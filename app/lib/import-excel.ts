@@ -59,6 +59,50 @@ const toInt = (v: unknown): number => Math.round(toNumber(v));
 const text = (row: Row, i: number): string => (i >= 0 ? String(row[i] ?? "").trim() : "");
 const extOf = (name: string): string => name.split(".").pop()?.toLowerCase() ?? "";
 
+const pad2 = (n: number): string => String(n).padStart(2, "0");
+const fmtISO = (d: Date): string => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+
+/**
+ * Convierte cualquier fecha de origen a una cadena ISO estable "YYYY-MM-DD":
+ * objetos Date (SheetJS con cellDates), seriales de Excel (número de días desde
+ * 1899-12-30), ISO, dd/mm/aaaa (es-CO) o formatos que `Date` sepa parsear.
+ * Si no reconoce el formato (p.ej. "Julio"), devuelve el texto tal cual para que
+ * la detección por nombre de mes de los gráficos siga funcionando.
+ */
+function toISODate(v: unknown): string {
+  if (v == null || v === "") return "";
+
+  // 1) Date real (SheetJS lee celdas de fecha como Date con cellDates:true).
+  if (v instanceof Date) return Number.isNaN(v.getTime()) ? "" : fmtISO(v);
+
+  // 2) Serial de Excel (número): se traduce con el parser de fechas de SheetJS.
+  if (typeof v === "number" && Number.isFinite(v)) {
+    const parts = XLSX.SSF?.parse_date_code(v);
+    if (parts && parts.y) return `${parts.y}-${pad2(parts.m)}-${pad2(parts.d)}`;
+  }
+
+  const s = String(v).trim();
+  if (!s) return "";
+
+  // 3) Ya viene en ISO (con o sin hora): se normaliza el relleno de ceros.
+  const iso = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (iso) return `${iso[1]}-${pad2(+iso[2])}-${pad2(+iso[3])}`;
+
+  // 4) dd/mm/aaaa o dd-mm-aaaa (día primero, formato es-CO).
+  const dmy = s.match(/^(\d{1,2})[/\-](\d{1,2})[/\-](\d{2,4})/);
+  if (dmy) {
+    const yr = dmy[3].length === 2 ? `20${dmy[3]}` : dmy[3];
+    return `${yr}-${pad2(+dmy[2])}-${pad2(+dmy[1])}`;
+  }
+
+  // 5) Último intento: parseo nativo (ISO con hora, "Jul 13 2026", etc.).
+  const d = new Date(s);
+  if (!Number.isNaN(d.getTime())) return fmtISO(d);
+
+  // 6) Texto sin formato de fecha reconocible: se conserva sin tocar.
+  return s;
+}
+
 /** Localiza el índice de una columna por cualquiera de sus sinónimos. */
 function makeIndexer(headers: string[]) {
   const normed = headers.map(norm);
@@ -198,7 +242,7 @@ function classifyAndMap(headers: string[], body: Row[], bundle: ImportBundle): S
         method: text(r, iMethod) || "—",
         amount,
         status: normalizeStatus(iStatus >= 0 ? r[iStatus] : ""),
-        date: text(r, iDate),
+        date: toISODate(iDate >= 0 ? r[iDate] : ""),
       });
     }
     bundle.sales = [...(bundle.sales ?? []), ...rows];
@@ -240,9 +284,11 @@ export async function parseFilesToBundle(files: File[]): Promise<ParseReport> {
       // se decodifican explícitamente como UTF-8 para no corromper acentos/ñ.
       if (extOf(file.name) === "csv") {
         const text = new TextDecoder("utf-8").decode(new Uint8Array(buf));
-        workbook = XLSX.read(text, { type: "string" });
+        workbook = XLSX.read(text, { type: "string", cellDates: true });
       } else {
-        workbook = XLSX.read(buf, { type: "array" });
+        // cellDates:true → las celdas de fecha llegan como objetos Date, no como
+        // seriales numéricos, para poder normalizarlas con seguridad.
+        workbook = XLSX.read(buf, { type: "array", cellDates: true });
       }
     } catch {
       continue; // archivo ilegible → se ignora

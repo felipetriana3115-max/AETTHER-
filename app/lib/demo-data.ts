@@ -114,6 +114,11 @@ function monthIndexFromDate(date: string): number | null {
   const dmy = raw.match(/^\s*\d{1,2}[/\-](\d{1,2})[/\-]\d{2,4}/);
   if (dmy) return Math.min(11, Math.max(0, Number.parseInt(dmy[1], 10) - 1));
 
+  // 4) Último recurso: parseo nativo a Date (ISO con hora, "Jul 13 2026", etc.).
+  //    Solo se acepta si produce una fecha válida, nunca "Invalid Date".
+  const parsed = new Date(raw);
+  if (!Number.isNaN(parsed.getTime())) return parsed.getMonth();
+
   return null;
 }
 

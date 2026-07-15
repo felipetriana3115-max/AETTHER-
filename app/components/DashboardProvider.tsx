@@ -1,6 +1,6 @@
 "use client";
 
-import { createContext, useCallback, useContext, useMemo, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   deriveMonthlyRevenue,
   headlineRevenue,
@@ -116,6 +116,9 @@ type DashboardContextValue = {
 
 const DashboardContext = createContext<DashboardContextValue | null>(null);
 
+/** Clave de localStorage para persistir la data importada entre recargas. */
+const STORAGE_KEY = "mi-dashboard-erp:v1";
+
 export function DashboardProvider({ children }: { children: ReactNode }) {
   // Sin datos quemados: todo arranca vacío y se llena desde la importación.
   const [inventory, setInventory] = useState<InventoryItem[]>([]);
@@ -129,6 +132,43 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
 
   const [toast, setToast] = useState<Toast | null>(null);
   const [toastSeq, setToastSeq] = useState(0);
+
+  // ── Persistencia en localStorage ─────────────────────────────────────────────
+  // La data importada sobrevive a las recargas: se recupera al montar y se
+  // guarda ante cualquier cambio de inventario, ventas o compras. `hydrated`
+  // evita que el guardado inicial (aún con estados vacíos) pise lo almacenado.
+  const [hydrated, setHydrated] = useState(false);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const saved = JSON.parse(raw) as Partial<{
+          inventory: InventoryItem[];
+          sales: Sale[];
+          purchases: PurchaseOrder[];
+        }>;
+        if (Array.isArray(saved.inventory)) setInventory(saved.inventory);
+        if (Array.isArray(saved.sales)) setSales(saved.sales);
+        if (Array.isArray(saved.purchases)) setPurchases(saved.purchases);
+        if (saved.inventory?.length || saved.sales?.length || saved.purchases?.length) {
+          setImported(true);
+        }
+      }
+    } catch {
+      // localStorage inaccesible o JSON corrupto → se arranca con estados vacíos.
+    }
+    setHydrated(true);
+  }, []);
+
+  useEffect(() => {
+    if (!hydrated) return; // no persistir hasta haber recuperado lo almacenado
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ inventory, sales, purchases }));
+    } catch {
+      // cuota excedida o modo privado → se ignora el guardado.
+    }
+  }, [hydrated, inventory, sales, purchases]);
 
   // ── Inventario ─────────────────────────────────────────────────────────────
   const addInventoryItems = useCallback((rows: NewInventoryItem[]) => {
