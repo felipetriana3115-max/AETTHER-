@@ -114,10 +114,15 @@ function monthIndexFromDate(date: string): number | null {
   const dmy = raw.match(/^\s*\d{1,2}[/\-](\d{1,2})[/\-]\d{2,4}/);
   if (dmy) return Math.min(11, Math.max(0, Number.parseInt(dmy[1], 10) - 1));
 
-  // 4) Último recurso: parseo nativo a Date (ISO con hora, "Jul 13 2026", etc.).
-  //    Solo se acepta si produce una fecha válida, nunca "Invalid Date".
-  const parsed = new Date(raw);
-  if (!Number.isNaN(parsed.getTime())) return parsed.getMonth();
+  // 4) Último recurso: parseo nativo a Date (ISO con hora, "August 5 2026",
+  //    "2026/07/14", etc.). Se exige que la cadena traiga un año de 4 dígitos
+  //    ANTES de confiar en `new Date`: de lo contrario un valor parcial o de
+  //    solo-hora ("10:42") heredaría el MES ACTUAL con que Date rellena los
+  //    campos faltantes, colapsando esas filas a julio (el mes de hoy).
+  if (/\d{4}/.test(raw)) {
+    const parsed = new Date(raw);
+    if (!Number.isNaN(parsed.getTime())) return parsed.getMonth();
+  }
 
   return null;
 }
