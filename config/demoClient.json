@@ -1,0 +1,15 @@
+{
+  "businessName": "Asequimicos S.A.S.",
+  "industry": "Distribución de productos químicos",
+  "currency": "COP",
+  "currencySymbol": "$",
+  "gateway": "Bold",
+  "metrics": {
+    "monthlySales": 72850000,
+    "salesGrowth": "+12.5%",
+    "stockProducts": 106,
+    "stockGrowth": "+4.1%",
+    "lowStockAlerts": 2,
+    "profitMargin": "62.4%"
+  }
+}
