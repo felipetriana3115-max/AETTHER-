@@ -156,22 +156,22 @@ function classifyAndMap(headers: string[], body: Row[], bundle: ImportBundle): S
   const at = makeIndexer(headers);
 
   // Inventario
-  const iName = at("producto", "nombre", "product", "item", "articulo", "descripcion");
+  const iName = at("producto", "nombre", "nombre producto", "id producto", "product", "item", "articulo", "descripcion");
   const iCategory = at("categoria", "category", "tipo", "linea", "familia");
-  const iStock = at("stock", "existencia", "existencias", "cantidad", "inventario", "unidades");
-  const iPrice = at("precio", "price", "precio unitario");
+  const iStock = at("stock", "stock actual", "existencia", "existencias", "cantidad", "inventario", "unidades");
+  const iPrice = at("precio", "precio venta", "price", "precio unitario");
   const iMin = at("minimo", "stock minimo", "reorden", "min");
   const iSku = at("sku", "codigo", "cod", "referencia interna");
 
   // Clientes
-  const iEmail = at("email", "correo", "correo electronico", "mail", "e-mail");
+  const iEmail = at("email", "correo", "correo electronico", "correo electrónico", "mail", "e-mail");
   const iPhone = at("telefono", "celular", "phone", "movil", "contacto");
   const iOrders = at("pedidos", "ordenes", "compras", "orders");
   const iSpent = at("total gastado", "compras acumuladas", "gastado", "ltv", "valor total", "total");
   const iTier = at("tier", "nivel", "segmento", "membresia", "categoria cliente");
 
   // Ventas
-  const iCustomer = at("cliente", "comprador", "razon social");
+  const iCustomer = at("cliente", "nombre cliente", "razon social", "razón social", "comprador");
   const iChannel = at("canal", "channel", "origen", "fuente");
   const iMethod = at("metodo", "medio de pago", "forma de pago", "pago", "payment");
   const iAmount = at("monto", "importe", "valor venta", "venta", "amount", "total venta", "valor", "total");
@@ -183,7 +183,7 @@ function classifyAndMap(headers: string[], body: Row[], bundle: ImportBundle): S
   const pSupplier = at("proveedor", "supplier", "vendor", "distribuidor", "fabricante");
   const pItems = at("insumos", "insumo", "articulos", "articulo", "items", "material", "producto", "descripcion", "detalle");
   const pUnits = at("unidades", "cantidad", "units", "qty", "cantidad pedida");
-  const pCost = at("costo", "costo total", "valor compra", "cost", "importe", "total compra", "total");
+  const pCost = at("costo", "costo unitario", "costo total", "valor compra", "cost", "importe", "total compra", "total");
   const pEta = at("entrega", "eta", "fecha entrega", "fecha de entrega", "llegada", "recepcion");
   const pStatus = at("estado", "status", "estado orden");
   const pId = at("orden", "oc", "orden de compra", "numero orden", "no orden", "id orden");
