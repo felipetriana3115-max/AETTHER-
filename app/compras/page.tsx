@@ -1,33 +1,14 @@
+"use client";
+
 import PageShell from "../components/PageShell";
 import MetricCard from "../components/MetricCard";
+import EmptyState from "../components/EmptyState";
 import demoClient from "../../config/demoClient.json";
+import { useDashboard } from "../components/DashboardProvider";
+import type { PurchaseStatus } from "../lib/demo-data";
 
 const currency = (n: number) =>
   n.toLocaleString("es-CO", { style: "currency", currency: demoClient.currency, minimumFractionDigits: 2 });
-
-type PurchaseStatus = "Recibido" | "Pendiente" | "Cancelado";
-
-type PurchaseOrder = {
-  id: string;
-  supplier: string;
-  items: string;
-  units: number;
-  cost: number;
-  eta: string;
-  status: PurchaseStatus;
-};
-
-const orders: PurchaseOrder[] = [
-  { id: "OC-2041", supplier: "Lácteos del Valle S.A.", items: "Queso Crema Premium", units: 40, cost: 360.0, eta: "12 Jul", status: "Recibido" },
-  { id: "OC-2042", supplier: "Chocolatería Andina", items: "Chocolate Cobertura", units: 25, cost: 375.0, eta: "14 Jul", status: "Pendiente" },
-  { id: "OC-2043", supplier: "Molinos San Rafael", items: "Harina de Almendra", units: 30, cost: 360.0, eta: "15 Jul", status: "Pendiente" },
-  { id: "OC-2044", supplier: "Distribuidora Dulce Hogar", items: "Azúcar Glass · Vainilla", units: 60, cost: 318.0, eta: "10 Jul", status: "Recibido" },
-  { id: "OC-2045", supplier: "Empaques EcoPack", items: "Cajas y tazas biodegradables", units: 500, cost: 240.0, eta: "09 Jul", status: "Recibido" },
-  { id: "OC-2046", supplier: "Frutas Tropicales Ltda.", items: "Pulpa de Maracuyá y Fresa", units: 35, cost: 210.0, eta: "16 Jul", status: "Pendiente" },
-  { id: "OC-2047", supplier: "Chocolatería Andina", items: "Cacao en polvo", units: 20, cost: 180.0, eta: "08 Jul", status: "Cancelado" },
-  { id: "OC-2048", supplier: "Lácteos del Valle S.A.", items: "Crema de Leche", units: 50, cost: 275.0, eta: "17 Jul", status: "Pendiente" },
-  { id: "OC-2049", supplier: "Molinos San Rafael", items: "Harina de Trigo Premium", units: 80, cost: 240.0, eta: "07 Jul", status: "Recibido" },
-];
 
 const statusStyles: Record<PurchaseStatus, string> = {
   Recibido: "bg-emerald-500/10 text-emerald-400 ring-emerald-500/20",
@@ -42,13 +23,22 @@ const statusDot: Record<PurchaseStatus, string> = {
 };
 
 export default function ComprasPage() {
+  // Estado global unificado: reacciona a la carga masiva de Excel/CSV.
+  const { purchases: orders } = useDashboard();
+
   const activeOrders = orders.filter((o) => o.status !== "Cancelado");
   const totalCost = activeOrders.reduce((s, o) => s + o.cost, 0);
   const pending = orders.filter((o) => o.status === "Pendiente").length;
   const received = orders.filter((o) => o.status === "Recibido").length;
+  const activeSuppliers = new Set(
+    activeOrders.map((o) => o.supplier).filter((s) => s && s !== "—"),
+  ).size;
 
   return (
     <PageShell title="Compras" subtitle={`${demoClient.businessName} · Abastecimiento y proveedores`}>
+      {orders.length === 0 ? (
+        <EmptyState message="Carga un archivo Excel o CSV con tus órdenes de compra para ver el abastecimiento." />
+      ) : (
       <div className="space-y-6">
         {/* Métricas */}
         <section className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
@@ -96,7 +86,7 @@ export default function ComprasPage() {
           />
           <MetricCard
             label="Proveedores Activos"
-            value="6"
+            value={String(activeSuppliers)}
             delta="+1"
             deltaGood
             deltaCaption="nuevo este trimestre"
@@ -171,6 +161,7 @@ export default function ComprasPage() {
           </div>
         </section>
       </div>
+      )}
     </PageShell>
   );
 }

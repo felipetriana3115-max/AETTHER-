@@ -3,12 +3,15 @@
 import { createContext, useCallback, useContext, useMemo, useState, type ReactNode } from "react";
 import {
   deriveMonthlyRevenue,
+  headlineRevenue,
   type InventoryItem,
   type Customer,
   type Sale,
   type SaleStatus,
   type Tier,
   type MonthPoint,
+  type PurchaseOrder,
+  type PurchaseStatus,
 } from "../lib/demo-data";
 import type { BoldPaymentStatus } from "../lib/bold";
 
@@ -42,11 +45,23 @@ export type NewSale = {
   date: string;
 };
 
+/** Fila de compra importada desde Excel/CSV; el id es opcional (se genera si falta). */
+export type NewPurchase = {
+  id?: string;
+  supplier: string;
+  items: string;
+  units: number;
+  cost: number;
+  eta: string;
+  status: PurchaseStatus;
+};
+
 /** Lo que puede traer un archivo/lote importado: cualquier combinación de módulos. */
 export type ImportBundle = {
   inventory?: NewInventoryItem[];
   customers?: NewCustomer[];
   sales?: NewSale[];
+  purchases?: NewPurchase[];
 };
 
 export type Transaction = {
@@ -63,6 +78,7 @@ export type BulkImportResult = {
   customers: number;
   products: number;
   sales: number;
+  purchases: number;
 };
 
 export type Toast = {
@@ -83,6 +99,9 @@ type DashboardContextValue = {
   addSales: (rows: NewSale[]) => number;
   monthlyRevenue: MonthPoint[];
   salesTotal: number;
+  // Compras
+  purchases: PurchaseOrder[];
+  addPurchases: (rows: NewPurchase[]) => number;
   // Importación (uno o varios archivos → uno o varios módulos)
   imported: boolean;
   bulkImport: (bundle: ImportBundle) => BulkImportResult;
@@ -102,6 +121,7 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
   const [inventory, setInventory] = useState<InventoryItem[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [sales, setSales] = useState<Sale[]>([]);
+  const [purchases, setPurchases] = useState<PurchaseOrder[]>([]);
   const [imported, setImported] = useState(false);
 
   const [transactions, setTransactions] = useState<Transaction[]>([]);
@@ -162,16 +182,36 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
     return rows.length;
   }, []);
 
-  /** Inyecta en los tres módulos lo que traiga el lote importado. */
+  // ── Compras ─────────────────────────────────────────────────────────────
+  const addPurchases = useCallback((rows: NewPurchase[]) => {
+    if (rows.length === 0) return 0;
+    setPurchases((prev) => {
+      let seq = prev.length;
+      const mapped: PurchaseOrder[] = rows.map((r) => ({
+        id: r.id && r.id.trim() ? r.id.trim() : `OC-${String(++seq).padStart(4, "0")}`,
+        supplier: r.supplier,
+        items: r.items,
+        units: r.units,
+        cost: r.cost,
+        eta: r.eta,
+        status: r.status,
+      }));
+      return [...mapped, ...prev];
+    });
+    return rows.length;
+  }, []);
+
+  /** Inyecta en los cuatro módulos lo que traiga el lote importado. */
   const bulkImport = useCallback(
     (bundle: ImportBundle): BulkImportResult => {
       const products = bundle.inventory?.length ? addInventoryItems(bundle.inventory) : 0;
       const custs = bundle.customers?.length ? addCustomers(bundle.customers) : 0;
       const sls = bundle.sales?.length ? addSales(bundle.sales) : 0;
-      if (products || custs || sls) setImported(true);
-      return { customers: custs, products, sales: sls };
+      const purch = bundle.purchases?.length ? addPurchases(bundle.purchases) : 0;
+      if (products || custs || sls || purch) setImported(true);
+      return { customers: custs, products, sales: sls, purchases: purch };
     },
-    [addInventoryItems, addCustomers, addSales],
+    [addInventoryItems, addCustomers, addSales, addPurchases],
   );
 
   const registerPayment = useCallback((tx: Transaction) => {
@@ -195,8 +235,9 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
   const monthlyRevenue = useMemo(() => deriveMonthlyRevenue(sales), [sales]);
 
   const value = useMemo<DashboardContextValue>(() => {
-    // "Ventas Totales del Mes" = último mes disponible + pagos Bold simulados.
-    const lastMonth = monthlyRevenue[monthlyRevenue.length - 1]?.amount ?? 0;
+    // "Ventas Totales del Mes" = ingreso del mes actual y, si el mes actual no
+    // tiene datos, la tendencia histórica (último mes registrado) + pagos Bold.
+    const headline = headlineRevenue(monthlyRevenue);
     return {
       inventory,
       addInventoryItems,
@@ -205,7 +246,9 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
       sales,
       addSales,
       monthlyRevenue,
-      salesTotal: lastMonth + extraSales,
+      salesTotal: headline + extraSales,
+      purchases,
+      addPurchases,
       imported,
       bulkImport,
       transactions,
@@ -223,6 +266,8 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
     addSales,
     monthlyRevenue,
     extraSales,
+    purchases,
+    addPurchases,
     imported,
     bulkImport,
     transactions,

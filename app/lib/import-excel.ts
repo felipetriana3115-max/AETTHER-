@@ -6,17 +6,18 @@
 // mayúsculas, orden de columnas, sinónimos y formatos numéricos es-CO/en-US.
 
 import * as XLSX from "xlsx";
-import type { SaleStatus, Tier } from "./demo-data";
+import type { SaleStatus, Tier, PurchaseStatus } from "./demo-data";
 import type {
   NewInventoryItem,
   NewCustomer,
   NewSale,
+  NewPurchase,
   ImportBundle,
 } from "../components/DashboardProvider";
 
 export type ParseReport = {
   bundle: ImportBundle;
-  matched: { inventory: number; customers: number; sales: number };
+  matched: { inventory: number; customers: number; sales: number; purchases: number };
   sheetsSeen: number;
   unknownSheets: string[];
 };
@@ -89,9 +90,23 @@ function normalizeStatus(v: unknown): SaleStatus {
   return "Pagado";
 }
 
+function normalizePurchaseStatus(v: unknown): PurchaseStatus {
+  const s = norm(v);
+  if (s.includes("cancel") || s.includes("anul") || s.includes("rechaz")) return "Cancelado";
+  if (
+    s.includes("recib") ||
+    s.includes("entreg") ||
+    s.includes("complet") ||
+    s.includes("received") ||
+    s.includes("cerrad")
+  )
+    return "Recibido";
+  return "Pendiente";
+}
+
 // ── Clasificación + mapeo de una hoja ─────────────────────────────────────────
 
-type SheetKind = "inventory" | "customers" | "sales" | "unknown";
+type SheetKind = "inventory" | "customers" | "sales" | "purchases" | "unknown";
 
 function classifyAndMap(headers: string[], body: Row[], bundle: ImportBundle): SheetKind {
   const at = makeIndexer(headers);
@@ -120,9 +135,21 @@ function classifyAndMap(headers: string[], body: Row[], bundle: ImportBundle): S
   const iDate = at("fecha", "date", "fecha venta");
   const iRef = at("referencia", "factura", "transaccion", "comprobante", "id venta");
 
+  // Compras
+  const pSupplier = at("proveedor", "supplier", "vendor", "distribuidor", "fabricante");
+  const pItems = at("insumos", "insumo", "articulos", "articulo", "items", "material", "producto", "descripcion", "detalle");
+  const pUnits = at("unidades", "cantidad", "units", "qty", "cantidad pedida");
+  const pCost = at("costo", "costo total", "valor compra", "cost", "importe", "total compra", "total");
+  const pEta = at("entrega", "eta", "fecha entrega", "fecha de entrega", "llegada", "recepcion");
+  const pStatus = at("estado", "status", "estado orden");
+  const pId = at("orden", "oc", "orden de compra", "numero orden", "no orden", "id orden");
+
   // Decisión por señales EXCLUSIVAS de cada módulo (orden de prioridad).
+  // "Proveedor" es la señal exclusiva de Compras: gana antes que Inventario
+  // (evita que "unidades" o "costo" lo clasifiquen como stock).
   let kind: SheetKind = "unknown";
-  if (iStock >= 0 || iSku >= 0) kind = "inventory";
+  if (pSupplier >= 0 && (pCost >= 0 || pUnits >= 0 || pEta >= 0 || pStatus >= 0)) kind = "purchases";
+  else if (iStock >= 0 || iSku >= 0) kind = "inventory";
   else if (iEmail >= 0 || iTier >= 0 || iOrders >= 0) kind = "customers";
   else if (iStatus >= 0 || iChannel >= 0 || iRef >= 0 || iDate >= 0) kind = "sales";
   else if (iName >= 0 && iPrice >= 0) kind = "inventory";
@@ -175,6 +202,23 @@ function classifyAndMap(headers: string[], body: Row[], bundle: ImportBundle): S
       });
     }
     bundle.sales = [...(bundle.sales ?? []), ...rows];
+  } else if (kind === "purchases") {
+    const rows: NewPurchase[] = [];
+    for (const r of body) {
+      const supplier = text(r, pSupplier);
+      const items = text(r, pItems);
+      if (!supplier && !items) continue;
+      rows.push({
+        id: text(r, pId),
+        supplier: supplier || "—",
+        items: items || "—",
+        units: toInt(r[pUnits]),
+        cost: toNumber(r[pCost]),
+        eta: text(r, pEta),
+        status: normalizePurchaseStatus(pStatus >= 0 ? r[pStatus] : ""),
+      });
+    }
+    bundle.purchases = [...(bundle.purchases ?? []), ...rows];
   }
 
   return kind;
@@ -230,6 +274,7 @@ export async function parseFilesToBundle(files: File[]): Promise<ParseReport> {
       inventory: bundle.inventory?.length ?? 0,
       customers: bundle.customers?.length ?? 0,
       sales: bundle.sales?.length ?? 0,
+      purchases: bundle.purchases?.length ?? 0,
     },
     sheetsSeen,
     unknownSheets,

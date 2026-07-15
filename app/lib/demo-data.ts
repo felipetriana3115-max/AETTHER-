@@ -41,6 +41,18 @@ export type Sale = {
   date: string;
 };
 
+export type PurchaseStatus = "Recibido" | "Pendiente" | "Cancelado";
+
+export type PurchaseOrder = {
+  id: string;
+  supplier: string;
+  items: string;
+  units: number;
+  cost: number;
+  eta: string;
+  status: PurchaseStatus;
+};
+
 export type MonthPoint = { month: string; amount: number };
 
 // Orden canónico de los meses del año (etiquetas cortas en español).
@@ -127,4 +139,24 @@ export function deriveMonthlyRevenue(sales: Sale[]): MonthPoint[] {
     if (seen[i]) points.push({ month: MONTHS[i], amount: totals[i] });
   }
   return points;
+}
+
+/**
+ * Ingreso "titular" para la métrica de Ventas del Mes. Prioriza el mes actual;
+ * si el mes actual no tiene datos (o quedó en cero), cae con gracia al último
+ * mes registrado con ingresos —la tendencia histórica— en lugar de mostrar $0.
+ * Solo devuelve 0 cuando no hay ninguna venta con fecha reconocible.
+ */
+export function headlineRevenue(points: MonthPoint[]): number {
+  if (points.length === 0) return 0;
+
+  const currentLabel = MONTHS[new Date().getMonth()];
+  const current = points.find((p) => p.month === currentLabel);
+  if (current && current.amount > 0) return current.amount;
+
+  // Fallback: el último mes registrado con ingresos (recorre hacia atrás).
+  for (let i = points.length - 1; i >= 0; i--) {
+    if (points[i].amount > 0) return points[i].amount;
+  }
+  return points[points.length - 1].amount;
 }

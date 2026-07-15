@@ -32,6 +32,7 @@ function describe(r: BulkImportResult): string {
   if (r.products) parts.push(`${r.products} producto${r.products === 1 ? "" : "s"}`);
   if (r.customers) parts.push(`${r.customers} cliente${r.customers === 1 ? "" : "s"}`);
   if (r.sales) parts.push(`${r.sales} venta${r.sales === 1 ? "" : "s"}`);
+  if (r.purchases) parts.push(`${r.purchases} compra${r.purchases === 1 ? "" : "s"}`);
   return parts.length ? `Distribuido en el ERP: ${parts.join(" · ")}.` : "Sin registros nuevos.";
 }
 
@@ -56,7 +57,11 @@ export default function ExcelImporter() {
       setStatus({ kind: "loading", fileName: file.name });
 
       const [report] = await Promise.all([parseFilesToBundle([file]), delay(1100)]);
-      const total = report.matched.inventory + report.matched.customers + report.matched.sales;
+      const total =
+        report.matched.inventory +
+        report.matched.customers +
+        report.matched.sales +
+        report.matched.purchases;
 
       if (total === 0) {
         setStatus({
@@ -95,7 +100,11 @@ export default function ExcelImporter() {
 
       // Espera el parseo real Y un mínimo de 2 s de animación.
       const [report] = await Promise.all([parseFilesToBundle(files), delay(2000)]);
-      const total = report.matched.inventory + report.matched.customers + report.matched.sales;
+      const total =
+        report.matched.inventory +
+        report.matched.customers +
+        report.matched.sales +
+        report.matched.purchases;
 
       if (total === 0) {
         setStatus({
@@ -288,6 +297,7 @@ export default function ExcelImporter() {
             {status.result.customers > 0 && <span>{status.result.customers} clientes → CRM</span>}
             {status.result.products > 0 && <span>{status.result.products} SKU → Inventario</span>}
             {status.result.sales > 0 && <span>{status.result.sales} registros → Ventas</span>}
+            {status.result.purchases > 0 && <span>{status.result.purchases} órdenes → Compras</span>}
           </div>
           {status.unknown.length > 0 && (
             <p className="mt-1.5 pl-6 text-[11px] text-amber-300/80">
