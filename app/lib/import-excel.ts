@@ -152,7 +152,67 @@ function normalizePurchaseStatus(v: unknown): PurchaseStatus {
 
 type SheetKind = "inventory" | "customers" | "sales" | "purchases" | "unknown";
 
-function classifyAndMap(headers: string[], body: Row[], bundle: ImportBundle): SheetKind {
+/**
+ * Pista por NOMBRE DE ARCHIVO. Si el nombre indica claramente el módulo
+ * (p. ej. "Base_de_Datos_Ventas.xlsx"), devuelve ese destino. Tolerante a
+ * acentos y mayúsculas. El orden refleja la prioridad pedida:
+ * Ventas → Inventario → Clientes → Compras.
+ */
+function hintFromFileName(fileName: string): SheetKind | null {
+  const n = norm(fileName);
+  if (n.includes("venta")) return "sales"; // "ventas", "venta"
+  if (n.includes("inventario")) return "inventory";
+  if (n.includes("cliente")) return "customers"; // "clientes", "cliente"
+  if (n.includes("compra") || n.includes("proveedor")) return "purchases";
+  return null;
+}
+
+/** Índices de columnas relevantes ya localizados en la hoja. */
+type ColIdx = {
+  iName: number;
+  iCustomer: number;
+  iAmount: number;
+  iStock: number;
+  iPrice: number;
+  iSku: number;
+  iEmail: number;
+  iTier: number;
+  iOrders: number;
+  iSpent: number;
+  pSupplier: number;
+  pItems: number;
+  pCost: number;
+};
+
+/**
+ * ¿La hoja tiene las columnas mínimas para mapearse a `kind`? Se usa para que
+ * la pista del nombre de archivo solo prevalezca cuando el contenido la respalda
+ * (evita forzar destinos que producirían filas vacías).
+ */
+function supportsKind(kind: SheetKind, c: ColIdx): boolean {
+  switch (kind) {
+    case "sales":
+      return (c.iCustomer >= 0 || c.iName >= 0) && c.iAmount >= 0;
+    case "inventory":
+      return c.iName >= 0 && (c.iStock >= 0 || c.iPrice >= 0 || c.iSku >= 0);
+    case "customers":
+      return (
+        (c.iName >= 0 || c.iCustomer >= 0) &&
+        (c.iEmail >= 0 || c.iTier >= 0 || c.iOrders >= 0 || c.iSpent >= 0)
+      );
+    case "purchases":
+      return c.pSupplier >= 0 && (c.pItems >= 0 || c.pCost >= 0);
+    default:
+      return false;
+  }
+}
+
+function classifyAndMap(
+  headers: string[],
+  body: Row[],
+  bundle: ImportBundle,
+  fileName = "",
+): SheetKind {
   const at = makeIndexer(headers);
 
   // Inventario
@@ -197,6 +257,32 @@ function classifyAndMap(headers: string[], body: Row[], bundle: ImportBundle): S
   else if (iEmail >= 0 || iTier >= 0 || iOrders >= 0) kind = "customers";
   else if (iStatus >= 0 || iChannel >= 0 || iRef >= 0 || iDate >= 0) kind = "sales";
   else if (iName >= 0 && iPrice >= 0) kind = "inventory";
+
+  // Override por NOMBRE DE ARCHIVO: si el nombre declara el módulo de forma
+  // explícita (p. ej. "Base_de_Datos_Ventas.xlsx") y la hoja tiene las columnas
+  // mínimas para ese destino, la pista del nombre PREVALECE sobre la heurística
+  // de encabezados. Corrige casos como un archivo de Ventas con columna
+  // "Cantidad"/"Unidades" que la heurística clasificaría erróneamente como
+  // Inventario.
+  const hint = hintFromFileName(fileName);
+  if (hint && hint !== kind) {
+    const cols: ColIdx = {
+      iName,
+      iCustomer,
+      iAmount,
+      iStock,
+      iPrice,
+      iSku,
+      iEmail,
+      iTier,
+      iOrders,
+      iSpent,
+      pSupplier,
+      pItems,
+      pCost,
+    };
+    if (supportsKind(hint, cols)) kind = hint;
+  }
 
   if (kind === "inventory") {
     const rows: NewInventoryItem[] = [];
@@ -307,7 +393,7 @@ export async function parseFilesToBundle(files: File[]): Promise<ParseReport> {
       sheetsSeen++;
       const headers = grid[0].map((c) => String(c ?? ""));
       const body = grid.slice(1);
-      const kind = classifyAndMap(headers, body, bundle);
+      const kind = classifyAndMap(headers, body, bundle, file.name);
       if (kind === "unknown") {
         unknownSheets.push(files.length > 1 ? `${file.name} · ${sheetName}` : sheetName);
       }
