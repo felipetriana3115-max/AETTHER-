@@ -1,8 +1,9 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import type { ReactNode } from "react";
+import { clearSession } from "../lib/auth";
 
 type NavItem = {
   label: string;
@@ -100,6 +101,15 @@ type SidebarProps = {
 
 export default function Sidebar({ open = false, onClose }: SidebarProps) {
   const pathname = usePathname();
+  const router = useRouter();
+
+  function handleLogout() {
+    clearSession();
+    onClose?.();
+    // Sin cookie, el proxy ya bloquea el resto de rutas; refresh reevalúa.
+    router.push("/login");
+    router.refresh();
+  }
 
   return (
     <aside
@@ -183,6 +193,20 @@ export default function Sidebar({ open = false, onClose }: SidebarProps) {
             <p className="truncate text-xs text-zinc-500">Administrador</p>
           </div>
         </div>
+        <button
+          type="button"
+          onClick={handleLogout}
+          className="mt-1 flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium text-zinc-400 transition-colors hover:bg-rose-500/10 hover:text-rose-300"
+        >
+          <span className="h-5 w-5 shrink-0">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+              <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+              <path d="m16 17 5-5-5-5" />
+              <path d="M21 12H9" />
+            </svg>
+          </span>
+          Cerrar sesión
+        </button>
       </div>
     </aside>
   );
