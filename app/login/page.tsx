@@ -38,7 +38,7 @@ export default function LoginPage() {
     <div className="flex min-h-screen">
       {/* Columna Izquierda: marca */}
       <div className="hidden w-1/2 flex-col items-center justify-center bg-gray-950 lg:flex">
-        <Image alt="Aether Logo" height={100} src="/logo Aether.jpeg" width={300} />
+        <Image alt="Logotipo de Aether" height={100} priority src="/logo-aether.png" width={300} />
         <p className="mt-6 text-2xl font-semibold text-gray-300">Potencia tu negocio</p>
       </div>
 
