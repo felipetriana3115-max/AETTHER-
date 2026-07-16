@@ -1,15 +1,20 @@
 "use client";
 
+import type { ReactNode } from "react";
+
 /**
  * Estado vacío consistente para cuando aún no se ha importado ningún dato.
  * Se muestra en los módulos que dependen exclusivamente de la carga de Excel.
+ * Acepta `children` opcionales para renderizar acciones (p. ej. un botón).
  */
 export default function EmptyState({
   title = "Aún no hay datos",
   message = "Carga un archivo Excel para ver tus productos.",
+  children,
 }: {
   title?: string;
   message?: string;
+  children?: ReactNode;
 }) {
   return (
     <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-violet-500/25 bg-zinc-900/40 px-6 py-16 text-center">
@@ -22,6 +27,7 @@ export default function EmptyState({
       </span>
       <p className="text-sm font-semibold text-zinc-200">{title}</p>
       <p className="mt-1 max-w-sm text-xs text-zinc-500">{message}</p>
+      {children}
     </div>
   );
 }

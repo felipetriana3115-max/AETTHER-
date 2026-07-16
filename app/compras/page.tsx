@@ -1,8 +1,11 @@
 "use client";
 
+import { useMemo, useState } from "react";
 import PageShell from "../components/PageShell";
 import MetricCard from "../components/MetricCard";
 import EmptyState from "../components/EmptyState";
+import ExcelImporter from "../components/ExcelImporter";
+import NewOrderForm from "../components/NewOrderForm";
 import demoClient from "../../config/demoClient.json";
 import { useDashboard } from "../components/DashboardProvider";
 import { formatCOP, type PurchaseStatus } from "../lib/demo-data";
@@ -21,7 +24,19 @@ const statusDot: Record<PurchaseStatus, string> = {
 
 export default function ComprasPage() {
   // Estado global unificado: reacciona a la carga masiva de Excel/CSV.
-  const { purchases: orders } = useDashboard();
+  const { purchases: orders, addPurchases, showToast } = useDashboard();
+
+  // Apertura del modal de creación manual de órdenes.
+  const [formOpen, setFormOpen] = useState(false);
+
+  // Proveedores existentes para el <select> del formulario (únicos, sin "—").
+  const suppliers = useMemo(
+    () =>
+      Array.from(
+        new Set(orders.map((o) => o.supplier).filter((s) => s && s !== "—")),
+      ).sort((a, b) => a.localeCompare(b, "es")),
+    [orders],
+  );
 
   const activeOrders = orders.filter((o) => o.status !== "Cancelado");
   const totalCost = activeOrders.reduce((s, o) => s + o.cost, 0);
@@ -31,12 +46,41 @@ export default function ComprasPage() {
     activeOrders.map((o) => o.supplier).filter((s) => s && s !== "—"),
   ).size;
 
+  // Guarda la orden manual en el estado global; la tabla se re-renderiza sola.
+  const handleCreateOrder = (order: Parameters<typeof addPurchases>[0][number]) => {
+    addPurchases([order]);
+    showToast("Orden creada", `Nueva orden para ${order.supplier} registrada.`);
+  };
+
   return (
     <PageShell title="Compras" subtitle={`${demoClient.businessName} · Abastecimiento y proveedores`}>
-      {orders.length === 0 ? (
-        <EmptyState message="Carga un archivo Excel o CSV con tus órdenes de compra para ver el abastecimiento." />
-      ) : (
+      <NewOrderForm
+        open={formOpen}
+        suppliers={suppliers}
+        onClose={() => setFormOpen(false)}
+        onSubmit={handleCreateOrder}
+      />
+
       <div className="space-y-6">
+        {/* Carga de archivos de órdenes de compra */}
+        <ExcelImporter />
+
+        {orders.length === 0 ? (
+          <EmptyState message="Carga un archivo Excel o CSV con tus órdenes de compra, o crea una orden manualmente con “+ Nueva orden”.">
+            <button
+              type="button"
+              onClick={() => setFormOpen(true)}
+              className="mt-4 inline-flex items-center gap-2 rounded-lg border border-violet-500/30 bg-violet-600/15 px-3 py-2 text-xs font-medium text-violet-200 shadow-[0_0_20px_-8px_rgba(139,92,246,0.7)] transition-colors hover:bg-violet-600/25"
+            >
+              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 5v14" />
+                <path d="M5 12h14" />
+              </svg>
+              Nueva orden
+            </button>
+          </EmptyState>
+        ) : (
+      <>
         {/* Métricas */}
         <section className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
           <MetricCard
@@ -107,6 +151,7 @@ export default function ComprasPage() {
             </div>
             <button
               type="button"
+              onClick={() => setFormOpen(true)}
               className="inline-flex items-center gap-2 rounded-lg border border-violet-500/30 bg-violet-600/15 px-3 py-2 text-xs font-medium text-violet-200 shadow-[0_0_20px_-8px_rgba(139,92,246,0.7)] transition-colors hover:bg-violet-600/25"
             >
               <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
@@ -157,8 +202,9 @@ export default function ComprasPage() {
             </table>
           </div>
         </section>
+      </>
+        )}
       </div>
-      )}
     </PageShell>
   );
 }
