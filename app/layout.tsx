@@ -38,3 +38,7 @@ export default function RootLayout({
     </html>
   );
 }
+export const metadata = {
+  title: 'Aether ERP | Potencia tu negocio',
+  description: 'Sistema ERP para la gestión inteligente de tu empresa.',
+}
