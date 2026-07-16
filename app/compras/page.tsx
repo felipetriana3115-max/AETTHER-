@@ -5,10 +5,7 @@ import MetricCard from "../components/MetricCard";
 import EmptyState from "../components/EmptyState";
 import demoClient from "../../config/demoClient.json";
 import { useDashboard } from "../components/DashboardProvider";
-import type { PurchaseStatus } from "../lib/demo-data";
-
-const currency = (n: number) =>
-  n.toLocaleString("es-CO", { style: "currency", currency: demoClient.currency, minimumFractionDigits: 2 });
+import { formatCOP, type PurchaseStatus } from "../lib/demo-data";
 
 const statusStyles: Record<PurchaseStatus, string> = {
   Recibido: "bg-emerald-500/10 text-emerald-400 ring-emerald-500/20",
@@ -44,7 +41,7 @@ export default function ComprasPage() {
         <section className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
           <MetricCard
             label="Costo de Adquisición"
-            value={currency(totalCost)}
+            value={formatCOP(totalCost)}
             delta="+6.2%"
             deltaGood={false}
             deltaCaption="vs. mes anterior"
@@ -145,7 +142,7 @@ export default function ComprasPage() {
                         o.status === "Cancelado" ? "text-zinc-500 line-through" : "text-zinc-100"
                       }`}
                     >
-                      {currency(o.cost)}
+                      {formatCOP(o.cost)}
                     </td>
                     <td className="px-5 py-3.5 text-zinc-500">{o.eta}</td>
                     <td className="px-5 py-3.5 text-right">

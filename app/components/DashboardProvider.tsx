@@ -1,3 +1,4 @@
+
 "use client";
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
@@ -14,6 +15,7 @@ import {
   type PurchaseStatus,
 } from "../lib/demo-data";
 import type { BoldPaymentStatus } from "../lib/bold";
+import type { PaymentMethod } from "../lib/payments/types";
 
 /** Fila de inventario importada desde Excel/CSV, sin id (lo asigna el proveedor). */
 export type NewInventoryItem = {
@@ -69,6 +71,9 @@ export type Transaction = {
   reference: string;
   amount: number;
   method: string;
+  /** Método de pago elegido en el POS (Wompi). Opcional para compatibilidad
+   *  con transacciones previas que solo traían `method` como texto libre. */
+  paymentMethod?: PaymentMethod;
   status: BoldPaymentStatus;
   createdAt: string; // ISO
 };

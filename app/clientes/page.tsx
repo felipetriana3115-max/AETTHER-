@@ -5,10 +5,7 @@ import MetricCard from "../components/MetricCard";
 import EmptyState from "../components/EmptyState";
 import demoClient from "../../config/demoClient.json";
 import { useDashboard } from "../components/DashboardProvider";
-import type { Tier } from "../lib/demo-data";
-
-const currency = (n: number) =>
-  n.toLocaleString("es-CO", { style: "currency", currency: demoClient.currency, maximumFractionDigits: 0 });
+import { formatCOP, type Tier } from "../lib/demo-data";
 
 const tierStyles: Record<Tier, string> = {
   Oro: "bg-amber-500/10 text-amber-300 ring-amber-400/30",
@@ -72,7 +69,7 @@ export default function ClientesPage() {
           />
           <MetricCard
             label="Ingresos por Clientes"
-            value={currency(totalRevenue)}
+            value={formatCOP(totalRevenue)}
             delta="+14.9%"
             deltaGood
             tone="emerald"
@@ -85,7 +82,7 @@ export default function ClientesPage() {
           />
           <MetricCard
             label="Compra Promedio"
-            value={currency(avgSpent)}
+            value={formatCOP(avgSpent)}
             delta="+3.4%"
             deltaGood
             deltaCaption="acumulado por cliente"
@@ -148,7 +145,7 @@ export default function ClientesPage() {
                 <div className="relative mt-4 flex items-end justify-between border-t border-zinc-800 pt-4">
                   <div>
                     <p className="text-[11px] text-zinc-500">Compras acumuladas</p>
-                    <p className="mt-0.5 text-lg font-semibold tracking-tight text-zinc-50">{currency(c.totalSpent)}</p>
+                    <p className="mt-0.5 text-lg font-semibold tracking-tight text-zinc-50">{formatCOP(c.totalSpent)}</p>
                   </div>
                   <button
                     type="button"

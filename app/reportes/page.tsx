@@ -6,10 +6,7 @@ import MetricCard from "../components/MetricCard";
 import EmptyState from "../components/EmptyState";
 import demoClient from "../../config/demoClient.json";
 import { useDashboard } from "../components/DashboardProvider";
-import { axisScale } from "../lib/demo-data";
-
-const currency = (n: number) =>
-  n.toLocaleString("es-CO", { style: "currency", currency: demoClient.currency, maximumFractionDigits: 0 });
+import { axisScale, formatCOP } from "../lib/demo-data";
 
 // Orden canónico del año para completar los meses proyectados.
 const YEAR_MONTHS = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"];
@@ -137,7 +134,7 @@ export default function ReportesPage() {
         <section className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
           <MetricCard
             label="Ingresos Anuales"
-            value={currency(annualRevenue)}
+            value={formatCOP(annualRevenue)}
             delta="+18.3%"
             deltaGood
             deltaCaption="vs. año anterior"
@@ -151,7 +148,7 @@ export default function ReportesPage() {
           />
           <MetricCard
             label="Costos Operativos"
-            value={currency(operatingCosts)}
+            value={formatCOP(operatingCosts)}
             delta="+5.1%"
             deltaGood={false}
             deltaCaption="vs. año anterior"
@@ -165,7 +162,7 @@ export default function ReportesPage() {
           />
           <MetricCard
             label="Utilidad Neta"
-            value={currency(netProfit)}
+            value={formatCOP(netProfit)}
             delta="+22.6%"
             deltaGood
             tone="emerald"
@@ -201,7 +198,7 @@ export default function ReportesPage() {
             <div>
               <h3 className="text-sm font-medium text-zinc-400">Proyección de crecimiento anual</h3>
               <p className="mt-1 text-2xl font-semibold tracking-tight text-zinc-50">
-                {currency(target)} <span className="text-sm font-normal text-zinc-500">meta a fin de año</span>
+                {formatCOP(target)} <span className="text-sm font-normal text-zinc-500">meta a fin de año</span>
               </p>
             </div>
             <div className="flex items-center gap-4 text-xs">
@@ -324,7 +321,7 @@ export default function ReportesPage() {
                       <p className="text-xs text-zinc-500">{p.units} unidades</p>
                     </div>
                   </div>
-                  <span className="shrink-0 text-sm font-semibold tabular-nums text-zinc-100">{currency(p.revenue)}</span>
+                  <span className="shrink-0 text-sm font-semibold tabular-nums text-zinc-100">{formatCOP(p.revenue)}</span>
                 </li>
               ))}
             </ul>

@@ -1,4 +1,6 @@
-import type { ReactNode } from "react";
+"use client";
+
+import { useState, type ReactNode } from "react";
 import Sidebar from "./Sidebar";
 
 type PageShellProps = {
@@ -15,17 +17,43 @@ type PageShellProps = {
  * violet-500/15 y glow morado) consistente en todo el ERP.
  */
 export default function PageShell({ title, subtitle, children, action }: PageShellProps) {
+  const [menuOpen, setMenuOpen] = useState(false);
+
   return (
     <div className="flex min-h-screen bg-black text-zinc-100">
-      <Sidebar />
+      <Sidebar open={menuOpen} onClose={() => setMenuOpen(false)} />
+
+      {/* Fondo oscuro al abrir el menú en móvil */}
+      {menuOpen && (
+        <div
+          className="fixed inset-0 z-40 bg-black/60 backdrop-blur-sm md:hidden"
+          aria-hidden="true"
+          onClick={() => setMenuOpen(false)}
+        />
+      )}
 
       {/* Área principal */}
       <div className="flex min-w-0 flex-1 flex-col">
         {/* Barra superior */}
-        <header className="sticky top-0 z-30 flex h-16 items-center justify-between border-b border-violet-500/15 bg-black/70 px-8 backdrop-blur">
-          <div className="min-w-0">
-            <h1 className="truncate text-base font-semibold text-zinc-100">{title}</h1>
-            <p className="truncate text-xs text-zinc-500">{subtitle}</p>
+        <header className="sticky top-0 z-30 flex h-16 items-center justify-between gap-3 border-b border-violet-500/15 bg-black/70 px-4 backdrop-blur md:px-8">
+          <div className="flex min-w-0 items-center gap-3">
+            {/* Botón hamburguesa (solo móvil) */}
+            <button
+              type="button"
+              onClick={() => setMenuOpen(true)}
+              aria-label="Abrir menú"
+              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-zinc-800 text-zinc-400 transition-colors hover:bg-zinc-800 hover:text-zinc-100 md:hidden"
+            >
+              <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                <path d="M4 6h16" />
+                <path d="M4 12h16" />
+                <path d="M4 18h16" />
+              </svg>
+            </button>
+            <div className="min-w-0">
+              <h1 className="truncate text-base font-semibold text-zinc-100">{title}</h1>
+              <p className="truncate text-xs text-zinc-500">{subtitle}</p>
+            </div>
           </div>
 
           <div className="flex items-center gap-3">

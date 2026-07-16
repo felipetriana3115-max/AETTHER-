@@ -1,15 +1,11 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { isLowStock, type InventoryItem } from "../lib/demo-data";
+import { formatCOP, isLowStock, type InventoryItem } from "../lib/demo-data";
 import { useDashboard } from "./DashboardProvider";
-import demoClient from "../../config/demoClient.json";
 
 type SortKey = "name" | "category" | "stock" | "price";
 type SortDir = "asc" | "desc";
-
-const currency = (n: number) =>
-  `${demoClient.currencySymbol} ${n.toLocaleString("es-CO", { maximumFractionDigits: 0 })}`;
 
 function StatusBadge({ low }: { low: boolean }) {
   if (low) {
@@ -165,7 +161,7 @@ export default function InventoryTable() {
                     {item.stock}
                   </td>
                   <td className="px-5 py-3.5 text-right tabular-nums text-zinc-300">
-                    {currency(item.price)}
+                    {formatCOP(item.price)}
                   </td>
                   <td className="px-5 py-3.5 text-right">
                     <StatusBadge low={low} />

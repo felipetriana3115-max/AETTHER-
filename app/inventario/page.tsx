@@ -5,10 +5,7 @@ import PageShell from "../components/PageShell";
 import EmptyState from "../components/EmptyState";
 import demoClient from "../../config/demoClient.json";
 import { useDashboard } from "../components/DashboardProvider";
-import { isLowStock, type InventoryItem } from "../lib/demo-data";
-
-const currency = (n: number) =>
-  n.toLocaleString("es-CO", { style: "currency", currency: demoClient.currency, maximumFractionDigits: 0 });
+import { formatCOP, isLowStock, type InventoryItem } from "../lib/demo-data";
 
 const isLow = (p: InventoryItem) => isLowStock(p);
 
@@ -44,7 +41,7 @@ export default function InventarioPage() {
             { label: "Referencias (SKU)", value: String(products.length), tone: "violet" },
             { label: "Unidades en stock", value: totalUnits.toLocaleString("es-CO"), tone: "fuchsia" },
             { label: "Alertas de stock bajo", value: String(lowCount), tone: "amber" },
-            { label: "Valor del inventario", value: currency(invValue), tone: "emerald" },
+            { label: "Valor del inventario", value: formatCOP(invValue), tone: "emerald" },
           ].map((c) => (
             <div
               key={c.label}
@@ -120,7 +117,7 @@ export default function InventarioPage() {
                           </span>
                         )}
                       </td>
-                      <td className="px-5 py-3.5 text-right tabular-nums text-zinc-300">{currency(p.price)}</td>
+                      <td className="px-5 py-3.5 text-right tabular-nums text-zinc-300">{formatCOP(p.price)}</td>
                     </tr>
                   );
                 })}

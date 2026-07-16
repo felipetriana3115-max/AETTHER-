@@ -1,16 +1,23 @@
 "use client";
 
 import { useDashboard } from "./DashboardProvider";
+import { formatCOP } from "../lib/demo-data";
+import { PAYMENT_METHOD_LABELS, type PaymentMethod } from "../lib/payments/types";
 
-const currency = (n: number) =>
-  n.toLocaleString("es-CO", { style: "currency", currency: "USD", minimumFractionDigits: 2 });
-
+// Etiquetas de los métodos "legacy" de Bold, para transacciones previas que
+// solo traían `method` como texto libre (sin el `paymentMethod` tipado).
 const METHOD_LABELS: Record<string, string> = {
   CARD: "Tarjeta",
   PSE: "PSE",
   NEQUI: "Nequi",
   BANCOLOMBIA_TRANSFER: "Transferencia",
 };
+
+/** Etiqueta del método a mostrar: prioriza el `paymentMethod` de Wompi. */
+function methodLabel(paymentMethod: PaymentMethod | undefined, method: string) {
+  if (paymentMethod) return PAYMENT_METHOD_LABELS[paymentMethod];
+  return METHOD_LABELS[method] ?? method;
+}
 
 function time(iso: string) {
   return new Date(iso).toLocaleTimeString("es-CO", { hour: "2-digit", minute: "2-digit" });
@@ -67,10 +74,17 @@ export default function TransactionsPanel() {
                     )}
                   </span>
                   <div className="min-w-0">
-                    <p className="truncate text-sm font-medium text-zinc-100">{tx.reference}</p>
-                    <p className="truncate text-xs text-zinc-500">
-                      {METHOD_LABELS[tx.method] ?? tx.method} · {time(tx.createdAt)}
-                    </p>
+                    <div className="flex items-center gap-2">
+                      <p className="truncate text-sm font-medium text-zinc-100">{tx.reference}</p>
+                      <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-violet-500/30 bg-violet-500/10 px-1.5 py-0.5 text-[10px] font-medium text-violet-300">
+                        <svg className="h-2.5 w-2.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                          <rect x="2" y="5" width="20" height="14" rx="2" />
+                          <path d="M2 10h20" />
+                        </svg>
+                        {methodLabel(tx.paymentMethod, tx.method)}
+                      </span>
+                    </div>
+                    <p className="truncate text-xs text-zinc-500">{time(tx.createdAt)}</p>
                   </div>
                 </div>
                 <span
@@ -78,7 +92,7 @@ export default function TransactionsPanel() {
                     ok ? "text-zinc-100" : "text-zinc-500 line-through"
                   }`}
                 >
-                  {currency(tx.amount)}
+                  {formatCOP(tx.amount)}
                 </span>
               </li>
             );

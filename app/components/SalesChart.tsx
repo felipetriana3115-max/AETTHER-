@@ -1,11 +1,7 @@
 "use client";
 
-import demoClient from "../../config/demoClient.json";
 import { useDashboard } from "./DashboardProvider";
-import { axisScale, formatCompactCOP } from "../lib/demo-data";
-
-const currency = (n: number) =>
-  n.toLocaleString("es-CO", { style: "currency", currency: demoClient.currency, maximumFractionDigits: 0 });
+import { axisScale, formatCompactCOP, formatCOP } from "../lib/demo-data";
 
 export default function SalesChart() {
   // Estado global unificado: reacciona a la carga masiva de Excel.
@@ -24,7 +20,7 @@ export default function SalesChart() {
       <div className="mb-6 flex items-start justify-between">
         <div>
           <h3 className="text-sm font-medium text-zinc-400">Tendencia de ingresos mensuales</h3>
-          <p className="mt-1 text-2xl font-semibold tracking-tight text-zinc-50">{currency(total)}</p>
+          <p className="mt-1 text-2xl font-semibold tracking-tight text-zinc-50">{formatCOP(total)}</p>
         </div>
         <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-2.5 py-1 text-xs font-medium text-emerald-400">
           <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
@@ -65,7 +61,7 @@ export default function SalesChart() {
                     >
                       {/* Tooltip */}
                       <div className="pointer-events-none absolute -top-10 left-1/2 z-10 -translate-x-1/2 whitespace-nowrap rounded-md border border-zinc-700 bg-zinc-800 px-2.5 py-1 text-xs font-medium text-zinc-100 opacity-0 shadow-lg transition-opacity group-hover:opacity-100">
-                        {currency(d.amount)}
+                        {formatCOP(d.amount)}
                         <span className="block text-center text-[10px] font-normal text-zinc-400">
                           {d.month}
                         </span>

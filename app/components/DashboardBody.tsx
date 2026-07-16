@@ -5,24 +5,20 @@ import SalesChart from "./SalesChart";
 import InventoryTable from "./InventoryTable";
 import ExcelImporter from "./ExcelImporter";
 import TransactionsPanel from "./TransactionsPanel";
-import BoldSimulator from "./BoldSimulator";
+import PaymentSimulator from "./PaymentSimulator";
 import demoClient from "../../config/demoClient.json";
 import { useDashboard } from "./DashboardProvider";
-import { isLowStock } from "../lib/demo-data";
+import { formatCOP, isLowStock } from "../lib/demo-data";
 
 export default function DashboardBody() {
-  const { metrics, currency } = demoClient;
+  const { metrics } = demoClient;
   const { inventory, salesTotal } = useDashboard();
 
   // Métricas derivadas del estado global (reaccionan a la carga masiva).
   const stockProducts = inventory.reduce((sum, i) => sum + i.stock, 0);
   const lowStockAlerts = inventory.filter(isLowStock).length;
 
-  const salesLabel = salesTotal.toLocaleString("es-CO", {
-    style: "currency",
-    currency,
-    maximumFractionDigits: 0,
-  });
+  const salesLabel = formatCOP(salesTotal);
 
   return (
     <>
@@ -108,7 +104,7 @@ export default function DashboardBody() {
       </div>
 
       {/* Panel de pruebas flotante */}
-      <BoldSimulator />
+      <PaymentSimulator />
     </>
   );
 }

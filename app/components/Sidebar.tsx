@@ -91,11 +91,22 @@ const navItems: NavItem[] = [
   },
 ];
 
-export default function Sidebar() {
+type SidebarProps = {
+  /** Solo aplica en móvil: controla si el cajón está desplegado. */
+  open?: boolean;
+  /** Cierra el cajón (móvil): al tocar un enlace o el botón de cerrar. */
+  onClose?: () => void;
+};
+
+export default function Sidebar({ open = false, onClose }: SidebarProps) {
   const pathname = usePathname();
 
   return (
-    <aside className="relative flex h-screen w-64 shrink-0 flex-col overflow-hidden border-r border-violet-500/15 bg-black">
+    <aside
+      className={`fixed inset-y-0 left-0 z-50 flex h-screen w-64 shrink-0 transform flex-col overflow-hidden border-r border-violet-500/15 bg-black transition-transform duration-300 ease-in-out md:static md:z-auto md:translate-x-0 ${
+        open ? "translate-x-0" : "-translate-x-full"
+      }`}
+    >
       {/* Glow morado ambiental (cyberpunk) */}
       <div className="pointer-events-none absolute -left-16 -top-16 h-56 w-56 rounded-full bg-violet-600/20 blur-3xl" />
       <div className="pointer-events-none absolute inset-0 bg-gradient-to-b from-violet-950/20 via-transparent to-transparent" />
@@ -111,6 +122,19 @@ export default function Sidebar() {
           </span>{" "}
           ERP
         </span>
+
+        {/* Cerrar (solo móvil) */}
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="Cerrar menú"
+          className="ml-auto flex h-9 w-9 items-center justify-center rounded-lg text-zinc-400 transition-colors hover:bg-violet-500/10 hover:text-zinc-100 md:hidden"
+        >
+          <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+            <path d="M18 6 6 18" />
+            <path d="m6 6 12 12" />
+          </svg>
+        </button>
       </div>
 
       {/* Navegación */}
@@ -125,6 +149,7 @@ export default function Sidebar() {
             <Link
               key={item.href}
               href={item.href}
+              onClick={onClose}
               className={`group relative flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-all ${
                 isActive
                   ? "bg-violet-600/15 text-violet-200 shadow-[0_0_20px_-6px_rgba(139,92,246,0.6)] ring-1 ring-inset ring-violet-500/30"

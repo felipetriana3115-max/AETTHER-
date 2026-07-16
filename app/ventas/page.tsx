@@ -5,13 +5,7 @@ import MetricCard from "../components/MetricCard";
 import EmptyState from "../components/EmptyState";
 import demoClient from "../../config/demoClient.json";
 import { useDashboard } from "../components/DashboardProvider";
-import { axisScale, formatCompactCOP, type SaleStatus } from "../lib/demo-data";
-
-const currency = (n: number) =>
-  n.toLocaleString("es-CO", { style: "currency", currency: demoClient.currency, maximumFractionDigits: 0 });
-
-const currency2 = (n: number) =>
-  n.toLocaleString("es-CO", { style: "currency", currency: demoClient.currency, minimumFractionDigits: 2 });
+import { axisScale, formatCompactCOP, formatCOP, type SaleStatus } from "../lib/demo-data";
 
 const statusStyles: Record<SaleStatus, string> = {
   Pagado: "bg-emerald-500/10 text-emerald-400 ring-emerald-500/20",
@@ -45,7 +39,7 @@ export default function VentasPage() {
         <section className="grid grid-cols-1 gap-4 sm:grid-cols-3">
           <MetricCard
             label="Ingresos Totales"
-            value={currency(total)}
+            value={formatCOP(total)}
             delta="+18.3%"
             deltaGood
             deltaCaption="vs. año anterior"
@@ -59,7 +53,7 @@ export default function VentasPage() {
           />
           <MetricCard
             label="Ticket Promedio"
-            value={currency2(avgTicket)}
+            value={formatCOP(avgTicket)}
             delta="+4.7%"
             deltaGood
             tone="fuchsia"
@@ -94,7 +88,7 @@ export default function VentasPage() {
           <div className="relative mb-6 flex items-start justify-between">
             <div>
               <h3 className="text-sm font-medium text-zinc-400">Ingresos mensuales</h3>
-              <p className="mt-1 text-2xl font-semibold tracking-tight text-zinc-50">{currency(total)}</p>
+              <p className="mt-1 text-2xl font-semibold tracking-tight text-zinc-50">{formatCOP(total)}</p>
             </div>
             <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-2.5 py-1 text-xs font-medium text-emerald-400 ring-1 ring-inset ring-emerald-500/20">
               <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
@@ -129,7 +123,7 @@ export default function VentasPage() {
                           style={{ height: `${pct}%` }}
                         >
                           <div className="pointer-events-none absolute -top-10 left-1/2 z-10 -translate-x-1/2 whitespace-nowrap rounded-md border border-zinc-700 bg-zinc-800 px-2.5 py-1 text-xs font-medium text-zinc-100 opacity-0 shadow-lg transition-opacity group-hover:opacity-100">
-                            {currency(d.amount)}
+                            {formatCOP(d.amount)}
                             <span className="block text-center text-[10px] font-normal text-zinc-400">{d.month}</span>
                           </div>
                         </div>
@@ -189,7 +183,7 @@ export default function VentasPage() {
                         s.status === "Reembolsado" ? "text-zinc-500 line-through" : "text-zinc-100"
                       }`}
                     >
-                      {currency2(s.amount)}
+                      {formatCOP(s.amount)}
                     </td>
                     <td className="px-5 py-3.5 text-right">
                       <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium ring-1 ring-inset ${statusStyles[s.status]}`}>
