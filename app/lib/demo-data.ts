@@ -96,7 +96,7 @@ export function axisScale(max: number, divisions = 4): { top: number; ticks: num
 const stripAccents = (s: string) => s.normalize("NFD").replace(/[̀-ͯ]/g, "");
 
 /** Intenta deducir el índice de mes (0=Ene … 11=Dic) desde una fecha en texto. */
-function monthIndexFromDate(date: string): number | null {
+export function monthIndexFromDate(date: string): number | null {
   if (!date) return null;
   const raw = String(date).trim();
   const lower = stripAccents(raw.toLowerCase());

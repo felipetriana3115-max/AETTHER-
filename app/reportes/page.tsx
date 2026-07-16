@@ -7,6 +7,7 @@ import EmptyState from "../components/EmptyState";
 import demoClient from "../../config/demoClient.json";
 import { useDashboard } from "../components/DashboardProvider";
 import { axisScale, formatCOP } from "../lib/demo-data";
+import { getMonthlyProjections } from "../lib/analytics/projections";
 
 // Orden canónico del año para completar los meses proyectados.
 const YEAR_MONTHS = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"];
@@ -22,8 +23,16 @@ type ProjectionPoint = { month: string; value: number; projected: boolean };
 
 export default function ReportesPage() {
   // Estado global unificado: reacciona a la carga masiva de Excel.
-  const { monthlyRevenue, inventory, sales } = useDashboard();
+  const { monthlyRevenue, inventory, sales, purchases } = useDashboard();
   const hasData = monthlyRevenue.length > 0 || inventory.length > 0 || sales.length > 0;
+
+  // Proyección del próximo mes (media móvil simple de 3 meses) de ingresos y
+  // egresos, con la alerta de caja resultante.
+  const projections = useMemo(
+    () => getMonthlyProjections(sales, purchases),
+    [sales, purchases],
+  );
+  const surplus = projections.cashFlow >= 0;
 
   // Métricas financieras derivadas de los ingresos vivos.
   const annualRevenue = monthlyRevenue.reduce((s, m) => s + m.amount, 0);
@@ -189,6 +198,69 @@ export default function ReportesPage() {
               </svg>
             }
           />
+        </section>
+
+        {/* Proyecciones Financieras (media móvil simple · próximo mes) */}
+        <section>
+          <div className="mb-4 flex items-baseline justify-between gap-3">
+            <h2 className="text-sm font-semibold text-zinc-100">Proyecciones Financieras</h2>
+            <p className="text-xs text-zinc-500">
+              Media móvil de {Math.max(projections.monthsAnalyzed.income, projections.monthsAnalyzed.expenses) || 0} meses · próximo mes
+            </p>
+          </div>
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+            <MetricCard
+              label="Proyección Ingresos"
+              value={formatCOP(projections.incomeProjection)}
+              deltaCaption={`Base: ${projections.monthsAnalyzed.income} mes(es) de ventas`}
+              delta="Próximo mes"
+              deltaGood
+              tone="emerald"
+              icon={
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M3 3v18h18" />
+                  <path d="m7 14 4-4 3 3 5-6" />
+                  <path d="M17 7h4v4" />
+                </svg>
+              }
+            />
+            <MetricCard
+              label="Proyección Egresos"
+              value={formatCOP(projections.expenseProjection)}
+              deltaCaption={`Base: ${projections.monthsAnalyzed.expenses} mes(es) de compras`}
+              delta="Próximo mes"
+              deltaGood={false}
+              tone="amber"
+              icon={
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M3 3v18h18" />
+                  <path d="m7 8 4 4 3-3 5 6" />
+                  <path d="M17 15h4v-4" />
+                </svg>
+              }
+            />
+            <MetricCard
+              label="Alerta de Caja"
+              value={projections.alert}
+              delta={`${surplus ? "+" : ""}${formatCOP(projections.cashFlow)}`}
+              deltaGood={surplus}
+              deltaCaption="flujo neto proyectado"
+              tone={surplus ? "emerald" : "fuchsia"}
+              icon={
+                surplus ? (
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M20 6 9 17l-5-5" />
+                  </svg>
+                ) : (
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z" />
+                    <path d="M12 9v4" />
+                    <path d="M12 17h.01" />
+                  </svg>
+                )
+              }
+            />
+          </div>
         </section>
 
         {/* Proyección de crecimiento */}
