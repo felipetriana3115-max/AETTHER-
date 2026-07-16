@@ -12,11 +12,21 @@ export default function Home() {
     </PageShell>
   );
 }
-<Image
-  src="/logo-aether.jpeg"
-  alt="Logotipo de Aether"
-  width={300}
-  height={100}
-  priority
-  />
 import Image from 'next/image';
+import logo from './logo-aether.png';
+
+export default function Home() {
+  return (
+    <PageShell>
+      <DashboardBody />
+      {/* Tu imagen ahora está dentro del componente correctamente */}
+      <Image 
+        src={logo} 
+        alt="Logotipo de Aether" 
+        width={300} 
+        height={100} 
+        priority 
+      />
+    </PageShell>
+  );
+}
