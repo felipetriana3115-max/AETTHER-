@@ -9,6 +9,7 @@
 
 export type InventoryItem = {
   id: number;
+  clientId: string;
   sku: string;
   name: string;
   category: string;
@@ -21,6 +22,7 @@ export type Tier = "Oro" | "Plata" | "Bronce";
 
 export type Customer = {
   id: number;
+  clientId: string;
   name: string;
   email: string;
   phone: string;
@@ -33,6 +35,7 @@ export type SaleStatus = "Pagado" | "Reembolsado" | "Pendiente";
 
 export type Sale = {
   id: string;
+  clientId: string;
   customer: string;
   channel: string;
   method: string;
@@ -45,6 +48,7 @@ export type PurchaseStatus = "Recibido" | "Pendiente" | "Cancelado";
 
 export type PurchaseOrder = {
   id: string;
+  clientId: string;
   supplier: string;
   items: string;
   units: number;

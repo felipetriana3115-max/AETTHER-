@@ -124,6 +124,15 @@ const DashboardContext = createContext<DashboardContextValue | null>(null);
 /** Clave de localStorage para persistir la data importada entre recargas. */
 const STORAGE_KEY = "mi-dashboard-erp:v1";
 
+/**
+ * Identificador del inquilino (cliente) actual. Base de la arquitectura
+ * multi-inquilino: por ahora es un valor fijo, pero es el ÚNICO punto donde el
+ * proveedor obtiene el `clientId` que estampa en cada registro creado.
+ * TODO(multi-tenant): reemplazar por el clientId del contexto de autenticación
+ * del usuario actual cuando exista la sesión.
+ */
+const CURRENT_CLIENT_ID = "default";
+
 export function DashboardProvider({ children }: { children: ReactNode }) {
   // Sin datos quemados: todo arranca vacío y se llena desde la importación.
   const [inventory, setInventory] = useState<InventoryItem[]>([]);
@@ -184,6 +193,7 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
         const id = ++nextId;
         return {
           id,
+          clientId: CURRENT_CLIENT_ID,
           sku: `IMP-${String(id).padStart(4, "0")}`,
           name: r.name,
           category: r.category,
@@ -202,7 +212,7 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
     if (rows.length === 0) return 0;
     setCustomers((prev) => {
       let nextId = prev.reduce((max, c) => Math.max(max, c.id), 0);
-      const mapped: Customer[] = rows.map((r) => ({ id: ++nextId, ...r }));
+      const mapped: Customer[] = rows.map((r) => ({ id: ++nextId, clientId: CURRENT_CLIENT_ID, ...r }));
       return [...prev, ...mapped];
     });
     return rows.length;
@@ -215,6 +225,7 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
       let seq = prev.length;
       const mapped: Sale[] = rows.map((r) => ({
         id: r.id && r.id.trim() ? r.id.trim() : `TX-${String(++seq).padStart(5, "0")}`,
+        clientId: CURRENT_CLIENT_ID,
         customer: r.customer,
         channel: r.channel,
         method: r.method,
@@ -234,6 +245,7 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
       let seq = prev.length;
       const mapped: PurchaseOrder[] = rows.map((r) => ({
         id: r.id && r.id.trim() ? r.id.trim() : `OC-${String(++seq).padStart(4, "0")}`,
+        clientId: CURRENT_CLIENT_ID,
         supplier: r.supplier,
         items: r.items,
         units: r.units,
