@@ -6,7 +6,6 @@ import MetricCard from "../components/MetricCard";
 import EmptyState from "../components/EmptyState";
 import ExcelImporter from "../components/ExcelImporter";
 import NewOrderForm from "../components/NewOrderForm";
-import demoClient from "../../config/demoClient.json";
 import { useDashboard } from "../components/DashboardProvider";
 import { formatCOP, type PurchaseStatus } from "../lib/demo-data";
 
@@ -24,7 +23,7 @@ const statusDot: Record<PurchaseStatus, string> = {
 
 export default function ComprasPage() {
   // Estado global unificado: reacciona a la carga masiva de Excel/CSV.
-  const { purchases: orders, addPurchases, showToast } = useDashboard();
+  const { purchases: orders, addPurchases, showToast, businessName } = useDashboard();
 
   // Apertura del modal de creación manual de órdenes.
   const [formOpen, setFormOpen] = useState(false);
@@ -53,7 +52,7 @@ export default function ComprasPage() {
   };
 
   return (
-    <PageShell title="Compras" subtitle={`${demoClient.businessName} · Abastecimiento y proveedores`}>
+    <PageShell title="Compras" subtitle={`${businessName} · Abastecimiento y proveedores`}>
       <NewOrderForm
         open={formOpen}
         suppliers={suppliers}

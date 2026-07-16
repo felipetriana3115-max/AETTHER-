@@ -3,7 +3,6 @@
 import { useMemo, useState } from "react";
 import PageShell from "../components/PageShell";
 import EmptyState from "../components/EmptyState";
-import demoClient from "../../config/demoClient.json";
 import { useDashboard } from "../components/DashboardProvider";
 import { formatCOP, isLowStock, type InventoryItem } from "../lib/demo-data";
 
@@ -11,7 +10,7 @@ const isLow = (p: InventoryItem) => isLowStock(p);
 
 export default function InventarioPage() {
   // Estado global unificado: reacciona a la carga masiva de Excel.
-  const { inventory: products } = useDashboard();
+  const { inventory: products, businessName } = useDashboard();
   const [query, setQuery] = useState("");
 
   const rows = useMemo(() => {
@@ -30,7 +29,7 @@ export default function InventarioPage() {
   const invValue = products.reduce((s, p) => s + p.stock * p.price, 0);
 
   return (
-    <PageShell title="Inventario" subtitle={`${demoClient.businessName} · Control de existencias`}>
+    <PageShell title="Inventario" subtitle={`${businessName} · Control de existencias`}>
       {products.length === 0 ? (
         <EmptyState message="Carga un archivo Excel para ver tus productos." />
       ) : (

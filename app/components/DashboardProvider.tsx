@@ -93,6 +93,9 @@ export type Toast = {
 };
 
 type DashboardContextValue = {
+  // Identidad de la empresa (configurable por el usuario)
+  businessName: string;
+  setBusinessName: (name: string) => void;
   // Inventario
   inventory: InventoryItem[];
   addInventoryItems: (rows: NewInventoryItem[]) => number;
@@ -124,6 +127,12 @@ const DashboardContext = createContext<DashboardContextValue | null>(null);
 /** Clave de localStorage para persistir la data importada entre recargas. */
 const STORAGE_KEY = "mi-dashboard-erp:v1";
 
+/** Clave de localStorage para el nombre de la empresa configurado por el usuario. */
+const BUSINESS_NAME_KEY = "mi-dashboard-erp:businessName:v1";
+
+/** Nombre por defecto cuando el usuario aún no ha configurado el suyo. */
+const DEFAULT_BUSINESS_NAME = "Mi Empresa";
+
 /**
  * Identificador del inquilino (cliente) actual. Base de la arquitectura
  * multi-inquilino: por ahora es un valor fijo, pero es el ÚNICO punto donde el
@@ -134,6 +143,10 @@ const STORAGE_KEY = "mi-dashboard-erp:v1";
 const CURRENT_CLIENT_ID = "default";
 
 export function DashboardProvider({ children }: { children: ReactNode }) {
+  // Nombre de la empresa: configurable y persistente. Arranca con el valor por
+  // defecto y se hidrata desde localStorage al montar (ver efecto de abajo).
+  const [businessName, setBusinessNameState] = useState(DEFAULT_BUSINESS_NAME);
+
   // Sin datos quemados: todo arranca vacío y se llena desde la importación.
   const [inventory, setInventory] = useState<InventoryItem[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
@@ -183,6 +196,29 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
       // cuota excedida o modo privado → se ignora el guardado.
     }
   }, [hydrated, inventory, sales, purchases]);
+
+  // ── Nombre de la empresa ─────────────────────────────────────────────────────
+  // Se hidrata una vez al montar; el guardado ocurre en el setter para no pisar
+  // el valor por defecto durante el primer render en el servidor/cliente.
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(BUSINESS_NAME_KEY);
+      if (saved) setBusinessNameState(saved);
+    } catch {
+      // localStorage inaccesible → se conserva el nombre por defecto.
+    }
+  }, []);
+
+  /** Actualiza y persiste el nombre; vacío o solo espacios → vuelve al defecto. */
+  const setBusinessName = useCallback((name: string) => {
+    const next = name.trim() || DEFAULT_BUSINESS_NAME;
+    setBusinessNameState(next);
+    try {
+      localStorage.setItem(BUSINESS_NAME_KEY, next);
+    } catch {
+      // cuota excedida o modo privado → se ignora el guardado.
+    }
+  }, []);
 
   // ── Inventario ─────────────────────────────────────────────────────────────
   const addInventoryItems = useCallback((rows: NewInventoryItem[]) => {
@@ -296,6 +332,8 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
     // tiene datos, la tendencia histórica (último mes registrado) + pagos Bold.
     const headline = headlineRevenue(monthlyRevenue);
     return {
+      businessName,
+      setBusinessName,
       inventory,
       addInventoryItems,
       customers,
@@ -315,6 +353,8 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
       dismissToast,
     };
   }, [
+    businessName,
+    setBusinessName,
     inventory,
     addInventoryItems,
     customers,

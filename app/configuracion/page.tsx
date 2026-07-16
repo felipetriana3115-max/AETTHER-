@@ -3,7 +3,6 @@
 import { useEffect, useMemo, useState } from "react";
 import PageShell from "../components/PageShell";
 import { useDashboard } from "../components/DashboardProvider";
-import demoClient from "../../config/demoClient.json";
 import { generateDailySummary } from "../lib/notifications/whatsapp-service";
 import { runDailyReportMock } from "../lib/cron/daily-report-mock";
 
@@ -21,10 +20,15 @@ const DEFAULT_SETTINGS: NotificationSettings = {
 };
 
 export default function ConfiguracionPage() {
-  const { sales, inventory, showToast } = useDashboard();
+  const { sales, inventory, showToast, businessName, setBusinessName } = useDashboard();
 
   const [settings, setSettings] = useState<NotificationSettings>(DEFAULT_SETTINGS);
   const [hydrated, setHydrated] = useState(false);
+
+  // Borrador editable del nombre de empresa; se sincroniza con el valor global
+  // (incluida su hidratación inicial desde localStorage).
+  const [nameDraft, setNameDraft] = useState(businessName);
+  useEffect(() => setNameDraft(businessName), [businessName]);
 
   // ── Persistencia en localStorage ──────────────────────────────────────────
   useEffect(() => {
@@ -55,10 +59,20 @@ export default function ConfiguracionPage() {
     () =>
       generateDailySummary(sales, {
         inventory,
-        businessName: demoClient.businessName,
+        businessName,
       }),
-    [sales, inventory],
+    [sales, inventory, businessName],
   );
+
+  // Guarda el nombre de empresa en el estado global (que lo persiste en
+  // localStorage). Vacío o solo espacios → el proveedor lo revierte al defecto.
+  const handleSaveName = () => {
+    setBusinessName(nameDraft);
+    showToast(
+      "Nombre actualizado",
+      `El nombre de tu empresa ahora es "${nameDraft.trim() || "Mi Empresa"}".`,
+    );
+  };
 
   const canSend = settings.dailyReportEnabled && phoneValid;
 
@@ -66,7 +80,7 @@ export default function ConfiguracionPage() {
     if (!canSend) return;
     runDailyReportMock(sales, settings.whatsappPhone, {
       inventory,
-      businessName: demoClient.businessName,
+      businessName,
     });
     showToast(
       "Reporte de prueba enviado",
@@ -77,9 +91,74 @@ export default function ConfiguracionPage() {
   return (
     <PageShell
       title="Configuración"
-      subtitle={`${demoClient.businessName} · Preferencias y automatizaciones`}
+      subtitle={`${businessName} · Preferencias y automatizaciones`}
     >
       <div className="mx-auto max-w-3xl space-y-6">
+        {/* Identidad de la empresa */}
+        <section className="relative overflow-hidden rounded-xl border border-violet-500/15 bg-zinc-900/50 p-6">
+          <div className="pointer-events-none absolute -left-20 -top-20 h-56 w-56 rounded-full bg-violet-600/10 blur-3xl" />
+
+          <div className="relative flex items-start gap-3">
+            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-violet-500/10 text-violet-300 ring-1 ring-violet-500/20">
+              <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                <path d="M3 21h18" />
+                <path d="M5 21V7l8-4v18" />
+                <path d="M19 21V11l-6-4" />
+                <path d="M9 9v.01" />
+                <path d="M9 12v.01" />
+                <path d="M9 15v.01" />
+                <path d="M9 18v.01" />
+              </svg>
+            </span>
+            <div>
+              <h3 className="text-sm font-semibold text-zinc-100">
+                Nombre de la empresa
+              </h3>
+              <p className="mt-1 max-w-md text-xs text-zinc-500">
+                Se muestra en la barra superior de todos los módulos y en los
+                reportes automáticos.
+              </p>
+            </div>
+          </div>
+
+          <form
+            className="relative mt-6 flex flex-col gap-3 sm:flex-row sm:items-end"
+            onSubmit={(e) => {
+              e.preventDefault();
+              handleSaveName();
+            }}
+          >
+            <div className="flex-1">
+              <label
+                htmlFor="business-name"
+                className="mb-1.5 block text-xs font-medium text-zinc-400"
+              >
+                Nombre visible
+              </label>
+              <input
+                id="business-name"
+                type="text"
+                placeholder="Mi Empresa"
+                value={nameDraft}
+                onChange={(e) => setNameDraft(e.target.value)}
+                className="w-full rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2.5 text-sm text-zinc-100 placeholder:text-zinc-600 transition-colors focus:border-violet-500 focus:outline-none focus:ring-1 focus:ring-violet-500"
+              />
+            </div>
+            <button
+              type="submit"
+              disabled={nameDraft.trim() === businessName.trim()}
+              className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg border border-violet-500/30 bg-violet-600/15 px-4 py-2.5 text-sm font-medium text-violet-200 shadow-[0_0_20px_-8px_rgba(139,92,246,0.7)] transition-colors hover:bg-violet-600/25 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-violet-600/15"
+            >
+              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z" />
+                <path d="M17 21v-8H7v8" />
+                <path d="M7 3v5h8" />
+              </svg>
+              Guardar
+            </button>
+          </form>
+        </section>
+
         {/* Reporte diario por WhatsApp */}
         <section className="relative overflow-hidden rounded-xl border border-violet-500/15 bg-zinc-900/50 p-6">
           <div className="pointer-events-none absolute -right-20 -top-20 h-56 w-56 rounded-full bg-violet-600/10 blur-3xl" />

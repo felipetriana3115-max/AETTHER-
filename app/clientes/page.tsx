@@ -3,7 +3,6 @@
 import PageShell from "../components/PageShell";
 import MetricCard from "../components/MetricCard";
 import EmptyState from "../components/EmptyState";
-import demoClient from "../../config/demoClient.json";
 import { useDashboard } from "../components/DashboardProvider";
 import { formatCOP, type Tier } from "../lib/demo-data";
 
@@ -24,7 +23,7 @@ function initials(name: string) {
 
 export default function ClientesPage() {
   // Estado global unificado: reacciona a la carga masiva de Excel.
-  const { customers } = useDashboard();
+  const { customers, businessName } = useDashboard();
 
   const totalCustomers = customers.length;
   const goldCount = customers.filter((c) => c.tier === "Oro").length;
@@ -32,7 +31,7 @@ export default function ClientesPage() {
   const avgSpent = totalCustomers > 0 ? totalRevenue / totalCustomers : 0;
 
   return (
-    <PageShell title="Clientes" subtitle={`${demoClient.businessName} · CRM y fidelización`}>
+    <PageShell title="Clientes" subtitle={`${businessName} · CRM y fidelización`}>
       {totalCustomers === 0 ? (
         <EmptyState message="Carga un archivo Excel con tus clientes para poblar el CRM." />
       ) : (

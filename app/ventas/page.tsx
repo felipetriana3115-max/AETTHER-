@@ -3,7 +3,6 @@
 import PageShell from "../components/PageShell";
 import MetricCard from "../components/MetricCard";
 import EmptyState from "../components/EmptyState";
-import demoClient from "../../config/demoClient.json";
 import { useDashboard } from "../components/DashboardProvider";
 import { axisScale, formatCompactCOP, formatCOP, type SaleStatus } from "../lib/demo-data";
 
@@ -15,7 +14,7 @@ const statusStyles: Record<SaleStatus, string> = {
 
 export default function VentasPage() {
   // Estado global unificado: reacciona a la carga masiva de Excel.
-  const { sales: recentSales, monthlyRevenue } = useDashboard();
+  const { sales: recentSales, monthlyRevenue, businessName } = useDashboard();
 
   const total = monthlyRevenue.reduce((s, m) => s + m.amount, 0);
   const paidSales = recentSales.filter((s) => s.status === "Pagado");
@@ -30,7 +29,7 @@ export default function VentasPage() {
   );
 
   return (
-    <PageShell title="Ventas" subtitle={`${demoClient.businessName} · Rendimiento comercial del año`}>
+    <PageShell title="Ventas" subtitle={`${businessName} · Rendimiento comercial del año`}>
       {recentSales.length === 0 ? (
         <EmptyState message="Carga un archivo Excel con tus ventas para ver el rendimiento comercial." />
       ) : (

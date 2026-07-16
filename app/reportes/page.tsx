@@ -4,7 +4,6 @@ import { useMemo } from "react";
 import PageShell from "../components/PageShell";
 import MetricCard from "../components/MetricCard";
 import EmptyState from "../components/EmptyState";
-import demoClient from "../../config/demoClient.json";
 import { useDashboard } from "../components/DashboardProvider";
 import { axisScale, formatCOP } from "../lib/demo-data";
 import { getMonthlyProjections } from "../lib/analytics/projections";
@@ -23,7 +22,7 @@ type ProjectionPoint = { month: string; value: number; projected: boolean };
 
 export default function ReportesPage() {
   // Estado global unificado: reacciona a la carga masiva de Excel.
-  const { monthlyRevenue, inventory, sales, purchases } = useDashboard();
+  const { monthlyRevenue, inventory, sales, purchases, businessName } = useDashboard();
   const hasData = monthlyRevenue.length > 0 || inventory.length > 0 || sales.length > 0;
 
   // Proyección del próximo mes (media móvil simple de 3 meses) de ingresos y
@@ -134,7 +133,7 @@ export default function ReportesPage() {
   }, [projection]);
 
   return (
-    <PageShell title="Reportes" subtitle={`${demoClient.businessName} · Analítica avanzada y proyecciones`}>
+    <PageShell title="Reportes" subtitle={`${businessName} · Analítica avanzada y proyecciones`}>
       {!hasData ? (
         <EmptyState message="Carga un archivo Excel para generar tu analítica y proyecciones." />
       ) : (
