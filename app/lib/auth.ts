@@ -10,13 +10,48 @@
  * IMPORTANTE: `SESSION_COOKIE` debe coincidir con el nombre que lee `proxy.ts`.
  */
 
-import { createClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
-/** Cliente Supabase (browser). Reutiliza la sesión que gestiona supabase-js. */
-export const supabase = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-);
+/**
+ * Cliente Supabase (browser), inicializado de forma **perezosa**.
+ *
+ * `createClient` NO debe ejecutarse al importar el módulo: durante `next build`
+ * las páginas cliente se pre-renderizan en el servidor y evaluarían este módulo
+ * sin las variables `NEXT_PUBLIC_*`, provocando `Error: supabaseUrl is required`.
+ * Al diferir la creación, el cliente solo se instancia la primera vez que se usa
+ * (en el navegador, en runtime), nunca durante el pre-render del build.
+ */
+let client: SupabaseClient | null = null;
+
+function getSupabase(): SupabaseClient {
+  if (client) return client;
+
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  if (!url || !anonKey) {
+    throw new Error(
+      "Faltan NEXT_PUBLIC_SUPABASE_URL y/o NEXT_PUBLIC_SUPABASE_ANON_KEY. " +
+        "Configúralas en .env.local (local) o en las variables de entorno de Vercel.",
+    );
+  }
+
+  client = createClient(url, anonKey);
+  return client;
+}
+
+/**
+ * Proxy que difiere la creación del cliente hasta el primer acceso a una
+ * propiedad (p. ej. `supabase.auth` o `supabase.from(...)`). Reutiliza la sesión
+ * que gestiona supabase-js y expone el mismo API que un `SupabaseClient` normal.
+ */
+export const supabase: SupabaseClient = new Proxy({} as SupabaseClient, {
+  get(_target, prop, receiver) {
+    const real = getSupabase();
+    const value = Reflect.get(real, prop, receiver);
+    // Preservar `this` en los métodos (auth, from, etc.).
+    return typeof value === "function" ? value.bind(real) : value;
+  },
+});
 
 /** Nombre de la cookie de sesión. Debe coincidir con el de `proxy.ts`. */
 export const SESSION_COOKIE = "aether_session";
