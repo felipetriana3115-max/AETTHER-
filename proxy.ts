@@ -14,7 +14,7 @@ import { SESSION_COOKIE } from "./app/lib/auth";
  */
 
 /** Rutas públicas que NO requieren sesión. */
-const PUBLIC_PATHS = ["/login"];
+const PUBLIC_PATHS = ["/login", "/registro"];
 
 export function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;

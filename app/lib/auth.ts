@@ -10,6 +10,14 @@
  * IMPORTANTE: `SESSION_COOKIE` debe coincidir con el nombre que lee `proxy.ts`.
  */
 
+import { createClient } from "@supabase/supabase-js";
+
+/** Cliente Supabase (browser). Reutiliza la sesión que gestiona supabase-js. */
+export const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+);
+
 /** Nombre de la cookie de sesión. Debe coincidir con el de `proxy.ts`. */
 export const SESSION_COOKIE = "aether_session";
 
@@ -52,4 +60,85 @@ export function getSession(): Session | null {
   } catch {
     return null;
   }
+}
+
+// ── Multi-tenant (Supabase Auth) ─────────────────────────────────────────────
+
+/** Clave de UI: tenant cacheado SOLO para pintar la interfaz (no es seguridad). */
+const TENANT_STORAGE_KEY = "aether:tenant";
+
+export type TenantInfo = { empresaId: string; tipoNegocio: string };
+
+/**
+ * Inicia sesión, resuelve la empresa del usuario y cachea `tipo_negocio` para UI.
+ * El aislamiento real lo impone RLS en Postgres: `empresa_id` aquí es
+ * conveniencia, NUNCA control de acceso.
+ */
+export async function signIn(email: string, password: string): Promise<TenantInfo> {
+  const { error: authError } = await supabase.auth.signInWithPassword({ email, password });
+  if (authError) throw authError;
+
+  const { data, error } = await supabase
+    .from("usuarios")
+    .select("empresa_id, empresas ( tipo_negocio )")
+    .single();
+  if (error) throw error;
+
+  const tenant: TenantInfo = {
+    empresaId: data.empresa_id,
+    // @ts-expect-error relación embebida de Supabase
+    tipoNegocio: data.empresas?.tipo_negocio ?? "",
+  };
+
+  try {
+    localStorage.setItem(TENANT_STORAGE_KEY, JSON.stringify(tenant));
+  } catch {
+    // Modo privado: la UI usará un fallback; no afecta seguridad.
+  }
+  return tenant;
+}
+
+/** Lee el tenant cacheado (solo UI). */
+export function getTenant(): TenantInfo | null {
+  try {
+    const raw = localStorage.getItem(TENANT_STORAGE_KEY);
+    return raw ? (JSON.parse(raw) as TenantInfo) : null;
+  } catch {
+    return null;
+  }
+}
+
+export type NuevaEmpresa = {
+  email: string;
+  password: string;
+  nombreComercial: string;
+  nit?: string;
+  tipoNegocio: string;
+  moneda?: string;
+};
+
+/**
+ * Registra una empresa nueva + su usuario admin. Los datos de la empresa viajan
+ * en `options.data` (metadata); el trigger `handle_new_user` los consume para
+ * crear `empresas` + `usuarios` de forma atómica.
+ *
+ * Devuelve `needsConfirm = true` si Supabase exige confirmar el correo antes de
+ * poder iniciar sesión (según config del proyecto).
+ */
+export async function signUpTenant(input: NuevaEmpresa): Promise<{ needsConfirm: boolean }> {
+  const { data, error } = await supabase.auth.signUp({
+    email: input.email,
+    password: input.password,
+    options: {
+      data: {
+        nombre_comercial: input.nombreComercial,
+        nit: input.nit ?? null,
+        tipo_negocio: input.tipoNegocio,
+        moneda: input.moneda ?? "COP",
+      },
+    },
+  });
+  if (error) throw error;
+  // Sin sesión activa tras signUp ⇒ el proyecto pide confirmación por correo.
+  return { needsConfirm: data.session === null };
 }
