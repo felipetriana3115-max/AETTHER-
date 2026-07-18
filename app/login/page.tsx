@@ -3,35 +3,39 @@
 import { useState, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
 import Image from "next/image";
-import { saveSession } from "../lib/auth";
+import { saveSession, signIn } from "../lib/auth";
 
 /**
- * Pantalla de acceso. Al enviar el formulario guarda la sesión (cookie + espejo
- * en localStorage vía `saveSession`) y navega al dashboard. El `proxy.ts` se
- * encarga de bloquear el resto de rutas mientras no exista esa cookie.
- *
- * Versión básica: acepta cualquier usuario/contraseña no vacíos (aún no hay
- * backend de credenciales).
+ * Pantalla de acceso. Autentica contra Supabase (`signIn`), consulta el rol en
+ * la tabla `usuarios` y guarda la sesión (cookie + cookie de rol para el proxy).
+ * Luego redirige: 'super_admin' → /admin; cualquier otro rol → dashboard (/).
  */
 export default function LoginPage() {
   const router = useRouter();
-  const [user, setUser] = useState("");
+  const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
-  function handleSubmit(event: FormEvent<HTMLFormElement>) {
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!user.trim() || !password.trim()) {
-      setError("Ingresa usuario y contraseña.");
+    if (!email.trim() || !password.trim()) {
+      setError("Ingresa correo y contraseña.");
       return;
     }
     setError(null);
     setSubmitting(true);
-    saveSession(user.trim());
-    // Navega al dashboard; el proxy ya verá la cookie recién escrita.
-    router.push("/");
-    router.refresh();
+    try {
+      const { rol } = await signIn(email.trim(), password);
+      // Escribe cookie de sesión + cookie de rol (esta última la lee el proxy).
+      saveSession(email.trim(), rol);
+      const destino = rol === "super_admin" ? "/admin" : "/";
+      router.push(destino);
+      router.refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "No se pudo iniciar sesión.");
+      setSubmitting(false);
+    }
   }
 
   return (
@@ -65,16 +69,16 @@ export default function LoginPage() {
             className="space-y-4 rounded-2xl border border-violet-500/15 bg-zinc-950/60 p-6 shadow-[0_0_40px_-12px_rgba(139,92,246,0.5)] backdrop-blur"
           >
             <div className="space-y-1.5">
-              <label htmlFor="user" className="block text-xs font-medium text-zinc-400">
-                Usuario
+              <label htmlFor="email" className="block text-xs font-medium text-zinc-400">
+                Correo
               </label>
               <input
-                id="user"
-                type="text"
-                autoComplete="username"
-                value={user}
-                onChange={(e) => setUser(e.target.value)}
-                placeholder="tu.usuario"
+                id="email"
+                type="email"
+                autoComplete="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="tu@empresa.com"
                 className="w-full rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2.5 text-sm text-zinc-100 placeholder:text-zinc-600 focus:border-violet-500 focus:outline-none focus:ring-1 focus:ring-violet-500"
               />
             </div>
