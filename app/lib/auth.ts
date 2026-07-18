@@ -132,15 +132,24 @@ export async function signIn(
 
   const { data, error } = await supabase
     .from("usuarios")
-    .select("empresa_id, rol, empresas ( tipo_negocio )")
+    .select("empresa_id, rol")
     .single();
   if (error) throw error;
 
-  const tenant: TenantInfo = {
-    empresaId: data.empresa_id,
-    // @ts-expect-error relación embebida de Supabase
-    tipoNegocio: data.empresas?.tipo_negocio ?? "",
-  };
+  // `tipo_negocio` es solo para UI y se resuelve en una consulta aparte: así el
+  // login no depende de un embed PostgREST (que exige una FK usuarios→empresas).
+  // El super_admin no tiene empresa, por eso se consulta solo si hay empresa_id.
+  let tipoNegocio = "";
+  if (data.empresa_id) {
+    const { data: emp } = await supabase
+      .from("empresas")
+      .select("tipo_negocio")
+      .eq("id", data.empresa_id)
+      .single();
+    tipoNegocio = emp?.tipo_negocio ?? "";
+  }
+
+  const tenant: TenantInfo = { empresaId: data.empresa_id, tipoNegocio };
 
   try {
     localStorage.setItem(TENANT_STORAGE_KEY, JSON.stringify(tenant));

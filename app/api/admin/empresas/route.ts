@@ -58,7 +58,7 @@ export async function GET(request: Request) {
     const { data, error } = await admin
       .from("empresas")
       .select("*")
-      .order("nombre_comercial", { ascending: true });
+      .order("nombre", { ascending: true });
     if (error) throw new HttpError(500, error.message);
     return Response.json({ ok: true, empresas: data ?? [] });
   } catch (e) {

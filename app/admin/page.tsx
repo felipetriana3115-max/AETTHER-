@@ -23,7 +23,7 @@ import { supabase } from "../lib/auth";
 
 type Empresa = {
   id: string;
-  nombre_comercial?: string | null;
+  nombre?: string | null;
   nit?: string | null;
   tipo_negocio?: string | null;
   estado?: "ACTIVO" | "SUSPENDIDO" | null;
@@ -147,7 +147,7 @@ export default function AdminPage() {
                 ) : (
                   empresas.map((e) => (
                     <tr key={e.id} className="border-b border-zinc-900 last:border-0">
-                      <td className="px-4 py-3 font-medium">{e.nombre_comercial ?? "—"}</td>
+                      <td className="px-4 py-3 font-medium">{e.nombre ?? "—"}</td>
                       <td className="px-4 py-3 text-zinc-400">{e.nit ?? "—"}</td>
                       <td className="px-4 py-3 text-zinc-400">{e.tipo_negocio ?? "—"}</td>
                       <td className="px-4 py-3">
