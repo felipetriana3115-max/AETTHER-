@@ -182,21 +182,12 @@ export default function Sidebar({ open = false, onClose }: SidebarProps) {
         })}
       </nav>
 
-      {/* Usuario */}
+      {/* Cerrar sesión */}
       <div className="relative border-t border-violet-500/15 p-3">
-        <div className="flex items-center gap-3 rounded-lg px-3 py-2">
-          <span className="flex h-9 w-9 items-center justify-center rounded-full bg-violet-500/10 text-sm font-medium text-violet-200 ring-1 ring-violet-500/30">
-            FT
-          </span>
-          <div className="min-w-0">
-            <p className="truncate text-sm font-medium text-zinc-100">Felipe Triana</p>
-            <p className="truncate text-xs text-zinc-500">Administrador</p>
-          </div>
-        </div>
         <button
           type="button"
           onClick={handleLogout}
-          className="mt-1 flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium text-zinc-400 transition-colors hover:bg-rose-500/10 hover:text-rose-300"
+          className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium text-zinc-500 transition-colors hover:bg-rose-500/10 hover:text-rose-300"
         >
           <span className="h-5 w-5 shrink-0">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
