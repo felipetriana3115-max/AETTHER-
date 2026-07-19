@@ -1,12 +1,13 @@
 "use client";
 
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import PageShell from "../components/PageShell";
 import MetricCard from "../components/MetricCard";
 import EmptyState from "../components/EmptyState";
 import { useDashboard } from "../components/DashboardProvider";
 import { axisScale, formatCOP } from "../lib/demo-data";
 import { getMonthlyProjections } from "../lib/analytics/projections";
+import { fetchCortes, hoyISO, type CorteCaja } from "../lib/corte";
 
 // Orden canónico del año para completar los meses proyectados.
 const YEAR_MONTHS = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"];
@@ -20,10 +21,40 @@ const PAD = 8;
 
 type ProjectionPoint = { month: string; value: number; projected: boolean };
 
+// Formatea una fecha `YYYY-MM-DD` a un texto legible en español (sin desfase de
+// zona: se construye la fecha en local a partir de sus componentes).
+function fechaLegible(iso: string): string {
+  const [y, m, d] = iso.split("-").map(Number);
+  if (!y || !m || !d) return iso;
+  return new Date(y, m - 1, d).toLocaleDateString("es-CO", {
+    weekday: "long",
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+  });
+}
+
 export default function ReportesPage() {
   // Estado global unificado: reacciona a la carga masiva de Excel.
   const { monthlyRevenue, inventory, sales, purchases, businessName } = useDashboard();
   const hasData = monthlyRevenue.length > 0 || inventory.length > 0 || sales.length > 0;
+
+  // Cortes de caja (arqueo) desde Supabase — independientes de los datos de Excel.
+  const [cortes, setCortes] = useState<CorteCaja[]>([]);
+  const [cortesCargando, setCortesCargando] = useState(true);
+  useEffect(() => {
+    let activo = true;
+    (async () => {
+      const data = await fetchCortes(30);
+      if (!activo) return;
+      setCortes(data);
+      setCortesCargando(false);
+    })();
+    return () => {
+      activo = false;
+    };
+  }, []);
+  const corteHoy = useMemo(() => cortes.find((c) => c.fecha === hoyISO()) ?? null, [cortes]);
 
   // Proyección del próximo mes (media móvil simple de 3 meses) de ingresos y
   // egresos, con la alerta de caja resultante.
@@ -134,6 +165,100 @@ export default function ReportesPage() {
 
   return (
     <PageShell title="Reportes" subtitle={`${businessName} · Analítica avanzada y proyecciones`}>
+      {/* ── Cierre de turno (corte de caja del POS) ── */}
+      <section className="mb-6 rounded-xl border border-violet-500/15 bg-zinc-900/50 p-6">
+        <div className="mb-5 flex flex-wrap items-baseline justify-between gap-2">
+          <div>
+            <h2 className="text-sm font-semibold text-zinc-100">Cierre de turno</h2>
+            <p className="mt-0.5 text-xs text-zinc-500 first-letter:uppercase">{fechaLegible(hoyISO())}</p>
+          </div>
+          <span className="text-xs text-zinc-500">Corte de caja · registrado desde el POS</span>
+        </div>
+
+        {cortesCargando ? (
+          <p className="py-8 text-center text-sm text-zinc-500">Cargando corte de caja…</p>
+        ) : (
+          <>
+            {/* Resumen del día de hoy */}
+            <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+              <div className="rounded-lg border border-emerald-500/25 bg-gradient-to-br from-emerald-500/10 to-transparent p-4">
+                <p className="text-[11px] font-medium uppercase tracking-wide text-emerald-400/80">Total vendido hoy</p>
+                <p className="mt-1 text-2xl font-bold tracking-tight text-emerald-300 tabular-nums">
+                  {formatCOP(corteHoy?.total_general ?? 0)}
+                </p>
+                <p className="mt-0.5 text-xs text-zinc-500">
+                  {corteHoy?.num_ventas ?? 0} venta{(corteHoy?.num_ventas ?? 0) === 1 ? "" : "s"}
+                </p>
+              </div>
+              <div className="rounded-lg border border-zinc-800 bg-zinc-950 p-4">
+                <p className="text-[11px] font-medium uppercase tracking-wide text-zinc-500">Efectivo</p>
+                <p className="mt-1 text-xl font-semibold tracking-tight text-zinc-100 tabular-nums">
+                  {formatCOP(corteHoy?.total_efectivo ?? 0)}
+                </p>
+              </div>
+              <div className="rounded-lg border border-zinc-800 bg-zinc-950 p-4">
+                <p className="text-[11px] font-medium uppercase tracking-wide text-zinc-500">Nequi / Daviplata</p>
+                <p className="mt-1 text-xl font-semibold tracking-tight text-zinc-100 tabular-nums">
+                  {formatCOP(corteHoy?.total_nequi ?? 0)}
+                </p>
+              </div>
+              <div className="rounded-lg border border-zinc-800 bg-zinc-950 p-4">
+                <p className="text-[11px] font-medium uppercase tracking-wide text-zinc-500">Bold (tarjeta)</p>
+                <p className="mt-1 text-xl font-semibold tracking-tight text-zinc-100 tabular-nums">
+                  {formatCOP(corteHoy?.total_bold ?? 0)}
+                </p>
+              </div>
+            </div>
+
+            {/* Historial de cortes por día */}
+            {cortes.length === 0 ? (
+              <p className="mt-6 rounded-lg border border-dashed border-zinc-800 py-8 text-center text-sm text-zinc-500">
+                Aún no hay ventas registradas en el POS.
+              </p>
+            ) : (
+              <div className="mt-6 overflow-x-auto">
+                <table className="w-full min-w-[560px] text-sm">
+                  <thead>
+                    <tr className="border-b border-zinc-800 text-left text-xs text-zinc-500">
+                      <th className="pb-2 pr-3 font-medium">Fecha</th>
+                      <th className="pb-2 px-3 text-right font-medium">Efectivo</th>
+                      <th className="pb-2 px-3 text-right font-medium">Nequi/Davi</th>
+                      <th className="pb-2 px-3 text-right font-medium">Bold</th>
+                      <th className="pb-2 px-3 text-right font-medium">Ventas</th>
+                      <th className="pb-2 pl-3 text-right font-medium">Total</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-zinc-800/70">
+                    {cortes.map((c) => {
+                      const esHoy = c.fecha === hoyISO();
+                      return (
+                        <tr key={c.id} className={esHoy ? "bg-emerald-500/5" : "hover:bg-zinc-800/30"}>
+                          <td className="py-2.5 pr-3 text-zinc-300">
+                            <span className="capitalize">{fechaLegible(c.fecha)}</span>
+                            {esHoy && (
+                              <span className="ml-2 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-300">
+                                HOY
+                              </span>
+                            )}
+                          </td>
+                          <td className="px-3 text-right tabular-nums text-zinc-400">{formatCOP(c.total_efectivo)}</td>
+                          <td className="px-3 text-right tabular-nums text-zinc-400">{formatCOP(c.total_nequi)}</td>
+                          <td className="px-3 text-right tabular-nums text-zinc-400">{formatCOP(c.total_bold)}</td>
+                          <td className="px-3 text-right tabular-nums text-zinc-400">{c.num_ventas}</td>
+                          <td className="pl-3 text-right font-semibold tabular-nums text-zinc-100">
+                            {formatCOP(c.total_general)}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </>
+        )}
+      </section>
+
       {!hasData ? (
         <EmptyState message="Carga un archivo Excel para generar tu analítica y proyecciones." />
       ) : (
