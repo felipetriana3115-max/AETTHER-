@@ -127,14 +127,40 @@ export async function signIn(
   email: string,
   password: string,
 ): Promise<TenantInfo & { rol: Rol }> {
-  const { error: authError } = await supabase.auth.signInWithPassword({ email, password });
-  if (authError) throw authError;
+  const { data: authData, error: authError } = await supabase.auth.signInWithPassword({
+    email,
+    password,
+  });
+  if (authError) {
+    // Captura el objeto completo: distingue AuthApiError (credenciales/correo sin
+    // confirmar) de un problema posterior de RLS o de fetching del perfil.
+    console.error("[signIn] Fallo en signInWithPassword:", authError);
+    throw authError;
+  }
 
+  // La sesión ya está lista aquí: supabase-js la persiste tras resolver el await,
+  // así que las consultas siguientes viajan autenticadas. Antes de validar el
+  // rol necesitamos el id del usuario recién autenticado.
+  const userId = authData.user?.id;
+  if (!userId) {
+    const err = new Error("La autenticación no devolvió un usuario.");
+    console.error("[signIn] signInWithPassword sin user:", authData);
+    throw err;
+  }
+
+  // IMPORTANTE: filtramos por `id = userId`. La política RLS `usuarios_select_propio`
+  // permite al super_admin ver TODAS las filas de `usuarios`; sin este `.eq`, un
+  // `.single()` recibía múltiples filas y fallaba con PGRST116 ("multiple rows"),
+  // que era exactamente lo que bloqueaba el login del super_admin.
   const { data, error } = await supabase
     .from("usuarios")
     .select("empresa_id, rol")
+    .eq("id", userId)
     .single();
-  if (error) throw error;
+  if (error) {
+    console.error("[signIn] Fallo al leer el perfil en 'usuarios' (RLS/fetch):", error);
+    throw error;
+  }
 
   // `tipo_negocio` es solo para UI y se resuelve en una consulta aparte: así el
   // login no depende de un embed PostgREST (que exige una FK usuarios→empresas).
