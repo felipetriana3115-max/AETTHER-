@@ -35,6 +35,20 @@ const navItems: NavItem[] = [
     ),
   },
   {
+    label: "Punto de Venta",
+    href: "/dashboard/pos",
+    icon: (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+        <path d="M2 20h20" />
+        <path d="M4 20V8a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v12" />
+        <path d="M7 10h6" />
+        <path d="M7 13h6" />
+        <path d="M17 12h3a1 1 0 0 1 1 1v7" />
+        <path d="M10 20v-3" />
+      </svg>
+    ),
+  },
+  {
     label: "Inventario",
     href: "/inventario",
     icon: (
