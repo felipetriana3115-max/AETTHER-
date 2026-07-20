@@ -5,7 +5,7 @@
 // inventario. No hace ninguna llamada de red — solo genera el mensaje; el envío
 // real se simula en app/lib/cron/daily-report-mock.ts.
 
-import { formatCOP, isLowStock, type Sale, type InventoryItem } from "../demo-data";
+import { formatCOP, isLowStock, type Sale, type InventoryItem } from "../data-model";
 
 export type DailySummaryOptions = {
   /** Inventario vivo para calcular la alerta de stock bajo. Opcional. */

@@ -6,12 +6,10 @@ import InventoryTable from "./InventoryTable";
 import ExcelImporter from "./ExcelImporter";
 import TransactionsPanel from "./TransactionsPanel";
 import PaymentSimulator from "./PaymentSimulator";
-import demoClient from "../../config/demoClient.json";
 import { useDashboard } from "./DashboardProvider";
-import { formatCOP, isLowStock } from "../lib/demo-data";
+import { formatCOP, isLowStock } from "../lib/data-model";
 
 export default function DashboardBody() {
-  const { metrics } = demoClient;
   const { inventory, salesTotal } = useDashboard();
 
   // Métricas derivadas del estado global (reaccionan a la carga masiva).
@@ -28,8 +26,6 @@ export default function DashboardBody() {
           <MetricCard
             label="Ventas Totales"
             value={salesLabel}
-            delta={metrics.salesGrowth}
-            deltaGood
             tone="violet"
             icon={
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
@@ -41,8 +37,6 @@ export default function DashboardBody() {
           <MetricCard
             label="Productos en Stock"
             value={stockProducts.toLocaleString("es-CO")}
-            delta={metrics.stockGrowth}
-            deltaGood
             tone="fuchsia"
             icon={
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
@@ -55,9 +49,6 @@ export default function DashboardBody() {
           <MetricCard
             label="Alertas de Stock Bajo"
             value={String(lowStockAlerts)}
-            delta="+2"
-            deltaGood={false}
-            deltaCaption="vs. semana anterior"
             tone="amber"
             icon={
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
@@ -69,9 +60,7 @@ export default function DashboardBody() {
           />
           <MetricCard
             label="Margen de Ganancia Promedio"
-            value={metrics.profitMargin}
-            delta="+1.8%"
-            deltaGood
+            value="0%"
             tone="emerald"
             icon={
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">

@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { formatCOP, isLowStock, type InventoryItem } from "../lib/demo-data";
+import { formatCOP, isLowStock, type InventoryItem } from "../lib/data-model";
 import { useDashboard } from "./DashboardProvider";
 
 type SortKey = "name" | "category" | "stock" | "price";

@@ -154,16 +154,3 @@ export function deriveMonthlyRevenue(sales: Sale[]): MonthPoint[] {
   }
   return points;
 }
-
-/**
- * Ingreso "titular" de la tarjeta de ventas. Ahora suma el ingreso de TODOS los
- * meses registrados, sin filtrar por el mes actual: la tarjeta muestra el
- * acumulado de las ventas recibidas, no solo las del mes en curso.
- *
- * Nota: `points` solo contiene ventas con fecha reconocible (ver
- * deriveMonthlyRevenue). Si necesitas incluir también las de fecha ilegible,
- * súmalas sobre `sales` en el provider, no aquí.
- */
-export function headlineRevenue(points: MonthPoint[]): number {
-  return points.reduce((sum, p) => sum + p.amount, 0);
-}

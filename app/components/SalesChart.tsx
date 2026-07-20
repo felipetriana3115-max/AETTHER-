@@ -1,7 +1,7 @@
 "use client";
 
 import { useDashboard } from "./DashboardProvider";
-import { axisScale, formatCompactCOP, formatCOP } from "../lib/demo-data";
+import { axisScale, formatCompactCOP, formatCOP } from "../lib/data-model";
 
 export default function SalesChart() {
   // Estado global unificado: reacciona a la carga masiva de Excel.
@@ -22,10 +22,8 @@ export default function SalesChart() {
           <h3 className="text-sm font-medium text-zinc-400">Tendencia de ingresos mensuales</h3>
           <p className="mt-1 text-2xl font-semibold tracking-tight text-zinc-50">{formatCOP(total)}</p>
         </div>
-        <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-2.5 py-1 text-xs font-medium text-emerald-400">
-          <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-          +8.2% este periodo
-        </span>
+        {/* Sin badge de variación: no hay métrica de crecimiento real todavía.
+            Cuando exista la lógica de periodo-sobre-periodo, se reincorpora aquí. */}
       </div>
 
       <div className="flex gap-3">

@@ -12,7 +12,7 @@ import {
   generateDailySummary,
   type DailySummaryOptions,
 } from "../notifications/whatsapp-service";
-import type { Sale } from "../demo-data";
+import type { Sale } from "../data-model";
 
 export type DailyReportPayload = {
   /** Número de destino en formato internacional, p. ej. +57 300 000 0000. */

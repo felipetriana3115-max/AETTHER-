@@ -15,7 +15,7 @@ import {
   type Sale,
   type PurchaseOrder,
   type MonthPoint,
-} from "../demo-data";
+} from "../data-model";
 
 /**
  * Agrega las compras (excluyendo canceladas) por mes usando su `eta` y devuelve

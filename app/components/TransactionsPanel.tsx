@@ -1,7 +1,7 @@
 "use client";
 
 import { useDashboard } from "./DashboardProvider";
-import { formatCOP } from "../lib/demo-data";
+import { formatCOP } from "../lib/data-model";
 import { PAYMENT_METHOD_LABELS, type PaymentMethod } from "../lib/payments/types";
 
 // Etiquetas de los métodos "legacy" de Bold, para transacciones previas que

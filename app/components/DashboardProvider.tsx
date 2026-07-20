@@ -4,7 +4,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   deriveMonthlyRevenue,
-  headlineRevenue,
   type InventoryItem,
   type Customer,
   type Sale,
@@ -13,11 +12,11 @@ import {
   type MonthPoint,
   type PurchaseOrder,
   type PurchaseStatus,
-} from "../lib/demo-data";
+} from "../lib/data-model";
 import type { BoldPaymentStatus } from "../lib/bold";
 import type { PaymentMethod } from "../lib/payments/types";
 import { supabase } from "../lib/auth";
-import { fetchVentasEmpresa, fetchProductosEmpresa } from "../lib/resumen";
+import { fetchVentasEmpresa, fetchProductosEmpresa, fetchTotalVentasEmpresa } from "../lib/resumen";
 
 /** Fila de inventario importada desde Excel/CSV, sin id (lo asigna el proveedor). */
 export type NewInventoryItem = {
@@ -157,7 +156,11 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
   const [imported, setImported] = useState(false);
 
   const [transactions, setTransactions] = useState<Transaction[]>([]);
-  const [extraSales, setExtraSales] = useState(0);
+
+  // Total de ventas: SIEMPRE el número que devuelve la RPC del servidor
+  // (`total_ventas_empresa`). NO se deriva de `sales` ni de localStorage, así que
+  // es idéntico en todos los dispositivos. Arranca en 0 hasta que la RPC responde.
+  const [salesTotal, setSalesTotal] = useState(0);
 
   const [toast, setToast] = useState<Toast | null>(null);
   const [toastSeq, setToastSeq] = useState(0);
@@ -210,14 +213,18 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
     // Carga real de la empresa. RLS ya aísla por `empresa_id = mi_empresa()`,
     // así que basta con que la petición viaje con la sesión activa.
     const cargar = async () => {
-      const [ventas, productos] = await Promise.all([
+      const [ventas, productos, total] = await Promise.all([
         fetchVentasEmpresa(),
         fetchProductosEmpresa(),
+        fetchTotalVentasEmpresa(),
       ]);
       if (!activo) return;
       // Reemplazamos (no acumulamos) para reflejar el estado real del servidor.
       if (ventas.length) setSales(ventas);
       if (productos.length) setInventory(productos);
+      // El total viene del servidor: se aplica SIEMPRE (incluido 0), para que un
+      // dispositivo con localStorage viejo no siga mostrando una cifra fantasma.
+      setSalesTotal(total);
     };
 
     // 1) Intento inicial: si la sesión YA está hidratada, cargamos de una.
@@ -352,10 +359,10 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
   );
 
   const registerPayment = useCallback((tx: Transaction) => {
+    // Solo alimenta el panel de transacciones en vivo. El total NO se toca aquí:
+    // sumar el monto en el cliente era justo lo que hacía divergir la cifra entre
+    // dispositivos. El total sale exclusivamente de la RPC del servidor.
     setTransactions((prev) => [tx, ...prev]);
-    if (tx.status === "SUCCESSFUL") {
-      setExtraSales((prev) => prev + tx.amount);
-    }
   }, []);
 
   const showToast = useCallback((title: string, message: string) => {
@@ -372,9 +379,6 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
   const monthlyRevenue = useMemo(() => deriveMonthlyRevenue(sales), [sales]);
 
   const value = useMemo<DashboardContextValue>(() => {
-    // "Ventas Totales del Mes" = ingreso del mes actual y, si el mes actual no
-    // tiene datos, la tendencia histórica (último mes registrado) + pagos Bold.
-    const headline = headlineRevenue(monthlyRevenue);
     return {
       businessName,
       setBusinessName,
@@ -385,7 +389,8 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
       sales,
       addSales,
       monthlyRevenue,
-      salesTotal: headline + extraSales,
+      // Total exacto del servidor (RPC), no una derivación local por dispositivo.
+      salesTotal,
       purchases,
       addPurchases,
       imported,
@@ -406,7 +411,7 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
     sales,
     addSales,
     monthlyRevenue,
-    extraSales,
+    salesTotal,
     purchases,
     addPurchases,
     imported,

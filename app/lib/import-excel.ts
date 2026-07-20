@@ -6,7 +6,7 @@
 // mayúsculas, orden de columnas, sinónimos y formatos numéricos es-CO/en-US.
 
 import * as XLSX from "xlsx";
-import type { SaleStatus, Tier, PurchaseStatus } from "./demo-data";
+import type { SaleStatus, Tier, PurchaseStatus } from "./data-model";
 import type {
   NewInventoryItem,
   NewCustomer,

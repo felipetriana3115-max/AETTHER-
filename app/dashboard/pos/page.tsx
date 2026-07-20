@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent }
 import { useHotkeys } from "react-hotkeys-hook";
 import PageShell from "../../components/PageShell";
 import { supabase } from "../../lib/auth";
-import { formatCOP } from "../../lib/demo-data";
+import { formatCOP } from "../../lib/data-model";
 import { fetchCorteHoy, mapCorte, type CorteCaja } from "../../lib/corte";
 
 /**

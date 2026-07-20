@@ -4,7 +4,7 @@ import { useMemo, useState } from "react";
 import PageShell from "../components/PageShell";
 import EmptyState from "../components/EmptyState";
 import { useDashboard } from "../components/DashboardProvider";
-import { formatCOP, isLowStock, type InventoryItem } from "../lib/demo-data";
+import { formatCOP, isLowStock, type InventoryItem } from "../lib/data-model";
 
 const isLow = (p: InventoryItem) => isLowStock(p);
 

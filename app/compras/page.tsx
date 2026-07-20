@@ -7,7 +7,7 @@ import EmptyState from "../components/EmptyState";
 import ExcelImporter from "../components/ExcelImporter";
 import NewOrderForm from "../components/NewOrderForm";
 import { useDashboard } from "../components/DashboardProvider";
-import { formatCOP, type PurchaseStatus } from "../lib/demo-data";
+import { formatCOP, type PurchaseStatus } from "../lib/data-model";
 
 const statusStyles: Record<PurchaseStatus, string> = {
   Recibido: "bg-emerald-500/10 text-emerald-400 ring-emerald-500/20",

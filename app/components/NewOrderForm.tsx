@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { NewPurchase } from "./DashboardProvider";
-import type { PurchaseStatus } from "../lib/demo-data";
+import type { PurchaseStatus } from "../lib/data-model";
 
 const NEW_SUPPLIER = "__new__";
 

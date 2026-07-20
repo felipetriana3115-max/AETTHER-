@@ -4,7 +4,7 @@ import PageShell from "../components/PageShell";
 import MetricCard from "../components/MetricCard";
 import EmptyState from "../components/EmptyState";
 import { useDashboard } from "../components/DashboardProvider";
-import { formatCOP, type Tier } from "../lib/demo-data";
+import { formatCOP, type Tier } from "../lib/data-model";
 
 const tierStyles: Record<Tier, string> = {
   Oro: "bg-amber-500/10 text-amber-300 ring-amber-400/30",

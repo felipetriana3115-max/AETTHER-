@@ -4,7 +4,7 @@ import PageShell from "../components/PageShell";
 import MetricCard from "../components/MetricCard";
 import EmptyState from "../components/EmptyState";
 import { useDashboard } from "../components/DashboardProvider";
-import { axisScale, formatCompactCOP, formatCOP, type SaleStatus } from "../lib/demo-data";
+import { axisScale, formatCompactCOP, formatCOP, type SaleStatus } from "../lib/data-model";
 
 const statusStyles: Record<SaleStatus, string> = {
   Pagado: "bg-emerald-500/10 text-emerald-400 ring-emerald-500/20",

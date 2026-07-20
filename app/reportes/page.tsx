@@ -5,7 +5,7 @@ import PageShell from "../components/PageShell";
 import MetricCard from "../components/MetricCard";
 import EmptyState from "../components/EmptyState";
 import { useDashboard } from "../components/DashboardProvider";
-import { axisScale, formatCOP } from "../lib/demo-data";
+import { axisScale, formatCOP } from "../lib/data-model";
 import { getMonthlyProjections } from "../lib/analytics/projections";
 import { fetchCortes, hoyISO, type CorteCaja } from "../lib/corte";
 

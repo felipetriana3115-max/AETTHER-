@@ -10,10 +10,15 @@
  * que vaciaba el dashboard en incógnito. Con una sesión activa, RLS ya devuelve
  * SOLO las filas de la empresa del usuario. Sin sesión, devuelve cero filas
  * (comportamiento correcto, no un fallo).
+ *
+ * El TOTAL de ventas NO se suma en el cliente: lo calcula el servidor vía la RPC
+ * `total_ventas_empresa()` (ver fetchTotalVentasEmpresa). Así todos los
+ * dispositivos ven la misma cifra, sin depender de localStorage ni de pagos que
+ * solo vivían en memoria de un dispositivo.
  */
 
 import { supabase } from "./auth";
-import type { InventoryItem, Sale } from "./demo-data";
+import type { InventoryItem, Sale } from "./data-model";
 
 /** Fila cruda de `public.ventas` (solo las columnas que consumimos). */
 type VentaRow = {
@@ -61,6 +66,26 @@ export async function fetchVentasEmpresa(): Promise<Sale[]> {
       date: row.created_at,
     };
   });
+}
+
+/**
+ * Total EXACTO de ventas de la empresa autenticada, calculado en el servidor por
+ * la RPC `total_ventas_empresa()` (SUM sobre `public.ventas`, aislada por RLS).
+ *
+ * Es la ÚNICA fuente de verdad del monto que muestra el dashboard: no depende de
+ * localStorage ni de estado en memoria, así que es idéntico en cada dispositivo.
+ * Sin sesión (o ante error) devuelve 0, nunca un número inventado en el cliente.
+ */
+export async function fetchTotalVentasEmpresa(): Promise<number> {
+  const { data, error } = await supabase.rpc("total_ventas_empresa");
+
+  if (error) {
+    console.warn("[resumen] No se pudo leer el total de ventas:", error.message);
+    return 0;
+  }
+
+  // numeric puede llegar como string desde PostgREST; normalizamos a number.
+  return Number(data ?? 0);
 }
 
 /**
