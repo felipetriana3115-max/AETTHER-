@@ -1,8 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useHotkeys } from "react-hotkeys-hook";
 import PageShell from "../../components/PageShell";
+import BarcodeScanner, { type BarcodeScannerHandle } from "../../components/BarcodeScanner";
 import { supabase } from "../../lib/auth";
 import { formatCOP } from "../../lib/data-model";
 import { fetchCorteHoy, mapCorte, type CorteCaja } from "../../lib/corte";
@@ -11,7 +12,10 @@ import { fetchCorteHoy, mapCorte, type CorteCaja } from "../../lib/corte";
  * Punto de Venta (POS) táctil — pensado para retail rápido (superior a Eleventa).
  *
  * Fuente de verdad: tabla `public.productos` en Supabase.
- * Columnas usadas: id · nombre · precio · codigo_barras · stock_actual.
+ * Columnas reales: id · descripcion · precio_venta · codigo_barras · stock_actual.
+ * Las leemos con alias PostgREST (`nombre:descripcion`, `precio:precio_venta`)
+ * para conservar las claves `nombre`/`precio` que usa el carrito sin renombrar
+ * todo el componente.
  *
  * Flujos clave:
  *  - Escáner: input con autoFocus; al pulsar Enter busca por `codigo_barras`,
@@ -81,7 +85,6 @@ function Placeholder({ nombre }: { nombre: string }) {
 export default function PosPage() {
   const [frecuentes, setFrecuentes] = useState<Producto[]>([]);
   const [carrito, setCarrito] = useState<LineaCarrito[]>([]);
-  const [busqueda, setBusqueda] = useState("");
   const [feedback, setFeedback] = useState<Feedback>(null);
   const [cobrando, setCobrando] = useState(false);
   // Línea seleccionada del carrito (para la tecla Delete). Guarda su `id`.
@@ -90,7 +93,7 @@ export default function PosPage() {
   const [comunAbierto, setComunAbierto] = useState(false);
   const [comunNombre, setComunNombre] = useState("");
   const [comunPrecio, setComunPrecio] = useState("");
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<BarcodeScannerHandle>(null);
   const comunNombreRef = useRef<HTMLInputElement>(null);
   // Contador de ids para los artículos comunes. Negativo y decreciente para no
   // colisionar nunca con los ids reales de `productos` (siempre positivos).
@@ -111,8 +114,8 @@ export default function PosPage() {
     (async () => {
       const { data, error } = await supabase
         .from("productos")
-        .select("id, nombre, precio, codigo_barras, stock_actual")
-        .order("nombre", { ascending: true })
+        .select("id, nombre:descripcion, precio:precio_venta, codigo_barras, stock_actual")
+        .order("descripcion", { ascending: true })
         .limit(12);
       if (!activo) return;
       if (error) {
@@ -276,42 +279,8 @@ export default function PosPage() {
   // dispara mientras se escribe en un input, así que no interfiere con el escáner.
   useHotkeys("delete", () => borrarSeleccionado(), [borrarSeleccionado]);
 
-  // ── Escáner / búsqueda por código de barras ──────────────────────────────────
-
-  /**
-   * Captura Enter del escáner (o teclado): busca en `productos` por
-   * `codigo_barras`, agrega 1 unidad y limpia el campo. Un lector de códigos
-   * "teclea" los dígitos y termina con Enter, así que este handler es todo lo
-   * que necesita el flujo de caja rápido.
-   */
-  const handleKeyDown = useCallback(
-    async (e: KeyboardEvent<HTMLInputElement>) => {
-      if (e.key !== "Enter") return;
-      e.preventDefault();
-      const codigo = busqueda.trim();
-      if (!codigo) return;
-
-      const { data, error } = await supabase
-        .from("productos")
-        .select("id, nombre, precio, codigo_barras, stock_actual")
-        .eq("codigo_barras", codigo)
-        .limit(1)
-        .maybeSingle();
-
-      setBusqueda(""); // Limpia siempre: el siguiente escaneo empieza en blanco.
-
-      if (error) {
-        setFeedback({ tone: "error", msg: "Error al buscar el producto." });
-        return;
-      }
-      if (!data) {
-        setFeedback({ tone: "error", msg: `Código "${codigo}" no encontrado.` });
-        return;
-      }
-      agregar(data as Producto);
-    },
-    [busqueda, agregar],
-  );
+  // El escaneo por `codigo_barras` lo maneja ahora <BarcodeScanner>, que emite el
+  // producto hallado por `onScan` y lo pasamos a `agregar` mapeando sus columnas.
 
   // ── Cobro (transacción de venta) ─────────────────────────────────────────────
 
@@ -429,20 +398,20 @@ export default function PosPage() {
             <label htmlFor="scan" className="mb-1.5 block text-xs font-medium text-zinc-400">
               Escanea o escribe el código de barras
             </label>
-            <div className="relative">
-              <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-lg">🔍</span>
-              <input
-                id="scan"
-                ref={inputRef}
-                autoFocus
-                inputMode="numeric"
-                value={busqueda}
-                onChange={(e) => setBusqueda(e.target.value)}
-                onKeyDown={handleKeyDown}
-                placeholder="Código de barras… (Enter para agregar)"
-                className="w-full rounded-lg border border-zinc-800 bg-zinc-950 py-3.5 pl-11 pr-3 text-base text-zinc-100 placeholder:text-zinc-500 focus:border-violet-500 focus:outline-none focus:ring-1 focus:ring-violet-500"
-              />
-            </div>
+            <BarcodeScanner
+              ref={inputRef}
+              onScan={(p) => {
+                agregar({
+                  id: p.id,
+                  nombre: p.descripcion,
+                  precio: p.precio_venta,
+                  codigo_barras: p.codigo_barras,
+                  stock_actual: p.stock_actual,
+                });
+              }}
+              onNotFound={(codigo) => setFeedback({ tone: "error", msg: `Código ${codigo} no encontrado.` })}
+              onError={(msg) => setFeedback({ tone: "error", msg })}
+            />
 
             {/* Artículo común: ítem suelto sin inventario (botón grande táctil). */}
             <button
