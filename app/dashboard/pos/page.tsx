@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { useHotkeys } from "react-hotkeys-hook";
 import PageShell from "../../components/PageShell";
-import { getTenant, supabase } from "../../lib/auth";
+import { supabase } from "../../lib/auth";
 import { formatCOP } from "../../lib/demo-data";
 import { fetchCorteHoy, mapCorte, type CorteCaja } from "../../lib/corte";
 
@@ -316,14 +316,14 @@ export default function PosPage() {
   // ── Cobro (transacción de venta) ─────────────────────────────────────────────
 
   /**
-   * Procesa la venta con el método de pago elegido:
-   *  a) valida que cada línea tenga stock (> 0 y suficiente),
-   *  b) descuenta `stock_actual` por unidad vendida (guard `.gte` anti-sobreventa),
-   *  c) registra la venta con su `metodo_pago` para asegurar la integridad.
+   * Procesa la venta con el método de pago elegido, de forma ATÓMICA.
    *
-   * Nota: supabase-js no ofrece transacciones multi-sentencia desde el cliente;
-   * el guard optimista `.gte` evita sobreventa a nivel de fila. Para atomicidad
-   * total (rollback conjunto) lo ideal es una RPC Postgres `registrar_venta`.
+   * Todo el cobro (descuento de inventario + registro de la venta + acumulado
+   * del corte de caja) ocurre dentro de una única transacción Postgres, vía la
+   * RPC `public.registrar_venta` (ver migración 2026-07-registrar-venta.sql).
+   * Si cualquier paso falla en el servidor, la BD hace ROLLBACK conjunto: nunca
+   * queda inventario descontado sin venta ni corte descuadrado. El aislamiento
+   * por empresa y el guard anti-sobreventa los impone la propia función.
    */
   const cobrar = useCallback(
     async (metodo: MetodoPago) => {
@@ -331,10 +331,12 @@ export default function PosPage() {
         setFeedback({ tone: "error", msg: "El carrito está vacío." });
         return;
       }
-      // a) Validación de stock antes de tocar la BD. Los artículos comunes no
-      //    tienen inventario, así que se excluyen del control de stock.
-      const reales = carrito.filter((l) => !l.esComun);
-      const sinStock = reales.find((l) => l.stock_actual <= 0 || l.qty > l.stock_actual);
+      // Validación de stock en cliente: feedback inmediato antes del round-trip.
+      // El servidor la revalida de todas formas (fuente de verdad). Los artículos
+      // comunes no tienen inventario, así que se excluyen del control de stock.
+      const sinStock = carrito
+        .filter((l) => !l.esComun)
+        .find((l) => l.stock_actual <= 0 || l.qty > l.stock_actual);
       if (sinStock) {
         setFeedback({
           tone: "error",
@@ -345,62 +347,43 @@ export default function PosPage() {
 
       setCobrando(true);
       try {
-        // b) Descuento de inventario por línea (solo productos reales). `.gte`
-        //    garantiza que no se venda más de lo que hay aunque el stock haya
-        //    cambiado desde la última carga.
-        const descuentos = await Promise.all(
-          reales.map(async (l) => {
-            const { data, error } = await supabase
-              .from("productos")
-              .update({ stock_actual: l.stock_actual - l.qty })
-              .eq("id", l.id)
-              .gte("stock_actual", l.qty)
-              .select("id")
-              .maybeSingle();
-            return { linea: l, ok: !error && !!data };
-          }),
-        );
+        // Un solo viaje al servidor: descuenta stock, inserta la venta y acumula
+        // el corte, todo o nada. `esComun` viaja en cada línea para que la RPC
+        // sepa cuáles saltan el descuento de inventario.
+        const { data, error } = await supabase.rpc("registrar_venta", {
+          p_metodo: metodo,
+          p_total: total,
+          p_items: carrito.map((l) => ({
+            id: l.id,
+            nombre: l.nombre,
+            qty: l.qty,
+            precio: l.precio,
+            esComun: l.esComun ?? false,
+          })),
+        });
 
-        const fallidos = descuentos.filter((d) => !d.ok).map((d) => d.linea.nombre);
-        if (fallidos.length > 0) {
-          setFeedback({
-            tone: "error",
-            msg: `No se pudo descontar stock de: ${fallidos.join(", ")}. Verifica existencias.`,
+        if (error) {
+          // Log completo (code/details/hint) para depurar en consola. La RPC usa
+          // errcodes propios: 42501 = sin empresa/RLS, P0001 = stock insuficiente.
+          console.error("[POS] La venta NO se registró (registrar_venta).", {
+            error,
+            contexto: { metodo, total, items: carrito.length },
           });
+          const msg =
+            error.code === "42501"
+              ? "La venta NO se guardó: tu usuario no tiene una empresa asociada. Inicia sesión como usuario de una empresa."
+              : error.code === "P0001"
+                ? "La venta NO se guardó: stock insuficiente en el servidor. Refresca el inventario."
+                : `La venta NO se guardó: ${error.message}`;
+          setFeedback({ tone: "error", msg });
+          // No limpiamos el carrito: la transacción se revirtió por completo.
           return;
         }
 
-        // c) Registro de la venta con el método de pago (integridad de datos).
-        //    Best-effort: si la tabla `ventas` aún no existe, la venta de caja
-        //    igual queda reflejada en el inventario ya descontado.
-        //    Incluimos `empresa_id` explícitamente (además del DEFAULT mi_empresa()
-        //    de la BD): así la venta queda atada al tenant correcto aunque cambie
-        //    el contexto de sesión. Si el tenant no está en caché, la BD lo rellena.
-        const empresaId = getTenant()?.empresaId;
-        const { error: ventaError } = await supabase.from("ventas").insert({
-          ...(empresaId ? { empresa_id: empresaId } : {}),
-          metodo_pago: metodo,
-          total,
-          items: carrito.map((l) => ({ id: l.id, nombre: l.nombre, qty: l.qty, precio: l.precio })),
-        });
-        if (ventaError) {
-          console.warn("[POS] No se pudo registrar la venta en 'ventas':", ventaError.message);
-        } else {
-          // d) Suma el total al corte de caja del día (arqueo). La RPC
-          //    `sumar_corte_caja` hace un UPSERT atómico por (empresa, fecha) para
-          //    evitar carreras entre cajas. Solo se acumula si la venta se registró.
-          const { data: corteData, error: corteError } = await supabase.rpc("sumar_corte_caja", {
-            p_total: total,
-            p_metodo: metodo,
-          });
-          if (corteError) {
-            console.warn("[POS] No se pudo actualizar el corte de caja:", corteError.message);
-          } else {
-            // La RPC devuelve la fila actualizada del corte → refresca la tarjeta.
-            const actualizado = mapCorte(corteData as Record<string, unknown> | null);
-            if (actualizado) setCorteHoy(actualizado);
-          }
-        }
+        // La RPC devuelve { venta_id, corte }. Refrescamos la tarjeta del corte.
+        const payload = (data ?? {}) as { corte?: Record<string, unknown> };
+        const actualizado = mapCorte(payload.corte ?? null);
+        if (actualizado) setCorteHoy(actualizado);
 
         // Refleja el nuevo stock en el grid de frecuentes sin recargar.
         setFrecuentes((prev) =>
