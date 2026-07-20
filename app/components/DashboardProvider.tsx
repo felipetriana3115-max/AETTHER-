@@ -16,6 +16,8 @@ import {
 } from "../lib/demo-data";
 import type { BoldPaymentStatus } from "../lib/bold";
 import type { PaymentMethod } from "../lib/payments/types";
+import { supabase } from "../lib/auth";
+import { fetchVentasEmpresa, fetchProductosEmpresa } from "../lib/resumen";
 
 /** Fila de inventario importada desde Excel/CSV, sin id (lo asigna el proveedor). */
 export type NewInventoryItem = {
@@ -196,6 +198,34 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
       // cuota excedida o modo privado → se ignora el guardado.
     }
   }, [hydrated, inventory, sales, purchases]);
+
+  // ── Carga desde Supabase (fuente de verdad multi-tenant) ─────────────────────
+  // Si hay sesión activa, la data real de la empresa manda sobre lo local: RLS ya
+  // la deja aislada por `empresa_id = mi_empresa()` (resuelto desde `auth.uid()`),
+  // así que NO se filtra por tenant en el cliente. Sin sesión no se toca nada: RLS
+  // devolvería cero filas, y conservamos lo importado localmente como fallback.
+  useEffect(() => {
+    let activo = true;
+    (async () => {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      if (!session) return;
+
+      const [ventas, productos] = await Promise.all([
+        fetchVentasEmpresa(),
+        fetchProductosEmpresa(),
+      ]);
+      if (!activo) return;
+
+      // Reemplazamos (no acumulamos) para reflejar el estado real del servidor.
+      if (ventas.length) setSales(ventas);
+      if (productos.length) setInventory(productos);
+    })();
+    return () => {
+      activo = false;
+    };
+  }, []);
 
   // ── Nombre de la empresa ─────────────────────────────────────────────────────
   // Se hidrata una vez al montar; el guardado ocurre en el setter para no pisar
