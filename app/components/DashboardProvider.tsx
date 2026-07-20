@@ -206,24 +206,38 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
   // devolvería cero filas, y conservamos lo importado localmente como fallback.
   useEffect(() => {
     let activo = true;
-    (async () => {
-      const {
-        data: { session },
-      } = await supabase.auth.getSession();
-      if (!session) return;
 
+    // Carga real de la empresa. RLS ya aísla por `empresa_id = mi_empresa()`,
+    // así que basta con que la petición viaje con la sesión activa.
+    const cargar = async () => {
       const [ventas, productos] = await Promise.all([
         fetchVentasEmpresa(),
         fetchProductosEmpresa(),
       ]);
       if (!activo) return;
-
       // Reemplazamos (no acumulamos) para reflejar el estado real del servidor.
       if (ventas.length) setSales(ventas);
       if (productos.length) setInventory(productos);
-    })();
+    };
+
+    // 1) Intento inicial: si la sesión YA está hidratada, cargamos de una.
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (activo && session) cargar();
+    });
+
+    // 2) Fuente de verdad para el arranque en frío: onAuthStateChange dispara
+    //    cuando el cliente termina de rehidratar la sesión desde storage (evento
+    //    INITIAL_SESSION) o cuando el usuario inicia sesión (SIGNED_IN). Así NO
+    //    consultamos con sesión vacía —causa del dashboard en $0 en incógnito—.
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (activo && session) cargar();
+    });
+
     return () => {
       activo = false;
+      subscription.unsubscribe();
     };
   }, []);
 
