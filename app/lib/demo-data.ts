@@ -156,21 +156,14 @@ export function deriveMonthlyRevenue(sales: Sale[]): MonthPoint[] {
 }
 
 /**
- * Ingreso "titular" para la métrica de Ventas del Mes. Prioriza el mes actual;
- * si el mes actual no tiene datos (o quedó en cero), cae con gracia al último
- * mes registrado con ingresos —la tendencia histórica— en lugar de mostrar $0.
- * Solo devuelve 0 cuando no hay ninguna venta con fecha reconocible.
+ * Ingreso "titular" de la tarjeta de ventas. Ahora suma el ingreso de TODOS los
+ * meses registrados, sin filtrar por el mes actual: la tarjeta muestra el
+ * acumulado de las ventas recibidas, no solo las del mes en curso.
+ *
+ * Nota: `points` solo contiene ventas con fecha reconocible (ver
+ * deriveMonthlyRevenue). Si necesitas incluir también las de fecha ilegible,
+ * súmalas sobre `sales` en el provider, no aquí.
  */
 export function headlineRevenue(points: MonthPoint[]): number {
-  if (points.length === 0) return 0;
-
-  const currentLabel = MONTHS[new Date().getMonth()];
-  const current = points.find((p) => p.month === currentLabel);
-  if (current && current.amount > 0) return current.amount;
-
-  // Fallback: el último mes registrado con ingresos (recorre hacia atrás).
-  for (let i = points.length - 1; i >= 0; i--) {
-    if (points[i].amount > 0) return points[i].amount;
-  }
-  return points[points.length - 1].amount;
+  return points.reduce((sum, p) => sum + p.amount, 0);
 }
