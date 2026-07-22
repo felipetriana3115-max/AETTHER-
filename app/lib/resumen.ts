@@ -28,11 +28,11 @@ type VentaRow = {
   created_at: string; // ISO timestamptz
 };
 
-/** Fila cruda de `public.productos`. */
+/** Fila cruda de `public.productos` (solo las columnas que consumimos). */
 type ProductoRow = {
   id: number;
-  nombre: string;
-  precio: number | string;
+  descripcion: string;
+  precio_venta: number | string; // numeric puede llegar como string desde PostgREST
   stock_actual: number | null;
   codigo_barras: string | null;
 };
@@ -96,8 +96,8 @@ export async function fetchTotalVentasEmpresa(): Promise<number> {
 export async function fetchProductosEmpresa(): Promise<InventoryItem[]> {
   const { data, error } = await supabase
     .from("productos")
-    .select("id, nombre, precio, stock_actual, codigo_barras")
-    .order("nombre", { ascending: true });
+    .select("id, descripcion, precio_venta, stock_actual, codigo_barras")
+    .order("descripcion", { ascending: true });
 
   if (error) {
     console.warn("[resumen] No se pudieron leer los productos:", error.message);
@@ -110,11 +110,92 @@ export async function fetchProductosEmpresa(): Promise<InventoryItem[]> {
       id: row.id,
       clientId: "",
       sku: row.codigo_barras ?? `PRD-${row.id}`,
-      name: row.nombre,
+      name: row.descripcion,
       category: "General",
       stock: row.stock_actual ?? 0,
       minStock: 10,
-      price: Number(row.precio ?? 0),
+      price: Number(row.precio_venta ?? 0),
     };
   });
+}
+
+// ── Integración Compras ⇄ Inventario ─────────────────────────────────────────
+
+/**
+ * Producto del catálogo, tal como lo consume el selector de órdenes de compra.
+ * Mantiene el `codigo_barras` REAL (sin el fallback `PRD-<id>` de InventoryItem),
+ * porque al recibir la orden hay que mapear la referencia existente sin inventarla.
+ */
+export type ProductoCatalogo = {
+  id: number;
+  descripcion: string;
+  codigo_barras: string | null;
+  precio_costo: number;
+};
+
+/**
+ * Catálogo de productos de la empresa autenticada para poblar el <select> del
+ * formulario de compras. Aislado por RLS; devuelve [] sin sesión o ante error.
+ */
+export async function fetchCatalogoProductos(): Promise<ProductoCatalogo[]> {
+  const { data, error } = await supabase
+    .from("productos")
+    .select("id, descripcion, codigo_barras, precio_costo")
+    .order("descripcion", { ascending: true });
+
+  if (error) {
+    console.warn("[resumen] No se pudo cargar el catálogo de productos:", error.message);
+    return [];
+  }
+
+  return (data ?? []).map((p) => {
+    const row = p as {
+      id: number;
+      descripcion: string;
+      codigo_barras: string | null;
+      precio_costo: number | string | null;
+    };
+    return {
+      id: row.id,
+      descripcion: row.descripcion,
+      codigo_barras: row.codigo_barras,
+      precio_costo: Number(row.precio_costo ?? 0),
+    };
+  });
+}
+
+/** Datos mínimos para impactar el inventario al recibir una orden de compra. */
+export type RecibirCompraInput = {
+  /** Id del producto seleccionado del catálogo, o null/omitido si es nuevo. */
+  productoId?: number | null;
+  descripcion: string;
+  codigoBarras?: string | null;
+  unidades: number;
+  /** Costo TOTAL de la orden (se reparte por unidad al dar de alta un producto). */
+  costo: number;
+};
+
+/**
+ * Suma las unidades recibidas al `stock_actual` del producto correspondiente vía
+ * la RPC atómica `recibir_compra` (SECURITY DEFINER, aislada por `mi_empresa()`).
+ * Si el producto no existía en el catálogo, la RPC lo crea con el stock inicial.
+ * Devuelve `true` si el inventario quedó impactado, `false` si hubo error.
+ */
+export async function recibirCompra(input: RecibirCompraInput): Promise<boolean> {
+  const { error } = await supabase.rpc("recibir_compra", {
+    p_producto_id: input.productoId ?? null,
+    p_descripcion: input.descripcion,
+    p_codigo_barras: input.codigoBarras ?? null,
+    p_unidades: input.unidades,
+    p_costo: input.costo,
+  });
+
+  if (error) {
+    console.error(
+      "[resumen] No se pudo impactar el inventario al recibir la compra:",
+      error.message,
+    );
+    return false;
+  }
+  return true;
 }

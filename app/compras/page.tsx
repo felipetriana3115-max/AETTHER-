@@ -6,8 +6,9 @@ import MetricCard from "../components/MetricCard";
 import EmptyState from "../components/EmptyState";
 import ExcelImporter from "../components/ExcelImporter";
 import NewOrderForm from "../components/NewOrderForm";
-import { useDashboard } from "../components/DashboardProvider";
+import { useDashboard, type NewPurchase } from "../components/DashboardProvider";
 import { formatCOP, type PurchaseStatus } from "../lib/data-model";
+import { recibirCompra } from "../lib/resumen";
 
 const statusStyles: Record<PurchaseStatus, string> = {
   Recibido: "bg-emerald-500/10 text-emerald-400 ring-emerald-500/20",
@@ -46,9 +47,30 @@ export default function ComprasPage() {
   ).size;
 
   // Guarda la orden manual en el estado global; la tabla se re-renderiza sola.
-  const handleCreateOrder = (order: Parameters<typeof addPurchases>[0][number]) => {
+  // Si la orden nace en estado "Recibido", impacta el inventario de forma atómica
+  // vía la RPC `recibir_compra` (suma el stock al producto o lo crea si no existe).
+  const handleCreateOrder = async (order: NewPurchase) => {
     addPurchases([order]);
-    showToast("Orden creada", `Nueva orden para ${order.supplier} registrada.`);
+
+    if (order.status !== "Recibido") {
+      showToast("Orden creada", `Nueva orden para ${order.supplier} registrada.`);
+      return;
+    }
+
+    const ok = await recibirCompra({
+      productoId: order.productoId ?? null,
+      descripcion: order.items,
+      codigoBarras: order.codigoBarras ?? null,
+      unidades: order.units,
+      costo: order.cost,
+    });
+
+    showToast(
+      ok ? "Orden recibida" : "Orden creada",
+      ok
+        ? `+${order.units} uds. de ${order.items} sumadas al inventario.`
+        : `Orden para ${order.supplier} registrada, pero no se pudo impactar el stock.`,
+    );
   };
 
   return (

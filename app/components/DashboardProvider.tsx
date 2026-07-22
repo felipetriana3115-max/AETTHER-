@@ -57,6 +57,14 @@ export type NewPurchase = {
   cost: number;
   eta: string;
   status: PurchaseStatus;
+  /**
+   * Vínculo opcional con el catálogo (`productos`) para el impacto en inventario
+   * al recibir. Si `productoId` viene, se suma el stock a ese producto; si no, se
+   * intenta emparejar por `codigoBarras`/descripción y, en última instancia, se
+   * da de alta un producto nuevo. Las importaciones masivas los dejan sin definir.
+   */
+  productoId?: number | null;
+  codigoBarras?: string | null;
 };
 
 /** Lo que puede traer un archivo/lote importado: cualquier combinación de módulos. */

@@ -1,10 +1,13 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { NewPurchase } from "./DashboardProvider";
 import type { PurchaseStatus } from "../lib/data-model";
+import { fetchCatalogoProductos, type ProductoCatalogo } from "../lib/resumen";
 
 const NEW_SUPPLIER = "__new__";
+/** Opción del <select> de producto que activa el alta de un insumo fuera del catálogo. */
+const NEW_PRODUCT = "__new_product__";
 
 const STATUS_OPTIONS: PurchaseStatus[] = ["Pendiente", "Recibido", "Cancelado"];
 
@@ -19,14 +22,23 @@ type Props = {
 
 /**
  * Modal para crear una orden de compra. Mantiene su propio estado de formulario
- * (proveedor, insumo, unidades, costo) y delega la persistencia en `onSubmit`,
+ * (proveedor, producto, unidades, costo) y delega la persistencia en `onSubmit`,
  * que conecta con `addPurchases` del DashboardProvider.
+ *
+ * El insumo ya NO es texto libre: se elige un producto EXISTENTE del catálogo
+ * (`productos`, aislado por RLS) — mapeando su código de barras/referencia — o se
+ * registra uno nuevo. Ese vínculo (`productoId`/`codigoBarras`) viaja en la orden
+ * para que, al recibirla, el stock impacte al producto correcto del inventario.
  */
 export default function NewOrderForm({ open, suppliers, onClose, onSubmit }: Props) {
   // Si aún no hay proveedores, arranca en modo "nuevo proveedor".
   const [supplierChoice, setSupplierChoice] = useState(NEW_SUPPLIER);
   const [newSupplier, setNewSupplier] = useState("");
-  const [items, setItems] = useState("");
+  // Producto: id (como string) de un producto del catálogo, o NEW_PRODUCT para alta.
+  const [productChoice, setProductChoice] = useState(NEW_PRODUCT);
+  const [newProduct, setNewProduct] = useState("");
+  const [barcode, setBarcode] = useState("");
+  const [catalog, setCatalog] = useState<ProductoCatalogo[]>([]);
   const [units, setUnits] = useState("");
   const [cost, setCost] = useState("");
   const [status, setStatus] = useState<PurchaseStatus>("Pendiente");
@@ -40,7 +52,9 @@ export default function NewOrderForm({ open, suppliers, onClose, onSubmit }: Pro
     if (!open) return;
     setSupplierChoice(suppliers.length ? suppliers[0] : NEW_SUPPLIER);
     setNewSupplier("");
-    setItems("");
+    setProductChoice(NEW_PRODUCT);
+    setNewProduct("");
+    setBarcode("");
     setUnits("");
     setCost("");
     setStatus("Pendiente");
@@ -48,6 +62,23 @@ export default function NewOrderForm({ open, suppliers, onClose, onSubmit }: Pro
     setError(null);
     firstFieldRef.current?.focus();
   }, [open, suppliers]);
+
+  // Carga el catálogo (aislado por RLS) para el <select> de productos al abrir.
+  useEffect(() => {
+    if (!open) return;
+    let activo = true;
+    (async () => {
+      const items = await fetchCatalogoProductos();
+      if (!activo) return;
+      setCatalog(items);
+      // Por defecto sugiere el primer producto del catálogo (nudge a reutilizar);
+      // si está vacío, se queda en modo "nuevo producto".
+      if (items.length) setProductChoice(String(items[0].id));
+    })();
+    return () => {
+      activo = false;
+    };
+  }, [open]);
 
   // Cierre con la tecla Escape.
   useEffect(() => {
@@ -60,20 +91,38 @@ export default function NewOrderForm({ open, suppliers, onClose, onSubmit }: Pro
   }, [open, onClose]);
 
   const usingNewSupplier = supplierChoice === NEW_SUPPLIER;
+  const usingNewProduct = productChoice === NEW_PRODUCT;
+
+  const selectedProduct = useMemo(
+    () => (usingNewProduct ? null : catalog.find((p) => String(p.id) === productChoice) ?? null),
+    [usingNewProduct, catalog, productChoice],
+  );
+
+  // Al elegir un producto del catálogo, prellenamos el costo con su precio de
+  // costo conocido (si aún no se ha escrito uno) para acelerar la captura.
+  const handleProductChange = useCallback(
+    (value: string) => {
+      setProductChoice(value);
+      const prod = catalog.find((p) => String(p.id) === value);
+      if (prod && prod.precio_costo > 0) setCost((c) => (c.trim() ? c : String(prod.precio_costo)));
+    },
+    [catalog],
+  );
 
   const handleSubmit = useCallback(
     (e: React.FormEvent) => {
       e.preventDefault();
 
       const supplier = (usingNewSupplier ? newSupplier : supplierChoice).trim();
-      const itemsValue = items.trim();
+      // La descripción sale del producto elegido o del alta manual.
+      const descripcion = (usingNewProduct ? newProduct : selectedProduct?.descripcion ?? "").trim();
 
       if (!supplier) {
         setError("Indica el proveedor.");
         return;
       }
-      if (!itemsValue) {
-        setError("Indica el insumo o material.");
+      if (!descripcion) {
+        setError("Selecciona un producto del catálogo o escribe el nombre de uno nuevo.");
         return;
       }
 
@@ -89,17 +138,40 @@ export default function NewOrderForm({ open, suppliers, onClose, onSubmit }: Pro
         return;
       }
 
+      // Mapeo del vínculo con el catálogo: id + código de barras (real) si es un
+      // producto existente; para uno nuevo, el código de barras es el que se teclee.
+      const productoId = usingNewProduct ? null : selectedProduct?.id ?? null;
+      const codigoBarras = usingNewProduct
+        ? barcode.trim() || null
+        : selectedProduct?.codigo_barras ?? null;
+
       onSubmit({
         supplier,
-        items: itemsValue,
+        items: descripcion,
         units: unitsNum,
         cost: costNum,
         eta: eta.trim() || "Por definir",
         status,
+        productoId,
+        codigoBarras,
       });
       onClose();
     },
-    [usingNewSupplier, newSupplier, supplierChoice, items, units, cost, eta, status, onSubmit, onClose],
+    [
+      usingNewSupplier,
+      newSupplier,
+      supplierChoice,
+      usingNewProduct,
+      newProduct,
+      selectedProduct,
+      barcode,
+      units,
+      cost,
+      eta,
+      status,
+      onSubmit,
+      onClose,
+    ],
   );
 
   if (!open) return null;
@@ -173,19 +245,55 @@ export default function NewOrderForm({ open, suppliers, onClose, onSubmit }: Pro
             )}
           </div>
 
-          {/* Insumo */}
+          {/* Producto (del catálogo de inventario) */}
           <div className="space-y-1.5">
-            <label htmlFor="no-items" className="block text-xs font-medium text-zinc-400">
-              Insumo
+            <label htmlFor="no-product" className="block text-xs font-medium text-zinc-400">
+              Producto
             </label>
-            <input
-              id="no-items"
-              type="text"
-              value={items}
-              onChange={(e) => setItems(e.target.value)}
-              placeholder="Ej. Harina de trigo, empaques…"
-              className="w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-600 outline-none transition-colors focus:border-violet-500/60 focus:ring-1 focus:ring-violet-500/40"
-            />
+            <select
+              id="no-product"
+              value={productChoice}
+              onChange={(e) => handleProductChange(e.target.value)}
+              className="w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 outline-none transition-colors focus:border-violet-500/60 focus:ring-1 focus:ring-violet-500/40"
+            >
+              {catalog.map((p) => (
+                <option key={p.id} value={String(p.id)}>
+                  {p.descripcion}
+                  {p.codigo_barras ? ` · ${p.codigo_barras}` : ""}
+                </option>
+              ))}
+              <option value={NEW_PRODUCT}>+ Nuevo producto…</option>
+            </select>
+
+            {usingNewProduct ? (
+              <div className="mt-1.5 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                <input
+                  type="text"
+                  value={newProduct}
+                  onChange={(e) => setNewProduct(e.target.value)}
+                  placeholder="Nombre del producto"
+                  className="w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-600 outline-none transition-colors focus:border-violet-500/60 focus:ring-1 focus:ring-violet-500/40"
+                />
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  value={barcode}
+                  onChange={(e) => setBarcode(e.target.value)}
+                  placeholder="Código de barras (opcional)"
+                  className="w-full rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-600 outline-none transition-colors focus:border-violet-500/60 focus:ring-1 focus:ring-violet-500/40"
+                />
+              </div>
+            ) : (
+              selectedProduct && (
+                <p className="mt-1 text-xs text-zinc-500">
+                  Ref.:{" "}
+                  <span className="font-mono text-violet-300">
+                    {selectedProduct.codigo_barras ?? "sin código"}
+                  </span>{" "}
+                  · el stock se sumará a este producto al recibir.
+                </p>
+              )
+            )}
           </div>
 
           {/* Unidades + Costo */}

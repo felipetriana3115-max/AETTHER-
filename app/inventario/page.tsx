@@ -34,7 +34,7 @@ export default function InventarioPage() {
     setCargando(true);
     const { data, error } = await supabase
       .from("productos")
-      .select(SELECT)
+      .select("*")
       .order("descripcion", { ascending: true });
     if (error) {
       console.error("[Inventario] No se pudo cargar el catálogo:", error);
