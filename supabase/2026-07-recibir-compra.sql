@@ -28,8 +28,14 @@
 
 begin;
 
+-- El id del catálogo es UUID (igual que en `registrar_venta`). La versión previa
+-- de esta función lo declaraba `bigint`; como cambiar el TIPO de un parámetro crea
+-- una sobrecarga NUEVA (no reemplaza), primero borramos la firma antigua para no
+-- dejar dos `recibir_compra` conviviendo.
+drop function if exists public.recibir_compra(bigint, text, text, integer, numeric);
+
 create or replace function public.recibir_compra(
-  p_producto_id   bigint,   -- id del producto del catálogo (o null / <=0 si es nuevo)
+  p_producto_id   uuid,     -- id del producto del catálogo (o null si es nuevo)
   p_descripcion   text,     -- nombre del insumo/producto (obligatorio para altas)
   p_codigo_barras text,     -- código de barras / referencia (opcional)
   p_unidades      integer,  -- unidades compradas a sumar al stock
@@ -65,7 +71,7 @@ begin
   end;
 
   -- 1) Emparejamiento por id (producto seleccionado del catálogo) ------------
-  if p_producto_id is not null and p_producto_id > 0 then
+  if p_producto_id is not null then
     update public.productos
        set stock_actual = coalesce(stock_actual, 0) + p_unidades
      where id = p_producto_id
@@ -138,7 +144,7 @@ end;
 $$;
 
 -- Solo usuarios autenticados; la función se acota a su empresa vía mi_empresa().
-grant execute on function public.recibir_compra(bigint, text, text, integer, numeric)
+grant execute on function public.recibir_compra(uuid, text, text, integer, numeric)
   to authenticated;
 
 commit;

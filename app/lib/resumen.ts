@@ -119,6 +119,63 @@ export async function fetchProductosEmpresa(): Promise<InventoryItem[]> {
   });
 }
 
+// ── Métricas de rentabilidad (margen real + rotación) ────────────────────────
+
+/**
+ * Margen y rotación de la empresa, calculados en el servidor por la RPC
+ * `metricas_rentabilidad_empresa()` cruzando `ventas.items` con
+ * `productos.precio_costo`. Es la fuente de verdad de ambas métricas del
+ * dashboard: no depende de estado local, así que es idéntica en cada dispositivo.
+ */
+export type MetricasRentabilidad = {
+  /** Ingresos de las líneas de productos del catálogo (Σ qty · precio). */
+  ingresos: number;
+  /** Costo de mercancía vendida — COGS (Σ qty · precio_costo). */
+  costo: number;
+  /** Unidades de catálogo vendidas (excluye artículos comunes). */
+  unidadesVendidas: number;
+  /** Valor del inventario actual a costo (Σ stock_actual · precio_costo). */
+  valorInventarioCosto: number;
+  /** Margen de ganancia en porcentaje, p. ej. 42.5. */
+  margen: number;
+  /** Rotación de inventario en veces, p. ej. 3.2. */
+  rotacion: number;
+};
+
+const METRICAS_VACIAS: MetricasRentabilidad = {
+  ingresos: 0,
+  costo: 0,
+  unidadesVendidas: 0,
+  valorInventarioCosto: 0,
+  margen: 0,
+  rotacion: 0,
+};
+
+/**
+ * Lee las métricas de rentabilidad de la empresa autenticada vía la RPC
+ * `metricas_rentabilidad_empresa()`. Aislada por RLS; sin sesión (o ante error)
+ * devuelve ceros, nunca cifras inventadas en el cliente.
+ */
+export async function fetchMetricasRentabilidad(): Promise<MetricasRentabilidad> {
+  const { data, error } = await supabase.rpc("metricas_rentabilidad_empresa");
+
+  if (error) {
+    console.warn("[resumen] No se pudieron leer las métricas de rentabilidad:", error.message);
+    return METRICAS_VACIAS;
+  }
+
+  // La RPC devuelve un jsonb; los numeric pueden llegar como string desde PostgREST.
+  const row = (data ?? {}) as Record<string, unknown>;
+  return {
+    ingresos: Number(row.ingresos ?? 0),
+    costo: Number(row.costo ?? 0),
+    unidadesVendidas: Number(row.unidades_vendidas ?? 0),
+    valorInventarioCosto: Number(row.valor_inventario_costo ?? 0),
+    margen: Number(row.margen ?? 0),
+    rotacion: Number(row.rotacion ?? 0),
+  };
+}
+
 // ── Integración Compras ⇄ Inventario ─────────────────────────────────────────
 
 /**
@@ -127,7 +184,7 @@ export async function fetchProductosEmpresa(): Promise<InventoryItem[]> {
  * porque al recibir la orden hay que mapear la referencia existente sin inventarla.
  */
 export type ProductoCatalogo = {
-  id: number;
+  id: string; // uuid del catálogo (public.productos.id)
   descripcion: string;
   codigo_barras: string | null;
   precio_costo: number;
@@ -150,7 +207,7 @@ export async function fetchCatalogoProductos(): Promise<ProductoCatalogo[]> {
 
   return (data ?? []).map((p) => {
     const row = p as {
-      id: number;
+      id: string;
       descripcion: string;
       codigo_barras: string | null;
       precio_costo: number | string | null;
@@ -166,8 +223,8 @@ export async function fetchCatalogoProductos(): Promise<ProductoCatalogo[]> {
 
 /** Datos mínimos para impactar el inventario al recibir una orden de compra. */
 export type RecibirCompraInput = {
-  /** Id del producto seleccionado del catálogo, o null/omitido si es nuevo. */
-  productoId?: number | null;
+  /** Id (uuid) del producto seleccionado del catálogo, o null/omitido si es nuevo. */
+  productoId?: string | null;
   descripcion: string;
   codigoBarras?: string | null;
   unidades: number;

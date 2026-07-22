@@ -14,7 +14,7 @@ const statusStyles: Record<SaleStatus, string> = {
 
 export default function VentasPage() {
   // Estado global unificado: reacciona a la carga masiva de Excel.
-  const { sales: recentSales, monthlyRevenue, businessName } = useDashboard();
+  const { sales: recentSales, monthlyRevenue, businessName, metricas } = useDashboard();
 
   const total = monthlyRevenue.reduce((s, m) => s + m.amount, 0);
   const paidSales = recentSales.filter((s) => s.status === "Pagado");
@@ -68,9 +68,7 @@ export default function VentasPage() {
           />
           <MetricCard
             label="Margen de Ganancia"
-            value="62.4%"
-            delta="+1.8%"
-            deltaGood
+            value={`${metricas.margen.toLocaleString("es-CO", { maximumFractionDigits: 1 })}%`}
             tone="emerald"
             icon={
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">

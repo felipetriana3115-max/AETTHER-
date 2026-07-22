@@ -13,10 +13,14 @@ import {
   type PurchaseOrder,
   type PurchaseStatus,
 } from "../lib/data-model";
-import type { BoldPaymentStatus } from "../lib/bold";
-import type { PaymentMethod } from "../lib/payments/types";
 import { supabase } from "../lib/auth";
-import { fetchVentasEmpresa, fetchProductosEmpresa, fetchTotalVentasEmpresa } from "../lib/resumen";
+import {
+  fetchVentasEmpresa,
+  fetchProductosEmpresa,
+  fetchTotalVentasEmpresa,
+  fetchMetricasRentabilidad,
+  type MetricasRentabilidad,
+} from "../lib/resumen";
 
 /** Fila de inventario importada desde Excel/CSV, sin id (lo asigna el proveedor). */
 export type NewInventoryItem = {
@@ -63,7 +67,7 @@ export type NewPurchase = {
    * intenta emparejar por `codigoBarras`/descripción y, en última instancia, se
    * da de alta un producto nuevo. Las importaciones masivas los dejan sin definir.
    */
-  productoId?: number | null;
+  productoId?: string | null;
   codigoBarras?: string | null;
 };
 
@@ -73,18 +77,6 @@ export type ImportBundle = {
   customers?: NewCustomer[];
   sales?: NewSale[];
   purchases?: NewPurchase[];
-};
-
-export type Transaction = {
-  id: string;
-  reference: string;
-  amount: number;
-  method: string;
-  /** Método de pago elegido en el POS (Wompi). Opcional para compatibilidad
-   *  con transacciones previas que solo traían `method` como texto libre. */
-  paymentMethod?: PaymentMethod;
-  status: BoldPaymentStatus;
-  createdAt: string; // ISO
 };
 
 /** Resumen de lo que inyectó la importación, para el resumen y el toast. */
@@ -116,15 +108,14 @@ type DashboardContextValue = {
   addSales: (rows: NewSale[]) => number;
   monthlyRevenue: MonthPoint[];
   salesTotal: number;
+  // Rentabilidad (margen real + rotación, calculados en el servidor)
+  metricas: MetricasRentabilidad;
   // Compras
   purchases: PurchaseOrder[];
   addPurchases: (rows: NewPurchase[]) => number;
   // Importación (uno o varios archivos → uno o varios módulos)
   imported: boolean;
   bulkImport: (bundle: ImportBundle) => BulkImportResult;
-  // Pagos en vivo (Bold)
-  transactions: Transaction[];
-  registerPayment: (tx: Transaction) => void;
   // Toast global
   toast: Toast | null;
   showToast: (title: string, message: string) => void;
@@ -163,12 +154,21 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
   const [purchases, setPurchases] = useState<PurchaseOrder[]>([]);
   const [imported, setImported] = useState(false);
 
-  const [transactions, setTransactions] = useState<Transaction[]>([]);
-
   // Total de ventas: SIEMPRE el número que devuelve la RPC del servidor
   // (`total_ventas_empresa`). NO se deriva de `sales` ni de localStorage, así que
   // es idéntico en todos los dispositivos. Arranca en 0 hasta que la RPC responde.
   const [salesTotal, setSalesTotal] = useState(0);
+
+  // Margen real + rotación: también del servidor (metricas_rentabilidad_empresa),
+  // que cruza ventas.items con productos.precio_costo. Arranca en ceros.
+  const [metricas, setMetricas] = useState<MetricasRentabilidad>({
+    ingresos: 0,
+    costo: 0,
+    unidadesVendidas: 0,
+    valorInventarioCosto: 0,
+    margen: 0,
+    rotacion: 0,
+  });
 
   const [toast, setToast] = useState<Toast | null>(null);
   const [toastSeq, setToastSeq] = useState(0);
@@ -221,10 +221,11 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
     // Carga real de la empresa. RLS ya aísla por `empresa_id = mi_empresa()`,
     // así que basta con que la petición viaje con la sesión activa.
     const cargar = async () => {
-      const [ventas, productos, total] = await Promise.all([
+      const [ventas, productos, total, mets] = await Promise.all([
         fetchVentasEmpresa(),
         fetchProductosEmpresa(),
         fetchTotalVentasEmpresa(),
+        fetchMetricasRentabilidad(),
       ]);
       if (!activo) return;
       // Reemplazamos (no acumulamos) para reflejar el estado real del servidor.
@@ -233,6 +234,8 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
       // El total viene del servidor: se aplica SIEMPRE (incluido 0), para que un
       // dispositivo con localStorage viejo no siga mostrando una cifra fantasma.
       setSalesTotal(total);
+      // Margen y rotación reales: también del servidor, se aplican SIEMPRE.
+      setMetricas(mets);
     };
 
     // 1) Intento inicial: si la sesión YA está hidratada, cargamos de una.
@@ -366,13 +369,6 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
     [addInventoryItems, addCustomers, addSales, addPurchases],
   );
 
-  const registerPayment = useCallback((tx: Transaction) => {
-    // Solo alimenta el panel de transacciones en vivo. El total NO se toca aquí:
-    // sumar el monto en el cliente era justo lo que hacía divergir la cifra entre
-    // dispositivos. El total sale exclusivamente de la RPC del servidor.
-    setTransactions((prev) => [tx, ...prev]);
-  }, []);
-
   const showToast = useCallback((title: string, message: string) => {
     setToastSeq((seq) => {
       const id = seq + 1;
@@ -399,12 +395,12 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
       monthlyRevenue,
       // Total exacto del servidor (RPC), no una derivación local por dispositivo.
       salesTotal,
+      // Margen real + rotación (RPC), tampoco derivados en el cliente.
+      metricas,
       purchases,
       addPurchases,
       imported,
       bulkImport,
-      transactions,
-      registerPayment,
       toast,
       showToast,
       dismissToast,
@@ -420,12 +416,11 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
     addSales,
     monthlyRevenue,
     salesTotal,
+    metricas,
     purchases,
     addPurchases,
     imported,
     bulkImport,
-    transactions,
-    registerPayment,
     toast,
     showToast,
     dismissToast,
