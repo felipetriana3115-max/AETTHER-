@@ -37,7 +37,7 @@ as $$
 declare
   v_empresa  uuid := public.mi_empresa();
   v_item     jsonb;
-  v_id       bigint;
+  v_id       uuid;
   v_qty      integer;
   v_es_comun boolean;
   v_venta_id uuid;
@@ -58,15 +58,24 @@ begin
   end if;
 
   -- 1) Descuento de inventario por línea (solo productos reales) -------------
-  --    Un "artículo común" (esComun) o con id <= 0 es una venta suelta sin
-  --    inventario → se salta el descuento pero sí entra en la venta.
+  --    Un "artículo común" (esComun) es una venta suelta sin inventario: el
+  --    cliente le asigna un id numérico negativo temporal (no es un uuid de
+  --    catálogo) → se salta el descuento pero sí entra en la venta.
   for v_item in select value from jsonb_array_elements(p_items) as t(value)
   loop
     v_es_comun := coalesce((v_item->>'esComun')::boolean, false);
-    v_id       := coalesce((v_item->>'id')::bigint, 0);
-    v_qty      := coalesce((v_item->>'qty')::integer, 0);
 
-    if v_es_comun or v_id <= 0 then
+    -- Descartar comunes ANTES de castear el id: su id temporal (p. ej. -1) no
+    -- es un uuid válido y reventaría el cast a continuación.
+    if v_es_comun then
+      continue;
+    end if;
+
+    v_id  := (v_item->>'id')::uuid;   -- id del producto del catálogo (uuid)
+    v_qty := coalesce((v_item->>'qty')::integer, 0);
+
+    -- Línea sin id de catálogo (suelta y sin marcar): tampoco toca inventario.
+    if v_id is null then
       continue;
     end if;
 
