@@ -3,10 +3,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useHotkeys } from "react-hotkeys-hook";
 import PageShell from "../../components/PageShell";
+import { useDashboard } from "../../components/DashboardProvider";
 import BarcodeScanner, { type BarcodeScannerHandle } from "../../components/BarcodeScanner";
 import { supabase } from "../../lib/auth";
 import { formatCOP } from "../../lib/data-model";
 import { fetchCorteHoy, mapCorte, type CorteCaja } from "../../lib/corte";
+import { loadDeviceSettings } from "../../lib/devices";
+import { printReceipt, type ReceiptData } from "../../lib/receipt";
 
 /**
  * Punto de Venta (POS) táctil — pensado para retail rápido (superior a Eleventa).
@@ -83,6 +86,7 @@ function Placeholder({ nombre }: { nombre: string }) {
 }
 
 export default function PosPage() {
+  const { businessName } = useDashboard();
   const [frecuentes, setFrecuentes] = useState<Producto[]>([]);
   const [carrito, setCarrito] = useState<LineaCarrito[]>([]);
   const [feedback, setFeedback] = useState<Feedback>(null);
@@ -100,6 +104,8 @@ export default function PosPage() {
   const comunIdRef = useRef(-1);
   // Corte de caja del día: alimenta la tarjeta "Vendido hoy".
   const [corteHoy, setCorteHoy] = useState<CorteCaja | null>(null);
+  // Última venta cobrada: habilita reimprimir la tirilla tras vaciar el carrito.
+  const [ultimaVenta, setUltimaVenta] = useState<ReceiptData | null>(null);
 
   // Autolimpia el feedback tras unos segundos para no dejar alertas pegadas.
   useEffect(() => {
@@ -350,7 +356,7 @@ export default function PosPage() {
         }
 
         // La RPC devuelve { venta_id, corte }. Refrescamos la tarjeta del corte.
-        const payload = (data ?? {}) as { corte?: Record<string, unknown> };
+        const payload = (data ?? {}) as { venta_id?: string; corte?: Record<string, unknown> };
         const actualizado = mapCorte(payload.corte ?? null);
         if (actualizado) setCorteHoy(actualizado);
 
@@ -362,6 +368,24 @@ export default function PosPage() {
           }),
         );
 
+        // Arma la tirilla con el carrito ANTES de vaciarlo. El desglose de pagos
+        // se registra por método (hoy una sola línea; preparado para pago mixto).
+        const recibo: ReceiptData = {
+          businessName,
+          ventaId: payload.venta_id,
+          fecha: new Date().toLocaleString("es-CO", { dateStyle: "short", timeStyle: "short" }),
+          items: carrito.map((l) => ({ nombre: l.nombre, qty: l.qty, precio: l.precio })),
+          total,
+          pagos: [{ metodo, monto: total }],
+        };
+        setUltimaVenta(recibo);
+
+        // Impresión automática si la impresora está activa y así configurada.
+        const devices = loadDeviceSettings();
+        if (devices.printer.enabled && devices.printer.autoPrint) {
+          printReceipt(recibo, devices.printer);
+        }
+
         setCarrito([]);
         setFeedback({ tone: "ok", msg: `Venta cobrada con ${metodo}: ${formatCOP(total)}.` });
         inputRef.current?.focus();
@@ -369,8 +393,15 @@ export default function PosPage() {
         setCobrando(false);
       }
     },
-    [carrito, total],
+    [carrito, total, businessName],
   );
+
+  /** Reimprime la tirilla de la última venta (botón manual del POS). */
+  const reimprimir = useCallback(() => {
+    if (!ultimaVenta) return;
+    const devices = loadDeviceSettings();
+    printReceipt(ultimaVenta, devices.printer);
+  }, [ultimaVenta]);
 
   // ── Render ───────────────────────────────────────────────────────────────────
 
@@ -592,6 +623,21 @@ export default function PosPage() {
                 </button>
               ))}
             </div>
+
+            {ultimaVenta && (
+              <button
+                type="button"
+                onClick={reimprimir}
+                className="mt-2.5 inline-flex w-full items-center justify-center gap-2 rounded-lg border border-zinc-700 py-2.5 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-800"
+              >
+                <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M6 9V2h12v7" />
+                  <path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2" />
+                  <path d="M6 14h12v8H6z" />
+                </svg>
+                Reimprimir tirilla ({formatCOP(ultimaVenta.total)})
+              </button>
+            )}
           </div>
         </section>
       </div>

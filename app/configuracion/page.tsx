@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import PageShell from "../components/PageShell";
 import { useDashboard } from "../components/DashboardProvider";
+import DevicesSection from "../components/config/DevicesSection";
 import { generateDailySummary } from "../lib/notifications/whatsapp-service";
 import { runDailyReportMock } from "../lib/cron/daily-report-mock";
 
@@ -158,6 +159,9 @@ export default function ConfiguracionPage() {
             </button>
           </form>
         </section>
+
+        {/* Dispositivos de la caja (POS) */}
+        <DevicesSection />
 
         {/* Reporte diario por WhatsApp */}
         <section className="relative overflow-hidden rounded-xl border border-violet-500/15 bg-zinc-900/50 p-6">
