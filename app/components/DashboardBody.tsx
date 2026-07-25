@@ -6,6 +6,7 @@ import InventoryTable from "./InventoryTable";
 import ExcelImporter from "./ExcelImporter";
 import RotacionPanel from "./RotacionPanel";
 import StockAlertBanner from "./StockAlertBanner";
+import PaymentBreakdownCard from "./PaymentBreakdownCard";
 import { useDashboard } from "./DashboardProvider";
 import { formatCOP, isLowStock } from "../lib/data-model";
 
@@ -73,6 +74,11 @@ export default function DashboardBody() {
             </svg>
           }
         />
+      </section>
+
+      {/* Desglose en tiempo real de lo vendido hoy por método de pago (cuadre de caja) */}
+      <section>
+        <PaymentBreakdownCard />
       </section>
 
       {/* Gráfico + rotación de inventario */}
