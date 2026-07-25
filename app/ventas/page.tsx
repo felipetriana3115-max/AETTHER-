@@ -168,9 +168,15 @@ export default function VentasPage() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-zinc-800/70">
-                {recentSales.map((s) => (
+                {recentSales.map((s, i) => {
+                  // Folio amigable derivado SOLO de la posición en la lista (más
+                  // reciente primero → el índice 0 es el número más alto). Es un
+                  // formateo puramente visual: no altera el `s.id` real (UUID),
+                  // que se conserva en el `title` para trazabilidad relacional.
+                  const folio = `Factura #${String(recentSales.length - i).padStart(5, "0")}`;
+                  return (
                   <tr key={s.id} className="transition-colors hover:bg-zinc-800/40">
-                    <td className="px-5 py-3.5 font-mono text-xs text-violet-300">{s.id}</td>
+                    <td className="px-5 py-3.5 font-mono text-xs font-semibold text-violet-300" title={s.id}>{folio}</td>
                     <td className="px-5 py-3.5 font-medium text-zinc-100">{s.customer}</td>
                     <td className="px-5 py-3.5 text-zinc-400">{s.channel}</td>
                     <td className="px-5 py-3.5 text-zinc-400">{s.method}</td>
@@ -188,7 +194,8 @@ export default function VentasPage() {
                       </span>
                     </td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           </div>
