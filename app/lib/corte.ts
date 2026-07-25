@@ -23,6 +23,14 @@ export type CorteCaja = {
   num_ventas: number;
   created_at: string;
   updated_at: string;
+  // Campos del turno/arqueo (migración 2026-07-arqueo-caja.sql). El POS no los
+  // usa: quedan en sus DEFAULT hasta que el cajero abre/cierra caja.
+  base_inicial: number;
+  estado: "abierta" | "cerrada";
+  abierto_at: string | null;
+  efectivo_contado: number | null; // null hasta el cierre ciego
+  diferencia: number | null; // + sobrante · − faltante · null si no se ha cerrado
+  cerrado_at: string | null;
 };
 
 /**
@@ -45,6 +53,9 @@ export function hoyISO(): string {
 export function mapCorte(raw: Record<string, unknown> | null | undefined): CorteCaja | null {
   if (!raw) return null;
   const n = (v: unknown) => (v == null ? 0 : Number(v));
+  // Nullable: distingue "aún sin cerrar" (null) de "cerrado en cero" (0).
+  const nOrNull = (v: unknown) => (v == null ? null : Number(v));
+  const sOrNull = (v: unknown) => (v == null ? null : String(v));
   return {
     id: String(raw.id ?? ""),
     empresa_id: String(raw.empresa_id ?? ""),
@@ -56,6 +67,12 @@ export function mapCorte(raw: Record<string, unknown> | null | undefined): Corte
     num_ventas: n(raw.num_ventas),
     created_at: String(raw.created_at ?? ""),
     updated_at: String(raw.updated_at ?? ""),
+    base_inicial: n(raw.base_inicial),
+    estado: raw.estado === "cerrada" ? "cerrada" : "abierta",
+    abierto_at: sOrNull(raw.abierto_at),
+    efectivo_contado: nOrNull(raw.efectivo_contado),
+    diferencia: nOrNull(raw.diferencia),
+    cerrado_at: sOrNull(raw.cerrado_at),
   };
 }
 
