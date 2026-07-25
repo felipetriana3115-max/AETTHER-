@@ -34,7 +34,9 @@ type ProductoRow = {
   descripcion: string;
   precio_venta: number | string; // numeric puede llegar como string desde PostgREST
   stock_actual: number | null;
+  stock_minimo: number | string | null;
   codigo_barras: string | null;
+  fecha_vencimiento?: string | null; // date de Postgres → "YYYY-MM-DD"; opcional
 };
 
 /**
@@ -90,22 +92,47 @@ export async function fetchTotalVentasEmpresa(): Promise<number> {
 
 /**
  * Inventario de la empresa autenticada, mapeado a `InventoryItem`. Aislado por
- * RLS. `productos` no tiene categoría ni stock mínimo, así que usamos valores
- * por defecto para las métricas de "stock bajo".
+ * RLS. Trae el `stock_minimo` REAL de la columna (con fallback 10 si viene nulo)
+ * y la `fecha_vencimiento` para las alertas de "insumos por vencer".
+ *
+ * `fecha_vencimiento` es una columna nueva (ver `supabase/2026-07-vencimiento-
+ * insumos.sql`). Si aún no se ha corrido esa migración, PostgREST devuelve el
+ * error 42703 ("columna inexistente"); en ese caso REINTENTAMOS sin la columna
+ * para que la alerta primaria de STOCK siga funcionando pase lo que pase. El
+ * reintento ocurre a lo sumo una vez, así que la validación sigue siendo ligera.
  */
+const PRODUCTOS_SELECT_BASE = "id, descripcion, precio_venta, stock_actual, stock_minimo, codigo_barras";
+
 export async function fetchProductosEmpresa(): Promise<InventoryItem[]> {
-  const { data, error } = await supabase
+  // 1) Intento con `fecha_vencimiento` (feature completa).
+  const conVenc = await supabase
     .from("productos")
-    .select("id, descripcion, precio_venta, stock_actual, codigo_barras")
+    .select(`${PRODUCTOS_SELECT_BASE}, fecha_vencimiento`)
     .order("descripcion", { ascending: true });
+
+  // 2) Fallback: la migración de vencimiento aún no corre → reintenta sin ella.
+  const debeReintentar = conVenc.error?.code === "42703";
+  if (debeReintentar) {
+    console.warn(
+      "[resumen] `productos.fecha_vencimiento` no existe todavía; corre " +
+        "supabase/2026-07-vencimiento-insumos.sql para activar la alerta de vencimiento.",
+    );
+  }
+  const { data, error } = debeReintentar
+    ? await supabase
+        .from("productos")
+        .select(PRODUCTOS_SELECT_BASE)
+        .order("descripcion", { ascending: true })
+    : conVenc;
 
   if (error) {
     console.warn("[resumen] No se pudieron leer los productos:", error.message);
     return [];
   }
 
-  return (data ?? []).map((p) => {
-    const row = p as ProductoRow;
+  return ((data ?? []) as ProductoRow[]).map((p) => {
+    const row = p;
+    const minStock = row.stock_minimo != null ? Number(row.stock_minimo) : 10;
     return {
       id: row.id,
       clientId: "",
@@ -113,8 +140,10 @@ export async function fetchProductosEmpresa(): Promise<InventoryItem[]> {
       name: row.descripcion,
       category: "General",
       stock: row.stock_actual ?? 0,
-      minStock: 10,
+      // Umbral real del catálogo; 10 solo cuando la fila no define stock_minimo.
+      minStock: Number.isFinite(minStock) ? minStock : 10,
       price: Number(row.precio_venta ?? 0),
+      expiryDate: row.fecha_vencimiento ?? null,
     };
   });
 }

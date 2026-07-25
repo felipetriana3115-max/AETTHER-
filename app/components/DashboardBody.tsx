@@ -5,6 +5,7 @@ import SalesChart from "./SalesChart";
 import InventoryTable from "./InventoryTable";
 import ExcelImporter from "./ExcelImporter";
 import RotacionPanel from "./RotacionPanel";
+import StockAlertBanner from "./StockAlertBanner";
 import { useDashboard } from "./DashboardProvider";
 import { formatCOP, isLowStock } from "../lib/data-model";
 
@@ -21,6 +22,9 @@ export default function DashboardBody() {
 
   return (
     <div className="space-y-6">
+      {/* Alertas inteligentes: stock crítico e insumos por vencer (banner flotante) */}
+      <StockAlertBanner />
+
       {/* Métricas clave */}
       <section className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <MetricCard

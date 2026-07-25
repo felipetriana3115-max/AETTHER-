@@ -34,6 +34,8 @@ export type Producto = {
   stock_actual: number;
   stock_minimo: number;
   stock_maximo: number | null;
+  /** Fecha de caducidad (ISO `YYYY-MM-DD`) para insumos perecederos; null si no aplica. */
+  fecha_vencimiento: string | null;
 };
 
 type Departamento = { id: number; nombre: string };
@@ -61,6 +63,7 @@ type FormState = {
   stock_actual: string;
   stock_minimo: string;
   stock_maximo: string;
+  fecha_vencimiento: string;
 };
 
 const TIPOS: { id: TipoProducto; label: string }[] = [
@@ -88,6 +91,7 @@ function toFormState(p?: Producto): FormState {
     stock_actual: p ? String(p.stock_actual) : "",
     stock_minimo: p ? String(p.stock_minimo) : "",
     stock_maximo: p?.stock_maximo != null ? String(p.stock_maximo) : "",
+    fecha_vencimiento: p?.fecha_vencimiento ?? "",
   };
 }
 
@@ -203,6 +207,8 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
         stock_actual: Number(form.stock_actual) || 0,
         stock_minimo: Number(form.stock_minimo) || 0,
         stock_maximo: toNumberOrNull(form.stock_maximo),
+        // Vacío → null (producto que no vence). Alimenta la alerta de vencimiento.
+        fecha_vencimiento: form.fecha_vencimiento.trim() || null,
       empresa_id: profile.empresa_id
 };
       setGuardando(true); //
@@ -422,6 +428,23 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
             className={INPUT}
           />
         </div>
+      </div>
+
+      {/* Fecha de vencimiento (para insumos perecederos → alerta de vencimiento) */}
+      <div>
+        <label htmlFor="pf-vencimiento" className={LABEL}>
+          Fecha de vencimiento
+        </label>
+        <input
+          id="pf-vencimiento"
+          type="date"
+          value={form.fecha_vencimiento}
+          onChange={set("fecha_vencimiento")}
+          className={INPUT}
+        />
+        <p className="mt-1 text-xs text-zinc-500">
+          Opcional. Solo para insumos perecederos; dispara la alerta de vencimiento.
+        </p>
       </div>
 
       {/* Acciones */}

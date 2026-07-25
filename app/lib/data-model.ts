@@ -16,6 +16,12 @@ export type InventoryItem = {
   stock: number;
   minStock: number;
   price: number;
+  /**
+   * Fecha de caducidad (ISO `YYYY-MM-DD`) para insumos perecederos, o null si el
+   * producto no vence / no la tiene registrada. Alimenta la alerta "Insumos por
+   * Vencer"; la mayoría de productos de retail la dejan en null.
+   */
+  expiryDate?: string | null;
 };
 
 export type Tier = "Oro" | "Plata" | "Bronce";
@@ -75,6 +81,57 @@ export const formatCompactCOP = (n: number) =>
 /** Un producto está en "stock bajo" cuando su existencia llega o baja del mínimo. */
 export function isLowStock(item: InventoryItem): boolean {
   return item.stock <= item.minStock;
+}
+
+// ── Alertas inteligentes de inventario ───────────────────────────────────────
+// Reglas de negocio compartidas por el banner del dashboard y la tabla. Son
+// funciones puras sobre `InventoryItem`, así que la validación es "ligera": se
+// evalúa en memoria sobre los datos ya cargados desde Supabase, sin consultas
+// extra.
+
+/**
+ * Umbral de STOCK CRÍTICO: menos de 5 unidades dispara la alerta roja prominente,
+ * independientemente del stock mínimo configurado por producto. Es el aviso de
+ * "quedan poquísimas, repón YA" que pide el negocio.
+ */
+export const CRITICAL_STOCK_THRESHOLD = 5;
+
+/** Ventana (en días) para considerar un insumo "próximo a vencer". */
+export const EXPIRY_SOON_DAYS = 30;
+
+/** Existencia por debajo del umbral crítico (menos de 5 unidades). */
+export function isCriticalStock(item: InventoryItem): boolean {
+  return item.stock < CRITICAL_STOCK_THRESHOLD;
+}
+
+/**
+ * Días que faltan para el vencimiento (negativo = ya vencido, 0 = vence hoy), o
+ * null si el producto no tiene fecha de caducidad registrada. Se compara contra
+ * la medianoche local para que "días" sea un conteo de calendario estable.
+ */
+export function daysUntilExpiry(item: InventoryItem, now: Date = new Date()): number | null {
+  const raw = item.expiryDate;
+  if (!raw) return null;
+  // Columna `date` de Postgres → "YYYY-MM-DD"; la anclamos a medianoche local
+  // para evitar que el desfase UTC reste/sume un día.
+  const exp = new Date(raw.length <= 10 ? `${raw}T00:00:00` : raw);
+  if (Number.isNaN(exp.getTime())) return null;
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const expDay = new Date(exp.getFullYear(), exp.getMonth(), exp.getDate());
+  const MS_PER_DAY = 24 * 60 * 60 * 1000;
+  return Math.round((expDay.getTime() - today.getTime()) / MS_PER_DAY);
+}
+
+/** El insumo ya pasó su fecha de vencimiento. */
+export function isExpired(item: InventoryItem, now: Date = new Date()): boolean {
+  const d = daysUntilExpiry(item, now);
+  return d !== null && d < 0;
+}
+
+/** El insumo vence dentro de la ventana de aviso (hoy … EXPIRY_SOON_DAYS días). */
+export function isExpiringSoon(item: InventoryItem, now: Date = new Date()): boolean {
+  const d = daysUntilExpiry(item, now);
+  return d !== null && d >= 0 && d <= EXPIRY_SOON_DAYS;
 }
 
 /**
