@@ -21,6 +21,12 @@ import {
 
 type Props = {
   cliente: Cliente;
+  /**
+   * Modo con el que abre el panel: "cargo" (Registrar fiado / deuda) o "abono"
+   * (Registrar abono / pago). El comerciante entra directo a la acción que quiere
+   * desde la tabla, sin tener que cambiar de pestaña. Por defecto: "cargo".
+   */
+  initialTipo?: TipoMovimiento;
   /** Notifica al directorio el saldo nuevo tras registrar un movimiento. */
   onSaldoChange?: (clienteId: string, saldo: number) => void;
   onClose?: () => void;
@@ -36,11 +42,11 @@ function fecha(iso: string): string {
   return d.toLocaleString("es-CO", { dateStyle: "medium", timeStyle: "short" });
 }
 
-export default function FiadoPanel({ cliente, onSaldoChange, onClose }: Props) {
+export default function FiadoPanel({ cliente, initialTipo = "cargo", onSaldoChange, onClose }: Props) {
   const [saldo, setSaldo] = useState(cliente.saldo_pendiente);
   const [movimientos, setMovimientos] = useState<MovimientoFiado[]>([]);
   const [cargando, setCargando] = useState(true);
-  const [tipo, setTipo] = useState<TipoMovimiento>("cargo");
+  const [tipo, setTipo] = useState<TipoMovimiento>(initialTipo);
   const [monto, setMonto] = useState("");
   const [descripcion, setDescripcion] = useState("");
   const [guardando, setGuardando] = useState(false);
@@ -57,6 +63,15 @@ export default function FiadoPanel({ cliente, onSaldoChange, onClose }: Props) {
     setSaldo(cliente.saldo_pendiente);
     cargar();
   }, [cliente.id, cliente.saldo_pendiente, cargar]);
+
+  // Al reabrir el panel para otro cliente o desde otro botón (Fiar/Abonar),
+  // arrancamos en el modo con el que se pidió abrir.
+  useEffect(() => {
+    setTipo(initialTipo);
+    setMonto("");
+    setDescripcion("");
+    setError(null);
+  }, [cliente.id, initialTipo]);
 
   const registrar = useCallback(
     async (e: React.FormEvent) => {
@@ -180,9 +195,21 @@ export default function FiadoPanel({ cliente, onSaldoChange, onClose }: Props) {
 
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <div>
-            <label htmlFor="fp-monto" className="mb-1.5 block text-xs font-medium text-zinc-400">
-              Monto (COP)
-            </label>
+            <div className="mb-1.5 flex items-center justify-between gap-2">
+              <label htmlFor="fp-monto" className="block text-xs font-medium text-zinc-400">
+                Monto (COP)
+              </label>
+              {/* Atajo para cancelar la deuda completa: deja el saldo en $0. */}
+              {tipo === "abono" && saldo > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setMonto(String(saldo))}
+                  className="rounded-md px-1.5 py-0.5 text-[11px] font-semibold text-emerald-300 transition-colors hover:bg-emerald-500/10"
+                >
+                  Saldar todo · {formatCOP(saldo)}
+                </button>
+              )}
+            </div>
             <input
               id="fp-monto"
               inputMode="numeric"

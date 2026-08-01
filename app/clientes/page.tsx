@@ -7,7 +7,7 @@ import ClienteForm from "../components/ClienteForm";
 import FiadoPanel from "../components/FiadoPanel";
 import { useDashboard } from "../components/DashboardProvider";
 import { formatCOP } from "../lib/data-model";
-import { fetchClientes, type Cliente } from "../lib/clientes";
+import { fetchClientes, type Cliente, type TipoMovimiento } from "../lib/clientes";
 import { supabase } from "../lib/auth";
 
 /**
@@ -42,8 +42,9 @@ export default function ClientesPage() {
   const [error, setError] = useState<string | null>(null);
   // Modal de alta/edición: null = cerrado, "nuevo" = alta, objeto = edición.
   const [modal, setModal] = useState<"nuevo" | Cliente | null>(null);
-  // Panel de fiados: cliente seleccionado o null.
-  const [fiadoDe, setFiadoDe] = useState<Cliente | null>(null);
+  // Panel de fiados: cliente seleccionado + modo con el que se abre (registrar
+  // deuda vs. registrar abono), o null si está cerrado.
+  const [fiado, setFiado] = useState<{ cliente: Cliente; tipo: TipoMovimiento } | null>(null);
 
   const cargar = useCallback(async () => {
     setCargando(true);
@@ -71,7 +72,11 @@ export default function ClientesPage() {
   // Refresca el saldo de un cliente en la lista tras un movimiento de fiado.
   const onSaldoChange = useCallback((clienteId: string, saldo: number) => {
     setClientes((prev) => prev.map((c) => (c.id === clienteId ? { ...c, saldo_pendiente: saldo } : c)));
-    setFiadoDe((prev) => (prev && prev.id === clienteId ? { ...prev, saldo_pendiente: saldo } : prev));
+    setFiado((prev) =>
+      prev && prev.cliente.id === clienteId
+        ? { ...prev, cliente: { ...prev.cliente, saldo_pendiente: saldo } }
+        : prev,
+    );
   }, []);
 
   const borrar = useCallback(
@@ -193,7 +198,7 @@ export default function ClientesPage() {
 
           {/* Tabla de clientes */}
           <div className="overflow-x-auto rounded-xl border border-violet-500/15 bg-zinc-900/50">
-            <table className="w-full min-w-[760px] text-left text-sm">
+            <table className="w-full min-w-[860px] text-left text-sm">
               <thead className="border-b border-zinc-800 text-xs uppercase tracking-wide text-zinc-500">
                 <tr>
                   <th className="px-4 py-3 font-medium">Cliente</th>
@@ -239,12 +244,17 @@ export default function ClientesPage() {
                         </td>
                         <td className="px-4 py-3 text-right">
                           {debe ? (
-                            <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-500/10 px-2.5 py-1 text-xs font-semibold text-amber-300 ring-1 ring-inset ring-amber-500/30 tabular-nums">
-                              {formatCOP(c.saldo_pendiente)}
-                            </span>
+                            <div className="flex flex-col items-end gap-0.5">
+                              <span className="text-base font-bold text-amber-300 tabular-nums">
+                                {formatCOP(c.saldo_pendiente)}
+                              </span>
+                              <span className="text-[11px] font-medium uppercase tracking-wide text-amber-400/60">
+                                Debe
+                              </span>
+                            </div>
                           ) : (
                             <span className="inline-flex items-center gap-1.5 rounded-full bg-emerald-500/10 px-2.5 py-1 text-xs font-medium text-emerald-300 ring-1 ring-inset ring-emerald-500/20">
-                              Al día
+                              ✓ Al día
                             </span>
                           )}
                         </td>
@@ -252,10 +262,20 @@ export default function ClientesPage() {
                           <div className="flex justify-end gap-2">
                             <button
                               type="button"
-                              onClick={() => setFiadoDe(c)}
+                              onClick={() => setFiado({ cliente: c, tipo: "cargo" })}
+                              title="Registrar una nueva deuda / mercancía fiada"
                               className="rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-1.5 text-xs font-semibold text-amber-200 transition-colors hover:bg-amber-500/15"
                             >
-                              Fiado
+                              + Fiar
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setFiado({ cliente: c, tipo: "abono" })}
+                              disabled={!debe}
+                              title={debe ? "Registrar un abono o cancelar la deuda" : "Sin deuda pendiente"}
+                              className="rounded-lg border border-emerald-500/30 bg-emerald-500/5 px-3 py-1.5 text-xs font-semibold text-emerald-200 transition-colors hover:bg-emerald-500/15 disabled:cursor-not-allowed disabled:border-zinc-800 disabled:bg-transparent disabled:text-zinc-600"
+                            >
+                              − Abonar
                             </button>
                             <button
                               type="button"
@@ -309,22 +329,23 @@ export default function ClientesPage() {
       )}
 
       {/* Panel de fiados (cuenta por cobrar del cliente) */}
-      {fiadoDe && (
+      {fiado && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm"
           role="dialog"
           aria-modal="true"
-          aria-label={`Fiados de ${fiadoDe.nombre}`}
-          onClick={() => setFiadoDe(null)}
+          aria-label={`Fiados de ${fiado.cliente.nombre}`}
+          onClick={() => setFiado(null)}
         >
           <div
             className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-2xl border border-violet-500/25 bg-zinc-900 p-6 shadow-2xl"
             onClick={(e) => e.stopPropagation()}
           >
             <FiadoPanel
-              cliente={fiadoDe}
+              cliente={fiado.cliente}
+              initialTipo={fiado.tipo}
               onSaldoChange={onSaldoChange}
-              onClose={() => setFiadoDe(null)}
+              onClose={() => setFiado(null)}
             />
           </div>
         </div>
