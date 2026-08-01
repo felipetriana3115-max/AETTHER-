@@ -64,9 +64,21 @@ export type VentaOutbox = {
   localId?: number;
   /** UUID generado en el cliente; único e inmutable por venta. */
   clientUuid: string;
+  /**
+   * Método de pago. Además de los de caja ('Efectivo'/'Nequi/Daviplata'/'Bold'),
+   * puede ser 'Fiado': venta a crédito que se carga al saldo de un cliente y NO
+   * entra al corte de caja como efectivo (ver registrar_venta_fiado).
+   */
   metodo: string;
   total: number;
   items: ItemVenta[];
+  /**
+   * Cliente al que se carga el fiado. Solo aplica cuando `metodo === 'Fiado'`;
+   * en las ventas de caja es null. `clienteNombre` se guarda para la tirilla sin
+   * tener que reconsultar el CRM al reimprimir.
+   */
+  clienteId?: string | null;
+  clienteNombre?: string | null;
   /** ISO del momento del cobro (hora local del dispositivo). */
   createdAt: string;
   estado: EstadoOutbox;

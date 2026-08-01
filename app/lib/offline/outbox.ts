@@ -36,6 +36,9 @@ export type NuevaVenta = {
   metodo: string;
   total: number;
   items: ItemVenta[];
+  /** Solo para ventas fiadas: cliente al que se carga el crédito. */
+  clienteId?: string | null;
+  clienteNombre?: string | null;
 };
 
 /**
@@ -49,6 +52,8 @@ export async function enqueueVenta(v: NuevaVenta): Promise<VentaOutbox> {
     metodo: v.metodo,
     total: v.total,
     items: v.items,
+    clienteId: v.clienteId ?? null,
+    clienteNombre: v.clienteNombre ?? null,
     createdAt: new Date().toISOString(),
     estado: "pendiente",
     intentos: 0,
@@ -74,10 +79,14 @@ export async function contarPendientes(): Promise<number> {
   return db.outbox.where("estado").anyOf("pendiente", "error").count();
 }
 
-/** Suma de los totales pendientes (para estimar el "vendido hoy" sin red). */
+/**
+ * Suma de los totales pendientes de CAJA (para estimar el "vendido hoy" sin red).
+ * Excluye las ventas fiadas: un fiado no es efectivo recibido, así que no debe
+ * inflar el corte del día ni la tarjeta de "vendido hoy" mientras espera sync.
+ */
 export async function totalPendiente(): Promise<number> {
   const pend = await getPendientes();
-  return pend.reduce((s, v) => s + v.total, 0);
+  return pend.reduce((s, v) => (v.metodo === "Fiado" ? s : s + v.total), 0);
 }
 
 export type ResultadoSync = {
@@ -169,6 +178,12 @@ type EnvioResultado = {
 
 /** Envía una venta concreta, con fallback a la RPC clásica si hace falta. */
 async function enviarUna(v: VentaOutbox): Promise<EnvioResultado> {
+  // Las ventas fiadas siguen su propio camino atómico (venta + cargo al cliente,
+  // sin sumar al corte de caja). No hay fallback a la RPC de caja: contarían mal
+  // como efectivo y no cargarían el saldo del cliente.
+  if (v.metodo === "Fiado") {
+    return enviarFiado(v);
+  }
   try {
     const { data, error } = await supabase.rpc("registrar_venta_offline", {
       p_client_uuid: v.clientUuid,
@@ -218,6 +233,61 @@ async function enviarClasico(v: VentaOutbox): Promise<EnvioResultado> {
     if (error.code === "P0001" || error.code === "22023") {
       return { ok: false, negocio: true, mensaje: error.message };
     }
+    return { ok: false, mensaje: error.message };
+  } catch (e) {
+    return { ok: false, mensaje: e instanceof Error ? e.message : "Fallo de red." };
+  }
+}
+
+/**
+ * Envía una venta FIADA vía la RPC atómica `registrar_venta_fiado`: descuenta
+ * stock, registra la venta con método 'Fiado' y carga el total al saldo del
+ * cliente, todo en una transacción. No suma al corte de caja.
+ *
+ * A diferencia de las ventas de caja, aquí NO hay fallback a otra RPC: si la
+ * migración 2026-08-fiado-desde-pos.sql aún no se aplicó (función inexistente),
+ * lo tratamos como error de negocio con un mensaje claro y dejamos la venta en la
+ * cola (estado `error`) para no perderla ni contarla mal como efectivo.
+ */
+async function enviarFiado(v: VentaOutbox): Promise<EnvioResultado> {
+  if (!v.clienteId) {
+    return { ok: false, negocio: true, mensaje: "Venta fiada sin cliente asociado; no se puede sincronizar." };
+  }
+  try {
+    const { data, error } = await supabase.rpc("registrar_venta_fiado", {
+      p_client_uuid: v.clientUuid,
+      p_cliente_id: v.clienteId,
+      p_total: v.total,
+      p_items: v.items,
+      p_descripcion: v.clienteNombre ? `Venta a crédito · ${v.clienteNombre}` : null,
+      p_created_at: v.createdAt,
+    });
+
+    if (!error) {
+      // Esta RPC no devuelve corte (el fiado no toca la caja); solo trazabilidad.
+      const payload = (data ?? {}) as { corte?: CorteRpc };
+      return { ok: true, corte: payload.corte ?? null };
+    }
+
+    // Función inexistente (migración sin aplicar): no reintentar en bucle, marcar
+    // como negocio con guía. El fiado no se pierde: queda visible en la cola.
+    if (error.code === "PGRST202" || error.code === "42883") {
+      return {
+        ok: false,
+        negocio: true,
+        mensaje:
+          "Falta aplicar la migración de fiado en POS (supabase/2026-08-fiado-desde-pos.sql).",
+      };
+    }
+    // Sin empresa/sesión → transitorio (requiere re-login).
+    if (error.code === "42501") {
+      return { ok: false, mensaje: "Sesión sin empresa asociada. Inicia sesión de nuevo." };
+    }
+    // Stock insuficiente, cliente inexistente u otra validación → conflicto de negocio.
+    if (error.code === "P0001" || error.code === "22023") {
+      return { ok: false, negocio: true, mensaje: error.message };
+    }
+    // Desconocido: transitorio para no perder la venta.
     return { ok: false, mensaje: error.message };
   } catch (e) {
     return { ok: false, mensaje: e instanceof Error ? e.message : "Fallo de red." };

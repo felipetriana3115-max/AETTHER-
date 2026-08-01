@@ -6,6 +6,7 @@ import PageShell from "../../components/PageShell";
 import { useDashboard } from "../../components/DashboardProvider";
 import BarcodeScanner, { type BarcodeScannerHandle } from "../../components/BarcodeScanner";
 import { formatCOP } from "../../lib/data-model";
+import { fetchClientes, type Cliente } from "../../lib/clientes";
 import { fetchCorteHoy, type CorteCaja } from "../../lib/corte";
 import { loadDeviceSettings } from "../../lib/devices";
 import { printReceipt, type ReceiptData } from "../../lib/receipt";
@@ -48,7 +49,9 @@ type Producto = {
 // tanto NO descuenta stock al cobrar. Se marca con `esComun`.
 type LineaCarrito = Producto & { qty: number; esComun?: boolean };
 
-type MetodoPago = "Efectivo" | "Nequi/Daviplata" | "Bold";
+// Métodos de caja (dinero recibido) + "Fiado" (venta a crédito). El fiado NO es
+// caja: se carga al saldo del cliente y se cobra al abonar (ver registrar_venta_fiado).
+type MetodoPago = "Efectivo" | "Nequi/Daviplata" | "Bold" | "Fiado";
 
 type Feedback = { tone: "error" | "ok"; msg: string } | null;
 
@@ -111,6 +114,17 @@ export default function PosPage() {
   // Última venta cobrada: habilita reimprimir la tirilla tras vaciar el carrito.
   const [ultimaVenta, setUltimaVenta] = useState<ReceiptData | null>(null);
 
+  // ── Cliente + fiado ──────────────────────────────────────────────────────
+  // Directorio del CRM para asociar la venta a un cliente (necesario para fiar).
+  const [clientes, setClientes] = useState<Cliente[]>([]);
+  // Cliente seleccionado para esta venta (null = venta general, sin cliente).
+  const [clienteSel, setClienteSel] = useState<Cliente | null>(null);
+  // Modal de búsqueda/selección de cliente + su término de filtro.
+  const [selectorAbierto, setSelectorAbierto] = useState(false);
+  const [buscarCliente, setBuscarCliente] = useState("");
+  // true si el módulo de clientes/fiados aún no se ha migrado en Supabase.
+  const [faltaFiado, setFaltaFiado] = useState(false);
+
   // Modo Sin Internet: estado de red + cola local de ventas. Al terminar una
   // sincronización con éxito, refrescamos el corte del servidor (fuente de verdad).
   const { online, pendientes, totalPend, sincronizando, sincronizar, refresh } = useOffline(() => {
@@ -153,8 +167,33 @@ export default function PosPage() {
     };
   }, []);
 
+  // Directorio de clientes para poder fiar. Con red viene de Supabase; si la
+  // migración de clientes/fiados no está aplicada, marcamos `faltaFiado` para
+  // guiar al usuario en el selector en vez de romper el POS.
+  useEffect(() => {
+    let activo = true;
+    (async () => {
+      const { clientes, faltaMigracion } = await fetchClientes();
+      if (!activo) return;
+      setClientes(clientes);
+      setFaltaFiado(faltaMigracion);
+    })();
+    return () => {
+      activo = false;
+    };
+  }, []);
+
   const total = useMemo(() => carrito.reduce((s, l) => s + l.precio * l.qty, 0), [carrito]);
   const unidades = useMemo(() => carrito.reduce((s, l) => s + l.qty, 0), [carrito]);
+
+  // Clientes que casan con la búsqueda del selector (nombre / teléfono).
+  const clientesFiltrados = useMemo(() => {
+    const q = buscarCliente.trim().toLowerCase();
+    if (!q) return clientes;
+    return clientes.filter(
+      (c) => c.nombre.toLowerCase().includes(q) || (c.telefono ?? "").toLowerCase().includes(q),
+    );
+  }, [clientes, buscarCliente]);
 
   // ── Carrito ────────────────────────────────────────────────────────────────
 
@@ -314,6 +353,13 @@ export default function PosPage() {
         setFeedback({ tone: "error", msg: "El carrito está vacío." });
         return;
       }
+      // Fiar exige un cliente al que cargar la deuda. Si no hay, abrimos el
+      // selector en vez de cobrar (el total se registraría "en el aire").
+      if (metodo === "Fiado" && !clienteSel) {
+        setFeedback({ tone: "error", msg: "Selecciona un cliente para registrar el fiado." });
+        setSelectorAbierto(true);
+        return;
+      }
       // Validación de stock en cliente: feedback inmediato. El servidor la
       // revalida al sincronizar (fuente de verdad). Los artículos comunes no
       // tienen inventario, así que se excluyen del control de stock.
@@ -341,7 +387,16 @@ export default function PosPage() {
         }));
 
         // 1) Persistir en la cola local ANTES de tocar la red (durabilidad).
-        await enqueueVenta({ metodo, total, items });
+        //    En fiado adjuntamos el cliente: la sincronización cargará el total a
+        //    su saldo vía registrar_venta_fiado (sin sumar al corte de caja).
+        const esFiado = metodo === "Fiado";
+        await enqueueVenta({
+          metodo,
+          total,
+          items,
+          clienteId: esFiado ? clienteSel?.id ?? null : null,
+          clienteNombre: esFiado ? clienteSel?.nombre ?? null : null,
+        });
 
         // 2) Efectos optimistas: descuento local + grid + tirilla + impresión.
         await descontarStockLocal(items);
@@ -352,12 +407,14 @@ export default function PosPage() {
           }),
         );
 
+        // En la tirilla dejamos claro que fue a crédito y a nombre de quién.
+        const nombreFiado = esFiado ? clienteSel?.nombre ?? null : null;
         const recibo: ReceiptData = {
           businessName,
           fecha: new Date().toLocaleString("es-CO", { dateStyle: "short", timeStyle: "short" }),
           items: carrito.map((l) => ({ nombre: l.nombre, qty: l.qty, precio: l.precio })),
           total,
-          pagos: [{ metodo, monto: total }],
+          pagos: [{ metodo: nombreFiado ? `Fiado · ${nombreFiado}` : metodo, monto: total }],
         };
         setUltimaVenta(recibo);
 
@@ -366,7 +423,13 @@ export default function PosPage() {
           printReceipt(recibo, devices.printer);
         }
 
+        const okMsg = esFiado
+          ? `Fiado a ${nombreFiado}: ${formatCOP(total)} cargado a su cuenta.`
+          : `Venta cobrada con ${metodo}: ${formatCOP(total)}.`;
+
         setCarrito([]);
+        // Soltamos el cliente tras fiar para no cargarle sin querer la próxima venta.
+        if (esFiado) setClienteSel(null);
         inputRef.current?.focus();
 
         // 3) Sincronizar si hay red. Con conexión, el corte se refresca vía el
@@ -377,21 +440,34 @@ export default function PosPage() {
           if (r && r.conError > 0) {
             setFeedback({
               tone: "error",
-              msg: "Venta guardada, pero el servidor rechazó una sincronización (revisa el stock). Pulsa Sincronizar.",
+              msg: esFiado
+                ? "Fiado guardado, pero el servidor rechazó la sincronización (revisa el stock o el cliente). Pulsa Sincronizar."
+                : "Venta guardada, pero el servidor rechazó una sincronización (revisa el stock). Pulsa Sincronizar.",
             });
           } else if (r && r.detuvoPorRed) {
             setFeedback({
               tone: "ok",
-              msg: `Venta cobrada (${formatCOP(total)}). Quedó pendiente por conexión; se reintentará.`,
+              msg: esFiado
+                ? `Fiado a ${nombreFiado} (${formatCOP(total)}) quedó pendiente por conexión; se cargará al reintentar.`
+                : `Venta cobrada (${formatCOP(total)}). Quedó pendiente por conexión; se reintentará.`,
             });
           } else {
-            setFeedback({ tone: "ok", msg: `Venta cobrada con ${metodo}: ${formatCOP(total)}.` });
+            setFeedback({ tone: "ok", msg: okMsg });
+            // Refrescamos el saldo del cliente en el selector tras cargar el fiado,
+            // para que un segundo fiado al mismo cliente muestre su deuda al día.
+            if (esFiado) {
+              fetchClientes().then(({ clientes }) => {
+                if (clientes.length > 0) setClientes(clientes);
+              });
+            }
           }
         } else {
           await refresh();
           setFeedback({
             tone: "ok",
-            msg: `Venta guardada SIN conexión (${formatCOP(total)}). Se sincronizará al volver la red.`,
+            msg: esFiado
+              ? `Fiado a ${nombreFiado} guardado SIN conexión (${formatCOP(total)}). Se cargará a su cuenta al volver la red.`
+              : `Venta guardada SIN conexión (${formatCOP(total)}). Se sincronizará al volver la red.`,
           });
         }
       } catch (e) {
@@ -401,7 +477,7 @@ export default function PosPage() {
         setCobrando(false);
       }
     },
-    [carrito, total, businessName, online, sincronizar, refresh],
+    [carrito, total, businessName, online, sincronizar, refresh, clienteSel],
   );
 
   /** Reimprime la tirilla de la última venta (botón manual del POS). */
@@ -635,8 +711,55 @@ export default function PosPage() {
             )}
           </div>
 
+          {/* Cliente de la venta (obligatorio para fiar) */}
+          <div className="border-t border-zinc-800 p-4 pb-0">
+            <div className="flex items-center justify-between gap-3 rounded-xl border border-zinc-800 bg-zinc-950/60 p-3">
+              <div className="flex min-w-0 items-center gap-2.5">
+                <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-violet-500/15 text-base">
+                  👤
+                </span>
+                <div className="min-w-0">
+                  <p className="text-[11px] font-medium uppercase tracking-wide text-zinc-500">Cliente</p>
+                  {clienteSel ? (
+                    <p className="truncate text-sm font-semibold text-zinc-100">
+                      {clienteSel.nombre}
+                      {clienteSel.saldo_pendiente > 0 && (
+                        <span className="ml-1.5 text-xs font-medium text-amber-400">
+                          debe {formatCOP(clienteSel.saldo_pendiente)}
+                        </span>
+                      )}
+                    </p>
+                  ) : (
+                    <p className="text-sm text-zinc-500">Venta general (sin cliente)</p>
+                  )}
+                </div>
+              </div>
+              <div className="flex shrink-0 items-center gap-1.5">
+                {clienteSel && (
+                  <button
+                    type="button"
+                    onClick={() => setClienteSel(null)}
+                    className="rounded-lg px-2 py-1.5 text-xs font-medium text-zinc-500 transition-colors hover:bg-zinc-800 hover:text-zinc-300"
+                  >
+                    Quitar
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setBuscarCliente("");
+                    setSelectorAbierto(true);
+                  }}
+                  className="rounded-lg border border-violet-500/40 bg-violet-500/10 px-3 py-1.5 text-xs font-semibold text-violet-200 transition-colors hover:bg-violet-500/20"
+                >
+                  {clienteSel ? "Cambiar" : "Seleccionar"}
+                </button>
+              </div>
+            </div>
+          </div>
+
           {/* Total + botones de pago rápido */}
-          <div className="border-t border-zinc-800 p-4">
+          <div className="border-t-0 p-4">
             <div className="mb-4 flex items-baseline justify-between">
               <span className="text-sm text-zinc-400">Total</span>
               <span className="text-3xl font-bold tracking-tight text-zinc-50">{formatCOP(total)}</span>
@@ -658,6 +781,23 @@ export default function PosPage() {
                   <span className="text-xl">{cobrando ? "…" : "→"}</span>
                 </button>
               ))}
+
+              {/* Fiado (venta a crédito): carga el total al saldo del cliente. */}
+              <button
+                type="button"
+                disabled={cobrando || carrito.length === 0}
+                onClick={() => cobrar("Fiado")}
+                title={clienteSel ? `Fiar a ${clienteSel.nombre}` : "Selecciona un cliente para fiar"}
+                className="flex h-16 w-full items-center justify-between rounded-xl border-2 border-dashed border-amber-500/50 bg-amber-500/10 px-4 text-left text-amber-200 transition-all active:scale-[0.98] hover:bg-amber-500/15 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <span>
+                  <span className="block text-base font-semibold">Fiado (crédito)</span>
+                  <span className="block text-xs text-amber-300/80">
+                    {clienteSel ? `A cuenta de ${clienteSel.nombre}` : "Requiere elegir cliente"}
+                  </span>
+                </span>
+                <span className="text-xl">{cobrando ? "…" : "→"}</span>
+              </button>
             </div>
 
             {ultimaVenta && (
@@ -755,6 +895,103 @@ export default function PosPage() {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* ── Modal: Selector de cliente (para fiar / asociar la venta) ── */}
+      {selectorAbierto && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="cliente-selector-titulo"
+          onClick={() => setSelectorAbierto(false)}
+        >
+          <div
+            className="flex max-h-[85vh] w-full max-w-md flex-col rounded-2xl border border-violet-500/25 bg-zinc-900 p-6 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 id="cliente-selector-titulo" className="text-base font-semibold text-zinc-100">
+                  Selecciona un cliente
+                </h3>
+                <p className="mt-1 text-xs text-zinc-500">
+                  Asocia la venta a un cliente para poder fiarla.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSelectorAbierto(false)}
+                aria-label="Cerrar"
+                className="shrink-0 rounded-lg p-1.5 text-zinc-500 transition-colors hover:bg-zinc-800 hover:text-zinc-200"
+              >
+                <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M18 6 6 18" />
+                  <path d="m6 6 12 12" />
+                </svg>
+              </button>
+            </div>
+
+            {faltaFiado ? (
+              <div className="mt-4 rounded-lg border border-amber-500/30 bg-amber-500/10 p-4 text-sm text-amber-200">
+                El módulo de clientes aún no está activo. Ejecuta{" "}
+                <code className="rounded bg-black/40 px-1.5 py-0.5 font-mono text-xs">
+                  supabase/2026-08-clientes-y-fiados.sql
+                </code>{" "}
+                en Supabase para poder fiar.
+              </div>
+            ) : (
+              <>
+                <input
+                  autoFocus
+                  value={buscarCliente}
+                  onChange={(e) => setBuscarCliente(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") setSelectorAbierto(false);
+                  }}
+                  placeholder="Buscar por nombre o teléfono…"
+                  className="mt-4 w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-3 text-base text-zinc-100 placeholder:text-zinc-500 focus:border-violet-500 focus:outline-none focus:ring-1 focus:ring-violet-500"
+                />
+
+                <div className="mt-3 flex-1 divide-y divide-zinc-800/70 overflow-y-auto rounded-lg border border-zinc-800 bg-zinc-950/60">
+                  {clientes.length === 0 ? (
+                    <p className="p-6 text-center text-sm text-zinc-500">
+                      No hay clientes registrados. Créalos en la sección Clientes.
+                    </p>
+                  ) : clientesFiltrados.length === 0 ? (
+                    <p className="p-6 text-center text-sm text-zinc-500">
+                      Sin resultados para “{buscarCliente}”.
+                    </p>
+                  ) : (
+                    clientesFiltrados.map((c) => (
+                      <button
+                        key={c.id}
+                        type="button"
+                        onClick={() => {
+                          setClienteSel(c);
+                          setSelectorAbierto(false);
+                        }}
+                        className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left transition-colors hover:bg-violet-500/10"
+                      >
+                        <div className="min-w-0">
+                          <p className="truncate text-sm font-medium text-zinc-100">{c.nombre}</p>
+                          {c.telefono && <p className="truncate text-xs text-zinc-500">{c.telefono}</p>}
+                        </div>
+                        {c.saldo_pendiente > 0 ? (
+                          <span className="shrink-0 text-xs font-semibold text-amber-400 tabular-nums">
+                            debe {formatCOP(c.saldo_pendiente)}
+                          </span>
+                        ) : (
+                          <span className="shrink-0 text-xs text-emerald-400">al día</span>
+                        )}
+                      </button>
+                    ))
+                  )}
+                </div>
+              </>
+            )}
           </div>
         </div>
       )}
