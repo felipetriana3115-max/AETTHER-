@@ -5,11 +5,13 @@ import { useHotkeys } from "react-hotkeys-hook";
 import PageShell from "../../components/PageShell";
 import { useDashboard } from "../../components/DashboardProvider";
 import BarcodeScanner, { type BarcodeScannerHandle } from "../../components/BarcodeScanner";
-import { supabase } from "../../lib/auth";
 import { formatCOP } from "../../lib/data-model";
-import { fetchCorteHoy, mapCorte, type CorteCaja } from "../../lib/corte";
+import { fetchCorteHoy, type CorteCaja } from "../../lib/corte";
 import { loadDeviceSettings } from "../../lib/devices";
 import { printReceipt, type ReceiptData } from "../../lib/receipt";
+import { cacheCatalogo, descontarStockLocal, getFrecuentes } from "../../lib/offline/catalog";
+import { enqueueVenta } from "../../lib/offline/outbox";
+import { useOffline } from "../../lib/offline/useOffline";
 
 /**
  * Punto de Venta (POS) táctil — pensado para retail rápido (superior a Eleventa).
@@ -32,7 +34,9 @@ import { printReceipt, type ReceiptData } from "../../lib/receipt";
 // ── Tipos ────────────────────────────────────────────────────────────────────
 
 type Producto = {
-  id: number;
+  // Los productos reales usan UUID (string); los "artículos comunes" ids
+  // negativos temporales (number). Por eso la clave es `string | number`.
+  id: string | number;
   nombre: string;
   precio: number;
   codigo_barras: string | null;
@@ -92,7 +96,7 @@ export default function PosPage() {
   const [feedback, setFeedback] = useState<Feedback>(null);
   const [cobrando, setCobrando] = useState(false);
   // Línea seleccionada del carrito (para la tecla Delete). Guarda su `id`.
-  const [seleccionado, setSeleccionado] = useState<number | null>(null);
+  const [seleccionado, setSeleccionado] = useState<string | number | null>(null);
   // Modal "Artículo común": abierto + campos del formulario.
   const [comunAbierto, setComunAbierto] = useState(false);
   const [comunNombre, setComunNombre] = useState("");
@@ -107,6 +111,12 @@ export default function PosPage() {
   // Última venta cobrada: habilita reimprimir la tirilla tras vaciar el carrito.
   const [ultimaVenta, setUltimaVenta] = useState<ReceiptData | null>(null);
 
+  // Modo Sin Internet: estado de red + cola local de ventas. Al terminar una
+  // sincronización con éxito, refrescamos el corte del servidor (fuente de verdad).
+  const { online, pendientes, totalPend, sincronizando, sincronizar, refresh } = useOffline(() => {
+    fetchCorteHoy().then((c) => c && setCorteHoy(c));
+  });
+
   // Autolimpia el feedback tras unos segundos para no dejar alertas pegadas.
   useEffect(() => {
     if (!feedback) return;
@@ -114,21 +124,17 @@ export default function PosPage() {
     return () => clearTimeout(t);
   }, [feedback]);
 
-  // Carga inicial de los productos frecuentes para el grid táctil.
+  // Carga inicial del grid táctil + cacheo del catálogo para uso sin conexión.
+  // `cacheCatalogo` refresca el espejo local completo (lo usan el scanner y la
+  // búsqueda cuando no hay red); `getFrecuentes` responde desde Supabase con red
+  // o desde IndexedDB sin ella.
   useEffect(() => {
     let activo = true;
     (async () => {
-      const { data, error } = await supabase
-        .from("productos")
-        .select("id, nombre:descripcion, precio:precio_venta, codigo_barras, stock_actual")
-        .order("descripcion", { ascending: true })
-        .limit(12);
+      void cacheCatalogo();
+      const productos = await getFrecuentes(12);
       if (!activo) return;
-      if (error) {
-        setFeedback({ tone: "error", msg: "No se pudieron cargar los productos." });
-        return;
-      }
-      setFrecuentes((data ?? []) as Producto[]);
+      setFrecuentes(productos as Producto[]);
     })();
     return () => {
       activo = false;
@@ -177,7 +183,7 @@ export default function PosPage() {
     });
   }, []);
 
-  const cambiarQty = useCallback((id: number, delta: number) => {
+  const cambiarQty = useCallback((id: string | number, delta: number) => {
     setCarrito((prev) =>
       prev
         .map((l) => {
@@ -193,7 +199,7 @@ export default function PosPage() {
     );
   }, []);
 
-  const quitar = useCallback((id: number) => {
+  const quitar = useCallback((id: string | number) => {
     setCarrito((prev) => prev.filter((l) => l.id !== id));
     setSeleccionado((sel) => (sel === id ? null : sel));
   }, []);
@@ -291,14 +297,16 @@ export default function PosPage() {
   // ── Cobro (transacción de venta) ─────────────────────────────────────────────
 
   /**
-   * Procesa la venta con el método de pago elegido, de forma ATÓMICA.
+   * Procesa la venta con el método de pago elegido, con enfoque OFFLINE-FIRST.
    *
-   * Todo el cobro (descuento de inventario + registro de la venta + acumulado
-   * del corte de caja) ocurre dentro de una única transacción Postgres, vía la
-   * RPC `public.registrar_venta` (ver migración 2026-07-registrar-venta.sql).
-   * Si cualquier paso falla en el servidor, la BD hace ROLLBACK conjunto: nunca
-   * queda inventario descontado sin venta ni corte descuadrado. El aislamiento
-   * por empresa y el guard anti-sobreventa los impone la propia función.
+   * 1) La venta se persiste PRIMERO en la cola local (IndexedDB/Dexie) con un
+   *    `clientUuid` de idempotencia. Así jamás se pierde, haya red o no.
+   * 2) Se aplican los efectos optimistas: descuento de stock local, tirilla,
+   *    impresión y vaciado del carrito.
+   * 3) Si hay conexión, se dispara la sincronización, que envía la venta (y las
+   *    pendientes) a Supabase vía la RPC idempotente `registrar_venta_offline`.
+   *    Todo el cobro en el servidor (descuento + venta + corte) sigue siendo una
+   *    única transacción atómica; el `clientUuid` evita duplicados en reintentos.
    */
   const cobrar = useCallback(
     async (metodo: MetodoPago) => {
@@ -306,9 +314,9 @@ export default function PosPage() {
         setFeedback({ tone: "error", msg: "El carrito está vacío." });
         return;
       }
-      // Validación de stock en cliente: feedback inmediato antes del round-trip.
-      // El servidor la revalida de todas formas (fuente de verdad). Los artículos
-      // comunes no tienen inventario, así que se excluyen del control de stock.
+      // Validación de stock en cliente: feedback inmediato. El servidor la
+      // revalida al sincronizar (fuente de verdad). Los artículos comunes no
+      // tienen inventario, así que se excluyen del control de stock.
       const sinStock = carrito
         .filter((l) => !l.esComun)
         .find((l) => l.stock_actual <= 0 || l.qty > l.stock_actual);
@@ -322,45 +330,21 @@ export default function PosPage() {
 
       setCobrando(true);
       try {
-        // Un solo viaje al servidor: descuenta stock, inserta la venta y acumula
-        // el corte, todo o nada. `esComun` viaja en cada línea para que la RPC
-        // sepa cuáles saltan el descuento de inventario.
-        const { data, error } = await supabase.rpc("registrar_venta", {
-          p_metodo: metodo,
-          p_total: total,
-          p_items: carrito.map((l) => ({
-            id: l.id,
-            nombre: l.nombre,
-            qty: l.qty,
-            precio: l.precio,
-            esComun: l.esComun ?? false,
-          })),
-        });
+        // `esComun` viaja en cada línea para que la RPC sepa cuáles saltan el
+        // descuento de inventario (mismo shape que ya usaba registrar_venta).
+        const items = carrito.map((l) => ({
+          id: l.id,
+          nombre: l.nombre,
+          qty: l.qty,
+          precio: l.precio,
+          esComun: l.esComun ?? false,
+        }));
 
-        if (error) {
-          // Log completo (code/details/hint) para depurar en consola. La RPC usa
-          // errcodes propios: 42501 = sin empresa/RLS, P0001 = stock insuficiente.
-          console.error("[POS] La venta NO se registró (registrar_venta).", {
-            error,
-            contexto: { metodo, total, items: carrito.length },
-          });
-          const msg =
-            error.code === "42501"
-              ? "La venta NO se guardó: tu usuario no tiene una empresa asociada. Inicia sesión como usuario de una empresa."
-              : error.code === "P0001"
-                ? "La venta NO se guardó: stock insuficiente en el servidor. Refresca el inventario."
-                : `La venta NO se guardó: ${error.message}`;
-          setFeedback({ tone: "error", msg });
-          // No limpiamos el carrito: la transacción se revirtió por completo.
-          return;
-        }
+        // 1) Persistir en la cola local ANTES de tocar la red (durabilidad).
+        await enqueueVenta({ metodo, total, items });
 
-        // La RPC devuelve { venta_id, corte }. Refrescamos la tarjeta del corte.
-        const payload = (data ?? {}) as { venta_id?: string; corte?: Record<string, unknown> };
-        const actualizado = mapCorte(payload.corte ?? null);
-        if (actualizado) setCorteHoy(actualizado);
-
-        // Refleja el nuevo stock en el grid de frecuentes sin recargar.
+        // 2) Efectos optimistas: descuento local + grid + tirilla + impresión.
+        await descontarStockLocal(items);
         setFrecuentes((prev) =>
           prev.map((p) => {
             const vendida = carrito.find((l) => l.id === p.id);
@@ -368,11 +352,8 @@ export default function PosPage() {
           }),
         );
 
-        // Arma la tirilla con el carrito ANTES de vaciarlo. El desglose de pagos
-        // se registra por método (hoy una sola línea; preparado para pago mixto).
         const recibo: ReceiptData = {
           businessName,
-          ventaId: payload.venta_id,
           fecha: new Date().toLocaleString("es-CO", { dateStyle: "short", timeStyle: "short" }),
           items: carrito.map((l) => ({ nombre: l.nombre, qty: l.qty, precio: l.precio })),
           total,
@@ -380,20 +361,47 @@ export default function PosPage() {
         };
         setUltimaVenta(recibo);
 
-        // Impresión automática si la impresora está activa y así configurada.
         const devices = loadDeviceSettings();
         if (devices.printer.enabled && devices.printer.autoPrint) {
           printReceipt(recibo, devices.printer);
         }
 
         setCarrito([]);
-        setFeedback({ tone: "ok", msg: `Venta cobrada con ${metodo}: ${formatCOP(total)}.` });
         inputRef.current?.focus();
+
+        // 3) Sincronizar si hay red. Con conexión, el corte se refresca vía el
+        //    callback `onSynced` de useOffline; sin ella, la tarjeta "Vendido
+        //    hoy" suma los pendientes (ver render).
+        if (online) {
+          const r = await sincronizar();
+          if (r && r.conError > 0) {
+            setFeedback({
+              tone: "error",
+              msg: "Venta guardada, pero el servidor rechazó una sincronización (revisa el stock). Pulsa Sincronizar.",
+            });
+          } else if (r && r.detuvoPorRed) {
+            setFeedback({
+              tone: "ok",
+              msg: `Venta cobrada (${formatCOP(total)}). Quedó pendiente por conexión; se reintentará.`,
+            });
+          } else {
+            setFeedback({ tone: "ok", msg: `Venta cobrada con ${metodo}: ${formatCOP(total)}.` });
+          }
+        } else {
+          await refresh();
+          setFeedback({
+            tone: "ok",
+            msg: `Venta guardada SIN conexión (${formatCOP(total)}). Se sincronizará al volver la red.`,
+          });
+        }
+      } catch (e) {
+        console.error("[POS] No se pudo encolar la venta:", e);
+        setFeedback({ tone: "error", msg: "No se pudo guardar la venta localmente. Intenta de nuevo." });
       } finally {
         setCobrando(false);
       }
     },
-    [carrito, total, businessName],
+    [carrito, total, businessName, online, sincronizar, refresh],
   );
 
   /** Reimprime la tirilla de la última venta (botón manual del POS). */
@@ -421,6 +429,38 @@ export default function PosPage() {
         </div>
       )}
 
+      {/* ── Barra de estado de conexión + sincronización ── */}
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-zinc-800 bg-zinc-900/50 px-4 py-2.5">
+        <div className="flex items-center gap-2 text-sm">
+          <span
+            className={`inline-flex h-2.5 w-2.5 rounded-full ${
+              online ? "bg-emerald-400" : "bg-amber-400"
+            }`}
+            aria-hidden
+          />
+          <span className={online ? "font-medium text-emerald-300" : "font-medium text-amber-300"}>
+            {online ? "En línea" : "Sin conexión"}
+          </span>
+          {pendientes > 0 && (
+            <span className="ml-1 rounded-full bg-amber-500/15 px-2 py-0.5 text-xs font-medium text-amber-300">
+              {pendientes} venta{pendientes === 1 ? "" : "s"} por sincronizar · {formatCOP(totalPend)}
+            </span>
+          )}
+          {online && pendientes === 0 && (
+            <span className="ml-1 text-xs text-zinc-500">Todo sincronizado</span>
+          )}
+        </div>
+        <button
+          type="button"
+          onClick={() => void sincronizar()}
+          disabled={!online || sincronizando || pendientes === 0}
+          className="inline-flex items-center gap-2 rounded-lg border border-violet-500/40 bg-violet-500/10 px-3 py-1.5 text-xs font-semibold text-violet-200 transition-colors hover:bg-violet-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          <span className={sincronizando ? "animate-spin" : ""}>↻</span>
+          {sincronizando ? "Sincronizando…" : `Sincronizar${pendientes > 0 ? ` (${pendientes})` : ""}`}
+        </button>
+      </div>
+
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
         {/* ── Columna izquierda: escáner + grid táctil ── */}
         <section className="space-y-4 lg:col-span-2">
@@ -431,15 +471,7 @@ export default function PosPage() {
             </label>
             <BarcodeScanner
               ref={inputRef}
-              onScan={(p) => {
-                agregar({
-                  id: p.id,
-                  nombre: p.descripcion,
-                  precio: p.precio_venta,
-                  codigo_barras: p.codigo_barras,
-                  stock_actual: p.stock_actual,
-                });
-              }}
+              onScan={(p) => agregar(p)}
               onNotFound={(codigo) => setFeedback({ tone: "error", msg: `Código ${codigo} no encontrado.` })}
               onError={(msg) => setFeedback({ tone: "error", msg })}
             />
@@ -508,12 +540,16 @@ export default function PosPage() {
               <div>
                 <p className="text-[11px] font-medium uppercase tracking-wide text-emerald-400/80">Vendido hoy</p>
                 <p className="text-xs text-zinc-500">
-                  {corteHoy?.num_ventas ?? 0} venta{(corteHoy?.num_ventas ?? 0) === 1 ? "" : "s"}
+                  {(corteHoy?.num_ventas ?? 0) + pendientes} venta
+                  {(corteHoy?.num_ventas ?? 0) + pendientes === 1 ? "" : "s"}
+                  {pendientes > 0 && (
+                    <span className="text-amber-400"> · {pendientes} sin sincronizar</span>
+                  )}
                 </p>
               </div>
             </div>
             <span className="text-xl font-bold tracking-tight text-emerald-300 tabular-nums">
-              {formatCOP(corteHoy?.total_general ?? 0)}
+              {formatCOP((corteHoy?.total_general ?? 0) + totalPend)}
             </span>
           </div>
 

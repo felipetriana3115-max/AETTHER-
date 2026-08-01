@@ -9,20 +9,23 @@ import {
   useState,
   type KeyboardEvent,
 } from "react";
-import { supabase } from "../lib/auth";
+import { findByBarcode } from "../lib/offline/catalog";
+import type { ProductoLocal } from "../lib/offline/db";
 
 /**
  * Escáner de código de barras reutilizable para el POS.
  *
  * Es un input con `autoFocus`: un lector físico "teclea" los dígitos y cierra con
- * Enter, así que capturamos Enter, buscamos en `public.productos` por
- * `codigo_barras` EXACTO y emitimos el resultado por callback. NO gestiona el
- * carrito: eso es responsabilidad del padre (venta_actual), lo que mantiene el
- * componente desacoplado y reusable (POS, entradas de inventario, etc.).
+ * Enter, así que capturamos Enter, buscamos el producto por `codigo_barras`
+ * EXACTO y emitimos el resultado por callback. NO gestiona el carrito: eso es
+ * responsabilidad del padre (venta_actual), lo que mantiene el componente
+ * desacoplado y reusable (POS, entradas de inventario, etc.).
  *
- * El aislamiento por empresa lo impone RLS (`empresa_id = public.mi_empresa()`),
- * así que la consulta NO filtra por tenant en el cliente: con sesión activa solo
- * devuelve productos de la empresa del usuario.
+ * MODO SIN INTERNET: la búsqueda ya NO habla con Supabase directamente, sino con
+ * `findByBarcode` (app/lib/offline/catalog), que consulta Supabase cuando hay red
+ * y cae al catálogo cacheado en IndexedDB cuando no la hay. Así el escaneo sigue
+ * funcionando sin conexión. El aislamiento por empresa lo impone RLS online y el
+ * espejo local ya trae solo los productos de la empresa del usuario.
  */
 
 /**
@@ -31,14 +34,8 @@ import { supabase } from "../lib/auth";
  */
 export type BarcodeScannerHandle = { focus: () => void };
 
-/** Producto devuelto por el escaneo (columnas reales de `public.productos`). */
-export type ProductoEscaneado = {
-  id: number;
-  descripcion: string;
-  precio_venta: number;
-  codigo_barras: string | null;
-  stock_actual: number;
-};
+/** Producto devuelto por el escaneo (espejo de `public.productos`). */
+export type ProductoEscaneado = ProductoLocal;
 
 type Props = {
   /** Se invoca con el producto hallado (para agregarlo a la venta actual). */
@@ -81,10 +78,10 @@ function BarcodeScanner(
   }, []);
 
   /**
-   * Consulta `public.productos` filtrando la columna `codigo_barras` por el valor
-   * EXACTO tecleado/escaneado. Si hay coincidencia la emite por `onScan` y limpia
-   * el campo (listo para el siguiente). `reportarNoEncontrado` solo se activa con
-   * Enter: mientras se escribe no molestamos con avisos de "no encontrado".
+   * Busca el producto por `codigo_barras` EXACTO (online con fallback local). Si
+   * hay coincidencia la emite por `onScan` y limpia el campo (listo para el
+   * siguiente). `reportarNoEncontrado` solo se activa con Enter: mientras se
+   * escribe no molestamos con avisos de "no encontrado".
    */
   const buscar = useCallback(
     async (valorCrudo: string, reportarNoEncontrado: boolean) => {
@@ -95,19 +92,8 @@ function BarcodeScanner(
 
       buscandoRef.current = true;
       try {
-        const { data, error } = await supabase
-          .from("productos")
-          .select("id, descripcion, precio_venta, codigo_barras, stock_actual")
-          .eq("codigo_barras", valor)
-          .limit(1)
-          .maybeSingle();
-
-        if (error) {
-          console.error("[BarcodeScanner] Error al buscar el producto:", error);
-          onError?.("Error al buscar el producto.");
-          return;
-        }
-        if (!data) {
+        const prod = await findByBarcode(valor);
+        if (!prod) {
           // Al escribir aún puede ser un código parcial → silencio hasta Enter.
           if (reportarNoEncontrado) onNotFound?.(valor);
           return;
@@ -115,9 +101,10 @@ function BarcodeScanner(
 
         setCodigo(""); // Coincidencia: limpia para el siguiente código.
         ultimoRef.current = "";
-        // numeric puede llegar como string desde PostgREST → normalizamos.
-        const row = data as ProductoEscaneado;
-        onScan({ ...row, precio_venta: Number(row.precio_venta ?? 0) });
+        onScan(prod);
+      } catch (e) {
+        console.error("[BarcodeScanner] Error al buscar el producto:", e);
+        onError?.("Error al buscar el producto.");
       } finally {
         buscandoRef.current = false;
         inputRef.current?.focus(); // devuelve el foco para el siguiente escaneo

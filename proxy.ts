@@ -53,6 +53,11 @@ export function proxy(request: NextRequest) {
 }
 
 export const config = {
-  // Se ejecuta en todas las rutas salvo API, assets estáticos, imágenes y favicon.
-  matcher: ["/((?!api|_next/static|_next/image|favicon.ico).*)"],
+  // Se ejecuta en todas las rutas salvo API, assets estáticos, imágenes, favicon
+  // y los archivos de la PWA. El manifest y el service worker se piden SIN
+  // credenciales (o deben cargar antes del login), así que no pueden redirigir a
+  // /login: se excluyen aquí para que la app siga siendo instalable y offline.
+  matcher: [
+    "/((?!api|_next/static|_next/image|favicon.ico|manifest.webmanifest|sw.js|icon-192.png|icon-512.png|icon-maskable-512.png).*)",
+  ],
 };
