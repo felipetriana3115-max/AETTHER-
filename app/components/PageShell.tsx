@@ -2,6 +2,7 @@
 
 import { useState, type ReactNode } from "react";
 import Sidebar from "./Sidebar";
+import InstallButton from "./InstallButton";
 
 type PageShellProps = {
   title: string;
@@ -58,6 +59,7 @@ export default function PageShell({ title, subtitle, children, action }: PageShe
 
           <div className="flex items-center gap-3">
             {action}
+            <InstallButton />
             <div className="relative hidden md:block">
               <span className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">

@@ -20,7 +20,7 @@ export default function manifest(): MetadataRoute.Manifest {
     start_url: "/dashboard/pos",
     scope: "/",
     display: "standalone",
-    orientation: "portrait-primary",
+    orientation: "any",
     background_color: "#09090b",
     theme_color: "#7c3aed",
     lang: "es-CO",

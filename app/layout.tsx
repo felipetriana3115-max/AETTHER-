@@ -27,6 +27,15 @@ export const metadata: Metadata = {
 };
 
 export const viewport: Viewport = {
+  // Ancho real del dispositivo y bloqueo del zoom por gesto: en un POS táctil el
+  // "pinch-to-zoom" accidental descuadra la interfaz de cobro. `viewportFit:
+  // "cover"` deja que la app pinte bajo el notch/barras cuando corre instalada.
+  width: 'device-width',
+  initialScale: 1,
+  maximumScale: 1,
+  userScalable: false,
+  viewportFit: 'cover',
+  colorScheme: 'dark',
   themeColor: '#7c3aed',
 };
 
