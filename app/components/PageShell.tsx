@@ -36,7 +36,7 @@ export default function PageShell({ title, subtitle, children, action }: PageShe
       {/* Área principal */}
       <div className="flex min-w-0 flex-1 flex-col">
         {/* Barra superior */}
-        <header className="sticky top-0 z-30 flex h-16 items-center justify-between gap-3 border-b border-violet-500/15 bg-black/70 px-4 backdrop-blur md:px-8">
+        <header className="pt-safe sticky top-0 z-30 flex min-h-16 items-center justify-between gap-3 border-b border-violet-500/15 bg-black/70 px-4 backdrop-blur md:px-8">
           <div className="flex min-w-0 items-center gap-3">
             {/* Botón hamburguesa (solo móvil) */}
             <button

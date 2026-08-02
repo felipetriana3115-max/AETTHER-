@@ -24,3 +24,15 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+@layer utilities {
+  /* Respeta la barra de estado / notch del teléfono cuando la PWA corre con
+     viewportFit: "cover" (ver app/layout.tsx). En escritorio env() vale 0, así
+     que estas clases son inertes fuera del móvil. */
+  .pt-safe {
+    padding-top: env(safe-area-inset-top);
+  }
+  .pb-safe {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+}

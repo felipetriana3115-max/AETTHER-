@@ -147,7 +147,7 @@ export default function Sidebar({ open = false, onClose }: SidebarProps) {
       <div className="pointer-events-none absolute inset-0 bg-gradient-to-b from-violet-950/20 via-transparent to-transparent" />
 
       {/* Marca */}
-      <div className="relative flex h-16 items-center gap-2.5 border-b border-violet-500/15 px-6">
+      <div className="pt-safe relative flex min-h-16 items-center gap-2.5 border-b border-violet-500/15 px-6">
         <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-violet-500 to-fuchsia-600 text-sm font-bold text-white shadow-[0_0_16px_-2px_rgba(139,92,246,0.8)]">
           A
         </span>
@@ -208,7 +208,7 @@ export default function Sidebar({ open = false, onClose }: SidebarProps) {
       </nav>
 
       {/* Cerrar sesión */}
-      <div className="relative border-t border-violet-500/15 p-3">
+      <div className="pb-safe relative border-t border-violet-500/15 p-3">
         <button
           type="button"
           onClick={handleLogout}
