@@ -6,8 +6,7 @@ import { formatCOP } from "../lib/data-model";
 import {
   abrirCaja,
   cerrarCaja,
-  fetchCorteHoy,
-  fetchMovimientosHoy,
+  fetchArqueoHoy,
   registrarMovimiento,
   type CierreResultado,
   type MovimientoCaja,
@@ -59,11 +58,11 @@ export default function CajaPage() {
     return () => clearTimeout(t);
   }, [feedback]);
 
-  // Carga inicial: estado de la caja + movimientos de hoy.
+  // Carga inicial: estado de la caja + movimientos del día en un solo round-trip.
   useEffect(() => {
     let activo = true;
     (async () => {
-      const [c, m] = await Promise.all([fetchCorteHoy(), fetchMovimientosHoy()]);
+      const { corte: c, movimientos: m } = await fetchArqueoHoy();
       if (!activo) return;
       setCorte(c);
       setMovimientos(m);

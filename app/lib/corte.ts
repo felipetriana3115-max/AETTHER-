@@ -34,16 +34,19 @@ export type CorteCaja = {
 };
 
 /**
- * Fecha de hoy en horario LOCAL como `YYYY-MM-DD`. No usamos `toISOString()`
- * porque devuelve UTC y desplazaría la fecha en zonas negativas (Colombia UTC-5)
- * cerca de la medianoche.
+ * Fecha del "día de negocio" en `America/Bogota` como `YYYY-MM-DD`. Fijamos la
+ * zona horaria explícitamente (no la del dispositivo ni UTC) para que coincida
+ * EXACTAMENTE con `public.hoy_negocio()` en la BD: así el arqueo filtra y
+ * reinicia por el mismo día en ambos lados y no arrastra valores de la jornada
+ * anterior cerca de la medianoche. El locale `en-CA` produce `YYYY-MM-DD`.
  */
 export function hoyISO(): string {
-  const d = new Date();
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Bogota",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
 }
 
 /**

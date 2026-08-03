@@ -13,7 +13,7 @@
  */
 
 import { supabase } from "./auth";
-import { hoyISO, mapCorte, type CorteCaja } from "./corte";
+import { mapCorte, type CorteCaja } from "./corte";
 
 export type TipoMovimiento = "ingreso" | "egreso";
 
@@ -52,32 +52,27 @@ export function mapMovimiento(raw: Record<string, unknown>): MovimientoCaja {
   };
 }
 
-/** Estado de la caja de hoy (o null si aún no hay fila para el día). */
-export async function fetchCorteHoy(): Promise<CorteCaja | null> {
-  const { data, error } = await supabase
-    .from("cortes_caja")
-    .select("*")
-    .eq("fecha", hoyISO())
-    .maybeSingle();
-  if (error) {
-    console.warn("[arqueo] No se pudo leer la caja de hoy:", error.message);
-    return null;
-  }
-  return mapCorte(data as Record<string, unknown> | null);
-}
+/** Estado del arqueo del día: el corte (o null) + sus movimientos manuales. */
+export type ArqueoHoy = { corte: CorteCaja | null; movimientos: MovimientoCaja[] };
 
-/** Movimientos manuales (ingresos/egresos) de hoy, más recientes primero. */
-export async function fetchMovimientosHoy(): Promise<MovimientoCaja[]> {
-  const { data, error } = await supabase
-    .from("movimientos_caja")
-    .select("*")
-    .eq("fecha", hoyISO())
-    .order("created_at", { ascending: false });
+/**
+ * Lee el arqueo del día en UNA sola llamada (RPC `arqueo_hoy`). El servidor fija
+ * la fecha con `hoy_negocio()` (America/Bogota), así que el filtro por día es
+ * autoritativo: nunca arrastra registros de jornadas anteriores. `corte` es null
+ * si aún no hay caja para hoy; `movimientos` viene del más reciente al más viejo.
+ */
+export async function fetchArqueoHoy(): Promise<ArqueoHoy> {
+  const { data, error } = await supabase.rpc("arqueo_hoy");
   if (error) {
-    console.warn("[arqueo] No se pudieron leer los movimientos de hoy:", error.message);
-    return [];
+    console.warn("[arqueo] No se pudo leer el arqueo de hoy:", error.message);
+    return { corte: null, movimientos: [] };
   }
-  return (data ?? []).map((r) => mapMovimiento(r as Record<string, unknown>));
+  const p = (data ?? {}) as Record<string, unknown>;
+  const movs = Array.isArray(p.movimientos) ? p.movimientos : [];
+  return {
+    corte: mapCorte(p.corte as Record<string, unknown> | null),
+    movimientos: movs.map((r) => mapMovimiento(r as Record<string, unknown>)),
+  };
 }
 
 /** Abre la caja del día declarando la base inicial en efectivo. */
