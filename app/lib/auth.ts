@@ -201,18 +201,50 @@ export async function signIn(
     console.error("[signIn] mi_empresa() falló (login continúa):", empresaRes.error, "userId:", userId);
   }
 
+  let rolResuelto = (rolRes.data as Rol | null) ?? null;
+  let empresaResuelta = (empresaRes.data as string | null) ?? null;
+
+  // FALLBACK NO FATAL: si los RPC no resolvieron el perfil (p. ej. los helpers
+  // quedaron como INVOKER y RLS los bloquea, o el trigger de alta aún no creó la
+  // fila), intentamos un SELECT directo sobre `usuarios` con `maybeSingle()`.
+  //
+  // `maybeSingle()` es clave: a diferencia de `single()`, si RLS filtra la fila y
+  // devuelve 0 resultados NO lanza el 406 "Not Acceptable" que bloqueaba el login;
+  // simplemente retorna `data: null`. Todo el bloque es best-effort: cualquier
+  // error se registra y se degrada a los valores por defecto, jamás detiene el
+  // login. El aislamiento real lo sigue imponiendo RLS en Postgres.
+  if (rolResuelto === null || empresaResuelta === null) {
+    const { data: perfil, error: perfilError } = await supabase
+      .from("usuarios")
+      .select("rol, empresa_id")
+      .eq("id", userId)
+      .maybeSingle();
+    if (perfilError) {
+      console.error(
+        "[signIn] Fallback SELECT a 'usuarios' falló (login continúa):",
+        perfilError,
+        "userId:",
+        userId,
+      );
+    } else if (perfil) {
+      rolResuelto = rolResuelto ?? ((perfil.rol as Rol | null) ?? null);
+      empresaResuelta = empresaResuelta ?? ((perfil.empresa_id as string | null) ?? null);
+    }
+  }
+
   // Rol por defecto seguro: si no se pudo resolver, tratamos al usuario como
   // 'empresa_empleado' (ruta al dashboard). NUNCA 'super_admin' por defecto.
-  const rol = (rolRes.data as Rol | null) ?? "empresa_empleado";
-  if (!rolRes.data) {
+  const rol = rolResuelto ?? "empresa_empleado";
+  if (rolResuelto === null) {
     console.warn(
       "[signIn] Usuario autenticado sin rol resuelto en 'usuarios'; usando 'empresa_empleado' " +
-        "por defecto. Revisa que exista su fila y que mi_rol() sea SECURITY DEFINER.",
+        "por defecto. Aplica 2026-08-fix-helpers-security-definer.sql para que mi_rol()/mi_empresa() " +
+        "sean SECURITY DEFINER y salten RLS.",
       "userId:",
       userId,
     );
   }
-  const empresaId = (empresaRes.data as string | null) ?? null;
+  const empresaId = empresaResuelta;
 
   // `tipo_negocio` es solo para UI. El super_admin no tiene empresa, por eso se
   // consulta solo si hay empresa_id. Si RLS lo bloquea, la UI usa un fallback vacío.

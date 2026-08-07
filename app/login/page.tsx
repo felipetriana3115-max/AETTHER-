@@ -33,7 +33,26 @@ export default function LoginPage() {
       router.push(destino);
       router.refresh();
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : "Error desconocido";
+      // DIAGNÓSTICO: imprime el objeto de error COMPLETO de Supabase en la consola
+      // del navegador (DevTools) sin ocultarlo tras textos genéricos. Incluye la
+      // representación serializada porque los AuthError/PostgrestError no siempre
+      // muestran sus campos (code, status, name…) al expandir el objeto en consola.
+      console.error("[login] Error crudo al iniciar sesión:", err);
+      try {
+        console.error(
+          "[login] Error (JSON):",
+          JSON.stringify(err, Object.getOwnPropertyNames(err ?? {}), 2),
+        );
+      } catch {
+        // Objeto no serializable: ya quedó impreso arriba en crudo.
+      }
+      // Muestra el mensaje EXACTO en la UI (no un texto genérico) para diagnosticar.
+      const errorMessage =
+        err instanceof Error
+          ? err.message
+          : typeof err === "string"
+            ? err
+            : JSON.stringify(err) || "Error desconocido";
       setError(errorMessage);
       setSubmitting(false);
     }
