@@ -14,7 +14,7 @@
  *    respuesta instantánea desde caché y refresco en segundo plano.
  */
 
-const VERSION = "aether-pos-v1";
+const VERSION = "aether-pos-v2";
 const APP_SHELL = `${VERSION}-shell`;
 const STATIC = `${VERSION}-static`;
 const OFFLINE_URL = "/dashboard/pos";

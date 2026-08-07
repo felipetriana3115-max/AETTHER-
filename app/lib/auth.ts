@@ -134,10 +134,31 @@ export type TenantInfo = { empresaId: string; tipoNegocio: string };
  * código (p. ej. `PGRST116`, `42703`) para que el fallo sea diagnosticable.
  */
 function toError(err: unknown, contexto: string): Error {
-  if (err instanceof Error) return err;
+  if (err instanceof Error) {
+    // AuthError trae `status`/`code` que no se ven en `.message`. Los adjuntamos
+    // al texto para que el fallo sea diagnosticable directamente en la UI.
+    const e = err as Error & { status?: number; code?: string };
+    const extra = [
+      e.status != null && `status=${e.status}`,
+      e.code && `code=${e.code}`,
+    ].filter(Boolean);
+    if (extra.length) return new Error(`${contexto}: ${err.message} (${extra.join(", ")})`);
+    return err;
+  }
   if (err && typeof err === "object") {
-    const e = err as { message?: string; code?: string; details?: string; hint?: string };
-    const partes = [e.message, e.code && `[${e.code}]`, e.hint].filter(Boolean);
+    const e = err as {
+      message?: string;
+      code?: string;
+      status?: number;
+      details?: string;
+      hint?: string;
+    };
+    const partes = [
+      e.message,
+      e.status != null && `status=${e.status}`,
+      e.code && `code=${e.code}`,
+      e.hint,
+    ].filter(Boolean);
     return new Error(`${contexto}: ${partes.join(" ") || "error desconocido"}`);
   }
   return new Error(`${contexto}: ${String(err)}`);

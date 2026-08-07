@@ -38,6 +38,14 @@ export default function LoginPage() {
       // representación serializada porque los AuthError/PostgrestError no siempre
       // muestran sus campos (code, status, name…) al expandir el objeto en consola.
       console.error("[login] Error crudo al iniciar sesión:", err);
+      // Desglose explícito de los campos que Supabase no muestra en `.message`.
+      {
+        const e = err as { message?: string; status?: number; code?: string; name?: string };
+        console.error("[login] message:", e?.message);
+        console.error("[login] status:", e?.status);
+        console.error("[login] code:", e?.code);
+        console.error("[login] name:", e?.name);
+      }
       try {
         console.error(
           "[login] Error (JSON):",
