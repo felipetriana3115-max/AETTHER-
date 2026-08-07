@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import PageShell from "../components/PageShell";
 import ProductForm, { type Producto } from "../components/ProductForm";
-import { supabase } from "../lib/auth";
+import { supabase, getEmpresaIdActiva } from "../lib/auth";
 import { formatCOP } from "../lib/data-model";
 
 /**
@@ -32,9 +32,20 @@ export default function InventarioPage() {
   // Carga (o recarga) el catálogo completo. RLS ya lo aísla por empresa.
   const cargar = useCallback(async () => {
     setCargando(true);
+    // Defensa en profundidad: además de RLS, filtramos explícitamente por la
+    // empresa de la sesión viva. Sin empresa resuelta no se consulta y la tabla
+    // queda vacía (nunca se muestran productos de otra empresa).
+    const empresaId = await getEmpresaIdActiva();
+    if (!empresaId) {
+      setProductos([]);
+      setError(null);
+      setCargando(false);
+      return;
+    }
     const { data, error } = await supabase
       .from("productos")
       .select("*")
+      .eq("empresa_id", empresaId)
       .order("descripcion", { ascending: true });
     if (error) {
       console.error("[Inventario] No se pudo cargar el catálogo:", error);

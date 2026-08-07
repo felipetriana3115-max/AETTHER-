@@ -97,9 +97,14 @@ export function clearSession(): void {
   document.cookie = `${ROLE_COOKIE}=; path=/; max-age=0; samesite=lax`;
   try {
     localStorage.removeItem(SESSION_STORAGE_KEY);
+    // Borra el tenant cacheado para que el siguiente usuario NO herede la empresa
+    // del anterior en este navegador (defensa contra fuga entre cuentas).
+    localStorage.removeItem(TENANT_STORAGE_KEY);
   } catch {
     // Ignorar: si la cookie ya se borró, la sesión está cerrada.
   }
+  // Invalida la empresa resuelta en memoria para el filtrado de consultas.
+  empresaActivaCache = null;
 }
 
 /** Devuelve el usuario de la sesión activa (espejo en localStorage) o null. */
@@ -194,6 +199,42 @@ export function getTenant(): TenantInfo | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Caché en memoria de la empresa del usuario autenticado. Se llena en la primera
+ * resolución y se invalida en `clearSession()` (y cuando cambia el usuario).
+ */
+let empresaActivaCache: { userId: string; empresaId: string | null } | null = null;
+
+/**
+ * Resuelve el `empresa_id` del usuario AUTENTICADO desde la sesión viva (no desde
+ * localStorage, que podría estar obsoleto). Fuente autoritativa para el filtrado
+ * explícito por empresa (defensa en profundidad sobre RLS).
+ *
+ * Devuelve `null` si no hay sesión activa o el usuario no tiene empresa
+ * (p. ej. super_admin). Ante ese `null`, las lecturas NO deben ejecutarse y
+ * deben devolver vacío/0 — nunca datos de otra empresa.
+ */
+export async function getEmpresaIdActiva(): Promise<string | null> {
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  if (!user) {
+    empresaActivaCache = null;
+    return null;
+  }
+  // Reutiliza la resolución previa mientras siga siendo el MISMO usuario.
+  if (empresaActivaCache?.userId === user.id) return empresaActivaCache.empresaId;
+
+  const { data, error } = await supabase
+    .from("usuarios")
+    .select("empresa_id")
+    .eq("id", user.id)
+    .single();
+  const empresaId = error ? null : ((data?.empresa_id as string | null) ?? null);
+  empresaActivaCache = { userId: user.id, empresaId };
+  return empresaId;
 }
 
 export type NuevaEmpresa = {

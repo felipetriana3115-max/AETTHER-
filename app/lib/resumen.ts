@@ -5,11 +5,12 @@
  * por empresa lo impone RLS (`empresa_id = public.mi_empresa()`), que resuelve la
  * empresa del usuario autenticado desde `public.usuarios` vía `auth.uid()`.
  *
- * POR ESO estas consultas NO llevan `.eq('empresa_id', ...)`: añadirlo obligaría a
- * leer el tenant en el cliente (localStorage/user_metadata), justo el patrón frágil
- * que vaciaba el dashboard en incógnito. Con una sesión activa, RLS ya devuelve
- * SOLO las filas de la empresa del usuario. Sin sesión, devuelve cero filas
- * (comportamiento correcto, no un fallo).
+ * DEFENSA EN PROFUNDIDAD: además de RLS, cada consulta filtra explícitamente por
+ * `empresa_id` resuelto desde la SESIÓN VIVA (`getEmpresaIdActiva()`, que lee
+ * `usuarios` por `auth.uid()`), no desde localStorage. Así el filtro no depende de
+ * un caché que pueda quedar obsoleto y no reintroduce la fragilidad de incógnito:
+ * si no hay sesión/empresa, `empresaId` es null → la consulta NO se ejecuta y se
+ * devuelve vacío/0. Nunca se devuelven filas de otra empresa.
  *
  * El TOTAL de ventas NO se suma en el cliente: lo calcula el servidor vía la RPC
  * `total_ventas_empresa()` (ver fetchTotalVentasEmpresa). Así todos los
@@ -17,7 +18,7 @@
  * solo vivían en memoria de un dispositivo.
  */
 
-import { supabase } from "./auth";
+import { supabase, getEmpresaIdActiva } from "./auth";
 import type { InventoryItem, Sale } from "./data-model";
 
 /** Fila cruda de `public.ventas` (solo las columnas que consumimos). */
@@ -45,9 +46,13 @@ type ProductoRow = {
  * `monthIndexFromDate`, así que los ingresos mensuales se derivan solos.
  */
 export async function fetchVentasEmpresa(): Promise<Sale[]> {
+  const empresaId = await getEmpresaIdActiva();
+  if (!empresaId) return []; // sin empresa resuelta no se consulta (aislamiento)
+
   const { data, error } = await supabase
     .from("ventas")
     .select("id, total, metodo_pago, created_at")
+    .eq("empresa_id", empresaId)
     .order("created_at", { ascending: false });
 
   if (error) {
@@ -79,6 +84,11 @@ export async function fetchVentasEmpresa(): Promise<Sale[]> {
  * Sin sesión (o ante error) devuelve 0, nunca un número inventado en el cliente.
  */
 export async function fetchTotalVentasEmpresa(): Promise<number> {
+  // La RPC resuelve la empresa server-side vía mi_empresa(); aun así no la
+  // invocamos sin sesión/empresa (defensa en profundidad): devolvemos 0.
+  const empresaId = await getEmpresaIdActiva();
+  if (!empresaId) return 0;
+
   const { data, error } = await supabase.rpc("total_ventas_empresa");
 
   if (error) {
@@ -104,10 +114,14 @@ export async function fetchTotalVentasEmpresa(): Promise<number> {
 const PRODUCTOS_SELECT_BASE = "id, descripcion, precio_venta, stock_actual, stock_minimo, codigo_barras";
 
 export async function fetchProductosEmpresa(): Promise<InventoryItem[]> {
+  const empresaId = await getEmpresaIdActiva();
+  if (!empresaId) return []; // sin empresa resuelta no se consulta (aislamiento)
+
   // 1) Intento con `fecha_vencimiento` (feature completa).
   const conVenc = await supabase
     .from("productos")
     .select(`${PRODUCTOS_SELECT_BASE}, fecha_vencimiento`)
+    .eq("empresa_id", empresaId)
     .order("descripcion", { ascending: true });
 
   // 2) Fallback: la migración de vencimiento aún no corre → reintenta sin ella.
@@ -122,6 +136,7 @@ export async function fetchProductosEmpresa(): Promise<InventoryItem[]> {
     ? await supabase
         .from("productos")
         .select(PRODUCTOS_SELECT_BASE)
+        .eq("empresa_id", empresaId)
         .order("descripcion", { ascending: true })
     : conVenc;
 
@@ -186,6 +201,10 @@ const METRICAS_VACIAS: MetricasRentabilidad = {
  * devuelve ceros, nunca cifras inventadas en el cliente.
  */
 export async function fetchMetricasRentabilidad(): Promise<MetricasRentabilidad> {
+  // Igual que total_ventas_empresa: sin sesión/empresa no invocamos la RPC.
+  const empresaId = await getEmpresaIdActiva();
+  if (!empresaId) return METRICAS_VACIAS;
+
   const { data, error } = await supabase.rpc("metricas_rentabilidad_empresa");
 
   if (error) {
@@ -224,9 +243,13 @@ export type ProductoCatalogo = {
  * formulario de compras. Aislado por RLS; devuelve [] sin sesión o ante error.
  */
 export async function fetchCatalogoProductos(): Promise<ProductoCatalogo[]> {
+  const empresaId = await getEmpresaIdActiva();
+  if (!empresaId) return []; // sin empresa resuelta no se consulta (aislamiento)
+
   const { data, error } = await supabase
     .from("productos")
     .select("id, descripcion, codigo_barras, precio_costo")
+    .eq("empresa_id", empresaId)
     .order("descripcion", { ascending: true });
 
   if (error) {

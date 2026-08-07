@@ -13,7 +13,7 @@ import {
   type PurchaseOrder,
   type PurchaseStatus,
 } from "../lib/data-model";
-import { supabase } from "../lib/auth";
+import { supabase, getTenant } from "../lib/auth";
 import {
   fetchVentasEmpresa,
   fetchProductosEmpresa,
@@ -124,11 +124,33 @@ type DashboardContextValue = {
 
 const DashboardContext = createContext<DashboardContextValue | null>(null);
 
-/** Clave de localStorage para persistir la data importada entre recargas. */
-const STORAGE_KEY = "mi-dashboard-erp:v1";
+// ── Caché local SEGMENTADO POR EMPRESA (aislamiento multi-tenant) ────────────
+// El caché de la data importada/cargada se guarda bajo una clave que incluye el
+// `empresa_id` del tenant activo. Antes era una clave GLOBAL, así que al iniciar
+// sesión otra empresa en el MISMO navegador (p. ej. una cuenta nueva y vacía)
+// heredaba del caché los productos/ventas de la empresa anterior (fuga de datos
+// entre tenants). Con la clave segmentada, cada empresa solo puede leer su propio
+// caché y una cuenta nueva arranca vacía.
 
-/** Clave de localStorage para el nombre de la empresa configurado por el usuario. */
-const BUSINESS_NAME_KEY = "mi-dashboard-erp:businessName:v1";
+/** Base de la clave de la data importada (se sufija con el empresa_id). */
+const STORAGE_KEY_BASE = "mi-dashboard-erp:v1";
+
+/** Base de la clave del nombre de la empresa (se sufija con el empresa_id). */
+const BUSINESS_NAME_KEY_BASE = "mi-dashboard-erp:businessName:v1";
+
+/** Claves GLOBALES antiguas (pre-segmentación). Se purgan para borrar datos
+ *  de otro tenant que hubieran quedado cacheados en navegadores existentes. */
+const LEGACY_KEYS = [STORAGE_KEY_BASE, BUSINESS_NAME_KEY_BASE];
+
+/**
+ * Clave de caché del tenant activo, o `null` si aún no se conoce la empresa
+ * (sesión no resuelta o super_admin sin empresa). Con `null` NO se hidrata ni se
+ * persiste nada: así jamás se lee/escribe un caché que no sea el de esta empresa.
+ */
+function tenantKey(base: string): string | null {
+  const empresaId = getTenant()?.empresaId;
+  return empresaId ? `${base}:${empresaId}` : null;
+}
 
 /** Nombre por defecto cuando el usuario aún no ha configurado el suyo. */
 const DEFAULT_BUSINESS_NAME = "Mi Empresa";
@@ -181,7 +203,14 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
+      // Purga cualquier caché GLOBAL antiguo (pre-segmentación): pudo quedar con
+      // datos de otra empresa y sería una fuga entre tenants si se leyera.
+      for (const legacy of LEGACY_KEYS) localStorage.removeItem(legacy);
+
+      // Solo se hidrata el caché de la PROPIA empresa. Sin empresa conocida no se
+      // toca nada (evita heredar datos de otro tenant en el mismo navegador).
+      const key = tenantKey(STORAGE_KEY_BASE);
+      const raw = key ? localStorage.getItem(key) : null;
       if (raw) {
         const saved = JSON.parse(raw) as Partial<{
           inventory: InventoryItem[];
@@ -203,8 +232,10 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (!hydrated) return; // no persistir hasta haber recuperado lo almacenado
+    const key = tenantKey(STORAGE_KEY_BASE);
+    if (!key) return; // sin empresa conocida no se cachea nada (aislamiento)
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ inventory, sales, purchases }));
+      localStorage.setItem(key, JSON.stringify({ inventory, sales, purchases }));
     } catch {
       // cuota excedida o modo privado → se ignora el guardado.
     }
@@ -264,7 +295,8 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
   // el valor por defecto durante el primer render en el servidor/cliente.
   useEffect(() => {
     try {
-      const saved = localStorage.getItem(BUSINESS_NAME_KEY);
+      const key = tenantKey(BUSINESS_NAME_KEY_BASE);
+      const saved = key ? localStorage.getItem(key) : null;
       if (saved) setBusinessNameState(saved);
     } catch {
       // localStorage inaccesible → se conserva el nombre por defecto.
@@ -276,7 +308,8 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
     const next = name.trim() || DEFAULT_BUSINESS_NAME;
     setBusinessNameState(next);
     try {
-      localStorage.setItem(BUSINESS_NAME_KEY, next);
+      const key = tenantKey(BUSINESS_NAME_KEY_BASE);
+      if (key) localStorage.setItem(key, next);
     } catch {
       // cuota excedida o modo privado → se ignora el guardado.
     }
