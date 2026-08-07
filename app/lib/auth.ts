@@ -125,6 +125,25 @@ const TENANT_STORAGE_KEY = "aether:tenant";
 export type TenantInfo = { empresaId: string; tipoNegocio: string };
 
 /**
+ * Normaliza CUALQUIER error de Supabase a un `Error` con mensaje legible.
+ *
+ * `AuthError` extiende `Error`, pero `PostgrestError` es un objeto plano
+ * (`{ message, details, hint, code }`) que NO es `instanceof Error`. Si se
+ * relanza tal cual, el `catch` de la UI (`e instanceof Error ? e.message : …`)
+ * cae al mensaje genérico y oculta la causa real. Esta función preserva el
+ * código (p. ej. `PGRST116`, `42703`) para que el fallo sea diagnosticable.
+ */
+function toError(err: unknown, contexto: string): Error {
+  if (err instanceof Error) return err;
+  if (err && typeof err === "object") {
+    const e = err as { message?: string; code?: string; details?: string; hint?: string };
+    const partes = [e.message, e.code && `[${e.code}]`, e.hint].filter(Boolean);
+    return new Error(`${contexto}: ${partes.join(" ") || "error desconocido"}`);
+  }
+  return new Error(`${contexto}: ${String(err)}`);
+}
+
+/**
  * Inicia sesión, resuelve la empresa del usuario y cachea `tipo_negocio` para UI.
  * El aislamiento real lo impone RLS en Postgres: `empresa_id` aquí es
  * conveniencia, NUNCA control de acceso.
@@ -140,8 +159,9 @@ export async function signIn(
   if (authError) {
     // Captura el objeto completo: distingue AuthApiError (credenciales/correo sin
     // confirmar) de un problema posterior de RLS o de fetching del perfil.
-    console.error("[signIn] Fallo en signInWithPassword:", authError);
-    throw authError;
+    console.error("ERROR REAL LOGIN:", authError);
+    // `AuthError` ya extiende `Error`, pero normalizamos por consistencia.
+    throw toError(authError, "Autenticación rechazada");
   }
 
   // La sesión ya está lista aquí: supabase-js la persiste tras resolver el await,
@@ -154,41 +174,62 @@ export async function signIn(
     throw err;
   }
 
-  // IMPORTANTE: filtramos por `id = userId`. La política RLS `usuarios_select_propio`
-  // permite al super_admin ver TODAS las filas de `usuarios`; sin este `.eq`, un
-  // `.single()` recibía múltiples filas y fallaba con PGRST116 ("multiple rows"),
-  // que era exactamente lo que bloqueaba el login del super_admin.
-  const { data, error } = await supabase
-    .from("usuarios")
-    .select("empresa_id, rol")
-    .eq("id", userId)
-    .single();
-  if (error) {
-    console.error("[signIn] Fallo al leer el perfil en 'usuarios' (RLS/fetch):", error);
-    throw error;
+  // Leemos el perfil (rol + empresa) con las funciones SECURITY DEFINER
+  // `mi_rol()` y `mi_empresa()` por RPC, NO con un SELECT directo sobre `usuarios`.
+  //
+  // MOTIVO (evitar el bloqueo RLS/406): `usuarios` tiene RLS activo, así que un
+  // SELECT directo depende de la política `usuarios_select_propio`. Si esa política
+  // falta o falla, PostgREST devuelve 0 filas y responde 406, bloqueando el login.
+  // Las funciones SECURITY DEFINER corren como el dueño de la tabla y SALTAN RLS
+  // por diseño: resuelven el perfil del usuario autenticado (`auth.uid()`) sin
+  // depender de la política de lectura. Así el login funciona pase lo que pase con
+  // esa política y sin tocar la base de datos.
+  const [rolRes, empresaRes] = await Promise.all([
+    supabase.rpc("mi_rol"),
+    supabase.rpc("mi_empresa"),
+  ]);
+  if (rolRes.error) {
+    console.error("ERROR REAL LOGIN:", rolRes.error);
+    throw toError(rolRes.error, "No se pudo leer tu rol de usuario");
+  }
+  if (empresaRes.error) {
+    console.error("ERROR REAL LOGIN:", empresaRes.error);
+    throw toError(empresaRes.error, "No se pudo leer tu empresa");
   }
 
-  // `tipo_negocio` es solo para UI y se resuelve en una consulta aparte: así el
-  // login no depende de un embed PostgREST (que exige una FK usuarios→empresas).
-  // El super_admin no tiene empresa, por eso se consulta solo si hay empresa_id.
+  const rol = rolRes.data as Rol | null;
+  const empresaId = (empresaRes.data as string | null) ?? null;
+  if (!rol) {
+    // Autenticado pero sin rol resuelto: no existe la fila del usuario en
+    // `usuarios` (el trigger de alta no corrió, o el registro se borró).
+    const err = new Error(
+      "Tu cuenta está autenticada pero no tiene un perfil (rol) asociado en 'usuarios'. " +
+        "Revisa que exista la fila del usuario.",
+    );
+    console.error("ERROR REAL LOGIN:", err, "userId:", userId);
+    throw err;
+  }
+
+  // `tipo_negocio` es solo para UI. El super_admin no tiene empresa, por eso se
+  // consulta solo si hay empresa_id. Si RLS lo bloquea, la UI usa un fallback vacío.
   let tipoNegocio = "";
-  if (data.empresa_id) {
+  if (empresaId) {
     const { data: emp } = await supabase
       .from("empresas")
       .select("tipo_negocio")
-      .eq("id", data.empresa_id)
-      .single();
+      .eq("id", empresaId)
+      .maybeSingle();
     tipoNegocio = emp?.tipo_negocio ?? "";
   }
 
-  const tenant: TenantInfo = { empresaId: data.empresa_id, tipoNegocio };
+  const tenant: TenantInfo = { empresaId: empresaId as string, tipoNegocio };
 
   try {
     localStorage.setItem(TENANT_STORAGE_KEY, JSON.stringify(tenant));
   } catch {
     // Modo privado: la UI usará un fallback; no afecta seguridad.
   }
-  return { ...tenant, rol: data.rol as Rol };
+  return { ...tenant, rol };
 }
 
 /** Lee el tenant cacheado (solo UI). */
@@ -227,12 +268,11 @@ export async function getEmpresaIdActiva(): Promise<string | null> {
   // Reutiliza la resolución previa mientras siga siendo el MISMO usuario.
   if (empresaActivaCache?.userId === user.id) return empresaActivaCache.empresaId;
 
-  const { data, error } = await supabase
-    .from("usuarios")
-    .select("empresa_id")
-    .eq("id", user.id)
-    .single();
-  const empresaId = error ? null : ((data?.empresa_id as string | null) ?? null);
+  // Igual que en `signIn`: se resuelve con la función SECURITY DEFINER `mi_empresa()`
+  // (por RPC) en vez de un SELECT directo sobre `usuarios`, para no depender de la
+  // política RLS de esa tabla ni chocar con un posible bloqueo/406.
+  const { data, error } = await supabase.rpc("mi_empresa");
+  const empresaId = error ? null : ((data as string | null) ?? null);
   empresaActivaCache = { userId: user.id, empresaId };
   return empresaId;
 }

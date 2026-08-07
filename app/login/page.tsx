@@ -32,8 +32,9 @@ export default function LoginPage() {
       const destino = rol === "super_admin" ? "/admin" : "/";
       router.push(destino);
       router.refresh();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "No se pudo iniciar sesión.");
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : "Error desconocido";
+      setError(errorMessage);
       setSubmitting(false);
     }
   }
