@@ -188,27 +188,31 @@ export async function signIn(
     supabase.rpc("mi_rol"),
     supabase.rpc("mi_empresa"),
   ]);
+
+  // La resolución del perfil NO debe tumbar el login. Si el RPC falla (p. ej. el
+  // helper quedó como INVOKER y RLS lo bloquea) o si aún no existe la fila del
+  // usuario en `usuarios` (el trigger de alta no corrió), registramos el error
+  // técnico completo y degradamos a valores por defecto. El aislamiento real lo
+  // impone RLS en Postgres; `empresa_id`/`rol` aquí son solo pistas de UI/enrutado.
   if (rolRes.error) {
-    console.error("ERROR REAL LOGIN:", rolRes.error);
-    throw toError(rolRes.error, "No se pudo leer tu rol de usuario");
+    console.error("[signIn] mi_rol() falló (login continúa):", rolRes.error, "userId:", userId);
   }
   if (empresaRes.error) {
-    console.error("ERROR REAL LOGIN:", empresaRes.error);
-    throw toError(empresaRes.error, "No se pudo leer tu empresa");
+    console.error("[signIn] mi_empresa() falló (login continúa):", empresaRes.error, "userId:", userId);
   }
 
-  const rol = rolRes.data as Rol | null;
-  const empresaId = (empresaRes.data as string | null) ?? null;
-  if (!rol) {
-    // Autenticado pero sin rol resuelto: no existe la fila del usuario en
-    // `usuarios` (el trigger de alta no corrió, o el registro se borró).
-    const err = new Error(
-      "Tu cuenta está autenticada pero no tiene un perfil (rol) asociado en 'usuarios'. " +
-        "Revisa que exista la fila del usuario.",
+  // Rol por defecto seguro: si no se pudo resolver, tratamos al usuario como
+  // 'empresa_empleado' (ruta al dashboard). NUNCA 'super_admin' por defecto.
+  const rol = (rolRes.data as Rol | null) ?? "empresa_empleado";
+  if (!rolRes.data) {
+    console.warn(
+      "[signIn] Usuario autenticado sin rol resuelto en 'usuarios'; usando 'empresa_empleado' " +
+        "por defecto. Revisa que exista su fila y que mi_rol() sea SECURITY DEFINER.",
+      "userId:",
+      userId,
     );
-    console.error("ERROR REAL LOGIN:", err, "userId:", userId);
-    throw err;
   }
+  const empresaId = (empresaRes.data as string | null) ?? null;
 
   // `tipo_negocio` es solo para UI. El super_admin no tiene empresa, por eso se
   // consulta solo si hay empresa_id. Si RLS lo bloquea, la UI usa un fallback vacío.
