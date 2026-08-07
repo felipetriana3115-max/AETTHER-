@@ -1,15 +1,19 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { supabase } from "../lib/auth";
+import { supabase, getEmpresaIdActiva } from "../lib/auth";
 
 /**
  * Alta/edición de productos (inspirado en Eleventa).
  *
  * Fuente de verdad: tabla `public.productos` en Supabase. El aislamiento por
- * empresa lo impone RLS (`empresa_id = public.mi_empresa()`), así que este
- * formulario NUNCA envía `empresa_id`: lo rellena el DEFAULT del servidor y el
- * `with check` de la política lo valida. Mismo patrón que `ventas` y el POS.
+ * empresa lo impone RLS (`empresa_id = public.mi_empresa()`).
+ *
+ * En el ALTA enviamos `empresa_id` EXPLÍCITO (resuelto por `getEmpresaIdActiva()`)
+ * en vez de confiar en el DEFAULT del servidor: así el payload deja de depender
+ * del contexto y podemos verificar/loguear que el ID viaja correcto antes del
+ * INSERT. Si el helper devuelve `null` (usuario sin empresa), abortamos con un
+ * mensaje claro en vez de disparar un RLS opaco. Mismo patrón que `ventas`/POS.
  *
  * `precio_venta` se sugiere solo a partir de `precio_costo` y `margen_ganancia`
  * (precio_venta = costo × (1 + margen/100)), pero queda editable: si el cajero lo
@@ -179,9 +183,9 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
         return;
       }
 
-      // Payload SIN empresa_id: lo estampa el DEFAULT mi_empresa() y lo valida RLS.
-      // Los precios/stocks vacíos van como 0 o null según la columna sea NOT NULL.
-      const payload = {
+      // Campos comunes a alta y edición. Los precios/stocks vacíos van como 0 o
+      // null según la columna sea NOT NULL.
+      const base = {
         codigo_barras: form.codigo_barras.trim() || null,
         descripcion,
         tipo: form.tipo,
@@ -196,12 +200,38 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
         // Vacío → null (producto que no vence). Alimenta la alerta de vencimiento.
         fecha_vencimiento: form.fecha_vencimiento.trim() || null,
       };
+
       setGuardando(true);
       try {
-        // Alta = insert; edición = update acotado por id (RLS lo acota a la empresa).
-        const query = editando
-          ? supabase.from("productos").update(payload).eq("id", producto!.id)
-          : supabase.from("productos").insert(payload);
+        let query;
+        if (editando) {
+          // Edición: RLS acota por `id` a la empresa del usuario; no reescribimos
+          // `empresa_id` (no debe cambiar de dueño).
+          query = supabase.from("productos").update(base).eq("id", producto!.id);
+        } else {
+          // Alta: adjuntamos `empresa_id` EXPLÍCITO en vez de confiar en el DEFAULT
+          // del servidor. Si no hay empresa resoluble, no tiene sentido intentar el
+          // INSERT: el `with check` lo rechazaría con un RLS opaco.
+          const empresaId = await getEmpresaIdActiva();
+          const payload = { ...base, empresa_id: empresaId };
+
+          // Diagnóstico: así se ve exactamente qué viaja al servidor. Si
+          // `empresa_id` sale `null`, el problema es el dato del usuario
+          // (usuarios.empresa_id nulo), NO la política ni el formulario.
+          console.log("[ProductForm] Payload INSERT productos →", payload);
+
+          if (!empresaId) {
+            setError(
+              "Tu usuario no tiene una empresa asignada, así que no se puede crear " +
+                "el producto. Cierra sesión y vuelve a entrar; si persiste, hay que " +
+                "reparar tu cuenta (usuarios.empresa_id está vacío).",
+            );
+            setGuardando(false);
+            return;
+          }
+
+          query = supabase.from("productos").insert(payload);
+        }
 
         const { data, error } = await query.select().single();
 
