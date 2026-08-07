@@ -167,21 +167,7 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
     async (e: React.FormEvent) => {
       e.preventDefault();
       setError(null);
-      // 1. Obtenemos el usuario activo
-    const { data: { user } } = await supabase.auth.getUser();
-    if (!user) return;
 
-    // 2. Buscamos el ID de empresa real en la tabla 'usuarios'
-    const { data: profile } = await supabase
-      .from("usuarios")
-      .select("empresa_id")
-      .eq("id", user.id)
-      .single();
-
-    if (!profile?.empresa_id) {
-      setError("Error: No se pudo identificar tu empresa.");
-      return;
-    }
       const descripcion = form.descripcion.trim();
       if (!descripcion) {
         setError("La descripción es obligatoria.");
@@ -209,9 +195,8 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
         stock_maximo: toNumberOrNull(form.stock_maximo),
         // Vacío → null (producto que no vence). Alimenta la alerta de vencimiento.
         fecha_vencimiento: form.fecha_vencimiento.trim() || null,
-      empresa_id: profile.empresa_id
-};
-      setGuardando(true); //
+      };
+      setGuardando(true);
       try {
         // Alta = insert; edición = update acotado por id (RLS lo acota a la empresa).
         const query = editando
