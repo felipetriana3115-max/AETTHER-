@@ -2,9 +2,10 @@
  * CRM de Clientes + Sistema de Fiados — acceso a datos (Supabase).
  *
  * Fuente de verdad: tablas `public.clientes` y `public.fiados`. El aislamiento por
- * empresa lo impone RLS (`empresa_id = public.mi_empresa()`), así que estas
- * consultas NO llevan `.eq('empresa_id', ...)`: con la sesión activa RLS ya
- * devuelve solo las filas de la empresa del usuario. Mismo patrón que `resumen.ts`.
+ * empresa lo impone RLS (`empresa_id = public.mi_empresa()`) y, como DEFENSA EN
+ * PROFUNDIDAD, cada lectura filtra además por el `empresa_id` de la sesión VIVA
+ * (`getEmpresaIdActiva()`); sin empresa resuelta NO se consulta y se devuelve
+ * vacío. Mismo patrón que `resumen.ts`/`corte.ts`.
  *
  * El SALDO PENDIENTE de cada cliente se lee DESNORMALIZADO de
  * `clientes.saldo_pendiente` (lo mantiene la RPC `registrar_fiado`), por lo que el
@@ -16,7 +17,7 @@
  * de romperse. Ver [[schema-migration-workflow]].
  */
 
-import { supabase } from "./auth";
+import { supabase, getEmpresaIdActiva } from "./auth";
 
 /** Cliente del CRM, tal como lo consume el directorio. */
 export type Cliente = {
@@ -92,9 +93,13 @@ export type FetchClientesResult = {
  * para que la UI guíe a correr el SQL.
  */
 export async function fetchClientes(): Promise<FetchClientesResult> {
+  const empresaId = await getEmpresaIdActiva();
+  if (!empresaId) return { clientes: [], faltaMigracion: false }; // sin empresa → vacío (aislamiento)
+
   const { data, error } = await supabase
     .from("clientes")
     .select("id, nombre, email, telefono, direccion, notas, saldo_pendiente, created_at")
+    .eq("empresa_id", empresaId)
     .order("nombre", { ascending: true });
 
   if (error) {
@@ -117,9 +122,13 @@ export async function fetchClientes(): Promise<FetchClientesResult> {
  * antiguo. Aislado por RLS; devuelve [] sin sesión o ante error.
  */
 export async function fetchMovimientosFiado(clienteId: string): Promise<MovimientoFiado[]> {
+  const empresaId = await getEmpresaIdActiva();
+  if (!empresaId) return []; // sin empresa → vacío (aislamiento)
+
   const { data, error } = await supabase
     .from("fiados")
     .select("id, cliente_id, tipo, monto, descripcion, venta_id, created_at")
+    .eq("empresa_id", empresaId)
     .eq("cliente_id", clienteId)
     .order("created_at", { ascending: false });
 

@@ -10,7 +10,7 @@
  * de turno en Reportes. Centralizar tipo + coerción aquí evita duplicar lógica.
  */
 
-import { supabase } from "./auth";
+import { supabase, getEmpresaIdActiva } from "./auth";
 
 export type CorteCaja = {
   id: string;
@@ -81,9 +81,16 @@ export function mapCorte(raw: Record<string, unknown> | null | undefined): Corte
 
 /** Corte del día de hoy (o null si aún no hay ventas hoy). */
 export async function fetchCorteHoy(): Promise<CorteCaja | null> {
+  // DEFENSA EN PROFUNDIDAD: además de RLS, filtramos explícitamente por la
+  // empresa resuelta desde la SESIÓN VIVA (`mi_empresa()` vía getEmpresaIdActiva).
+  // Sin empresa resuelta NO se consulta → null (nunca cortes de otra empresa).
+  const empresaId = await getEmpresaIdActiva();
+  if (!empresaId) return null;
+
   const { data, error } = await supabase
     .from("cortes_caja")
     .select("*")
+    .eq("empresa_id", empresaId)
     .eq("fecha", hoyISO())
     .maybeSingle();
   if (error) {
@@ -95,9 +102,15 @@ export async function fetchCorteHoy(): Promise<CorteCaja | null> {
 
 /** Historial de cortes recientes (más reciente primero) para el cierre de turno. */
 export async function fetchCortes(limit = 30): Promise<CorteCaja[]> {
+  // DEFENSA EN PROFUNDIDAD: el histórico de "Cierre de turno" de Reportes filtra
+  // por la empresa de la sesión viva, no solo por RLS. Sin empresa → vacío.
+  const empresaId = await getEmpresaIdActiva();
+  if (!empresaId) return [];
+
   const { data, error } = await supabase
     .from("cortes_caja")
     .select("*")
+    .eq("empresa_id", empresaId)
     .order("fecha", { ascending: false })
     .limit(limit);
   if (error) {

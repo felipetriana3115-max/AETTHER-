@@ -10,7 +10,7 @@
  * sin duplicar la lógica de consulta en cada componente.
  */
 
-import { supabase } from "../auth";
+import { supabase, getEmpresaIdActiva } from "../auth";
 import { getDB, type ProductoLocal } from "./db";
 
 /** ¿Hay conexión de red? En SSR asumimos que sí (no hay `navigator`). */
@@ -45,9 +45,15 @@ export async function cacheCatalogo(): Promise<number> {
   const db = getDB();
   if (!db || !isOnline()) return -1;
 
+  // DEFENSA EN PROFUNDIDAD: además de RLS, filtramos por la empresa de la sesión
+  // viva para no cachear jamás productos de otro tenant en el espejo local.
+  const empresaId = await getEmpresaIdActiva();
+  if (!empresaId) return -1;
+
   const { data, error } = await supabase
     .from("productos")
     .select(SELECT_PRODUCTO)
+    .eq("empresa_id", empresaId)
     .order("descripcion", { ascending: true });
 
   if (error || !data) {
@@ -73,11 +79,15 @@ export async function findByBarcode(codigo: string): Promise<ProductoLocal | nul
   if (!valor) return null;
   const db = getDB();
 
-  if (isOnline()) {
+  // Solo consultamos online si hay empresa resuelta; sin ella caemos al espejo
+  // local (aislamiento: nunca leemos productos de otro tenant desde el servidor).
+  const empresaId = isOnline() ? await getEmpresaIdActiva() : null;
+  if (empresaId) {
     try {
       const { data, error } = await supabase
         .from("productos")
         .select(SELECT_PRODUCTO)
+        .eq("empresa_id", empresaId)
         .eq("codigo_barras", valor)
         .limit(1)
         .maybeSingle();
@@ -104,11 +114,14 @@ export async function findByBarcode(codigo: string): Promise<ProductoLocal | nul
 export async function getFrecuentes(limit = 12): Promise<ProductoLocal[]> {
   const db = getDB();
 
-  if (isOnline()) {
+  // Igual que findByBarcode: sin empresa resuelta no consultamos online.
+  const empresaId = isOnline() ? await getEmpresaIdActiva() : null;
+  if (empresaId) {
     try {
       const { data, error } = await supabase
         .from("productos")
         .select(SELECT_PRODUCTO)
+        .eq("empresa_id", empresaId)
         .order("descripcion", { ascending: true })
         .limit(limit);
       if (!error && data) {
