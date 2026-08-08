@@ -14,7 +14,12 @@
  *    respuesta instantánea desde caché y refresco en segundo plano.
  */
 
-const VERSION = "aether-pos-v2";
+// IMPORTANTE: sube este número en CADA despliegue que cambie el comportamiento del
+// cliente. El navegador solo reinstala el SW si el BYTE de este archivo cambia; al
+// hacerlo, `activate` purga las cachés viejas (app-shell + estáticos) y con
+// `skipWaiting`+`clients.claim` el SW nuevo toma control, forzando que los clientes
+// dejen de correr el bundle anterior (que era lo que mostraba el falso "sincronizado").
+const VERSION = "aether-pos-v3";
 const APP_SHELL = `${VERSION}-shell`;
 const STATIC = `${VERSION}-static`;
 const OFFLINE_URL = "/dashboard/pos";

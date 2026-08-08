@@ -438,36 +438,16 @@ export default function PosPage() {
         //    hoy" suma los pendientes (ver render).
         if (online) {
           const r = await sincronizar();
-          if (r && r.conError > 0) {
-            setFeedback({
-              tone: "error",
-              // Preferimos el mensaje REAL del servidor (`r.mensaje`) para no dar una
-              // causa equivocada: p. ej. una venta que el servidor marcó como ya
-              // registrada sin insertarla no se arregla "revisando el stock".
-              msg:
-                r.mensaje ??
-                (esFiado
-                  ? "Fiado guardado, pero el servidor rechazó la sincronización (revisa el stock o el cliente). Pulsa Sincronizar."
-                  : "Venta guardada, pero el servidor rechazó una sincronización (revisa el stock). Pulsa Sincronizar."),
-            });
-          } else if (!r || r.detuvoPorRed || r.restantes > 0) {
-            // La venta quedó guardada localmente pero AÚN NO se confirmó su subida
-            // al servidor. Esto cubre: sin resultado (`!r`), corte por red, y —lo
-            // importante— cuando `syncOutbox` volvió sin error pero la cola NO se
-            // vació (`restantes > 0`: p. ej. el gate de sesión salió temprano o la
-            // RPC no confirmó la venta). Antes estos casos caían en el `else` y se
-            // marcaban como "Venta cobrada" (éxito FALSO) pese a no haberse subido.
-            // Ahora se reportan como pendiente para no dar por subida una venta que
-            // no lo está; el latido/botón Sincronizar reintentará.
-            setFeedback({
-              tone: "ok",
-              msg: esFiado
-                ? `Fiado a ${nombreFiado} (${formatCOP(total)}) quedó guardado y pendiente de subir; se reintentará.`
-                : `Venta cobrada (${formatCOP(total)}). Quedó guardada y pendiente de subir; se reintentará.`,
-            });
-          } else {
-            // Éxito real: la cola se vació sin errores (`restantes === 0`), o sea
-            // que el servidor confirmó la venta.
+          // ÉXITO REAL, y solo entonces mensaje verde: estando EN LÍNEA la venta se
+          // subió de verdad si —y solo si— la sincronización confirmó progreso
+          // (`enviadas > 0`), vació la cola (`restantes === 0`) y no hubo rechazos
+          // (`conError === 0`). Cualquier otro desenlace en línea significa que la
+          // persistencia final NO se completó (RPC interceptada/silenciada, gate de
+          // sesión que salió temprano, corte de red o rechazo del servidor): en ese
+          // caso mostramos ERROR VISIBLE con el motivo real, en vez de un mensaje
+          // tranquilizador que haga creer que se guardó cuando no fue así.
+          const subidaConfirmada = !!r && r.conError === 0 && r.enviadas > 0 && r.restantes === 0;
+          if (subidaConfirmada) {
             setFeedback({ tone: "ok", msg: okMsg });
             // Refrescamos el saldo del cliente en el selector tras cargar el fiado,
             // para que un segundo fiado al mismo cliente muestre su deuda al día.
@@ -476,6 +456,13 @@ export default function PosPage() {
                 if (clientes.length > 0) setClientes(clientes);
               });
             }
+          } else {
+            setFeedback({
+              tone: "error",
+              msg:
+                r?.mensaje ??
+                `La venta quedó guardada localmente pero NO se subió al servidor (${formatCOP(total)}). Revisa tu conexión y tu sesión, y pulsa Sincronizar.`,
+            });
           }
         } else {
           await refresh();
