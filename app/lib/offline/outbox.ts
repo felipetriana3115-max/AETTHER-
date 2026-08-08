@@ -151,13 +151,20 @@ export async function syncOutbox(): Promise<ResultadoSync> {
     // Sin sesión cargada, la RPC viaja como `anon`: como `registrar_venta_offline`
     // solo tiene GRANT a `authenticated`, el servidor la rechaza con 42501, el
     // MISMO código que usamos para "empresa nula". Además, sin `auth.uid()`,
-    // `mi_empresa()` evaluaría a nulo. Al hacer `await getUser()` forzamos la
-    // rehidratación (y el refresco del token si expiró): el JWT queda adjunto y
-    // `mi_empresa()` resuelve el empresa_id real en las RPC de abajo.
+    // `mi_empresa()` evaluaría a nulo.
+    //
+    // Usamos `getSession()` (NO `getUser()`) a propósito: supabase-js firma cada
+    // RPC leyendo el `access_token` de `getSession()` (ver `_getAccessToken`), y si
+    // no hay sesión cae a la anon key. `getUser()` hace un round-trip de red a
+    // /auth/v1/user para VALIDAR el token, pero NO es la fuente que autentica la
+    // petición: podía devolver un usuario y aun así la RPC salir como `anon` si la
+    // sesión no estaba adjunta. Al puertear el gate a la MISMA `getSession()` que
+    // usa la RPC, garantizamos que si seguimos adelante hay un token que viajará
+    // realmente con la petición (y `getSession()` rehidrata + refresca si expiró).
     const {
-      data: { user },
-    } = await supabase.auth.getUser();
-    if (!user) {
+      data: { session },
+    } = await supabase.auth.getSession();
+    if (!session?.access_token) {
       // Sesión aún no disponible (o sin login): NO es un fallo de empresa. Salimos
       // sin error para que el latido/evento `online` reintente cuando la sesión
       // esté lista, en vez de mostrar el mensaje alarmante de "sesión sin empresa".
