@@ -247,6 +247,15 @@ async function enviarUna(v: VentaOutbox): Promise<EnvioResultado> {
       return { ok: true, corte: payload.corte ?? null };
     }
 
+    // DIAGNÓSTICO TEMPORAL — imprime el objeto de error crudo de la RPC de caja.
+    // TODO(quitar): sirve para ver code/message/details/hint reales en consola.
+    console.error("ERROR REAL SUPABASE (registrar_venta_offline):", error, {
+      code: error.code,
+      message: error.message,
+      details: (error as { details?: unknown }).details,
+      hint: (error as { hint?: unknown }).hint,
+    });
+
     // Función inexistente aún (migración sin aplicar) → RPC clásica sin idempotencia.
     if (error.code === "PGRST202" || error.code === "42883") {
       return enviarClasico(v);
@@ -283,6 +292,13 @@ async function enviarClasico(v: VentaOutbox): Promise<EnvioResultado> {
       const payload = (data ?? {}) as { corte?: CorteRpc };
       return { ok: true, corte: payload.corte ?? null };
     }
+    // DIAGNÓSTICO TEMPORAL — objeto de error crudo de la RPC clásica.
+    console.error("ERROR REAL SUPABASE (registrar_venta):", error, {
+      code: error.code,
+      message: error.message,
+      details: (error as { details?: unknown }).details,
+      hint: (error as { hint?: unknown }).hint,
+    });
     if (error.code === "P0001" || error.code === "22023") {
       return { ok: false, negocio: true, mensaje: error.message };
     }
@@ -321,6 +337,14 @@ async function enviarFiado(v: VentaOutbox): Promise<EnvioResultado> {
       const payload = (data ?? {}) as { corte?: CorteRpc };
       return { ok: true, corte: payload.corte ?? null };
     }
+
+    // DIAGNÓSTICO TEMPORAL — objeto de error crudo de la RPC de fiado.
+    console.error("ERROR REAL SUPABASE (registrar_venta_fiado):", error, {
+      code: error.code,
+      message: error.message,
+      details: (error as { details?: unknown }).details,
+      hint: (error as { hint?: unknown }).hint,
+    });
 
     // Función inexistente (migración sin aplicar): no reintentar en bucle, marcar
     // como negocio con guía. El fiado no se pierde: queda visible en la cola.
