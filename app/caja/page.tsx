@@ -58,6 +58,15 @@ export default function CajaPage() {
     return () => clearTimeout(t);
   }, [feedback]);
 
+  // Relee el arqueo del día desde la BD (fuente de verdad) y sincroniza el estado.
+  // Se usa en la carga inicial y tras registrar un movimiento, para que la UI
+  // refleje SIEMPRE lo persistido y no solo un estado optimista en memoria.
+  const recargar = useCallback(async () => {
+    const { corte: c, movimientos: m } = await fetchArqueoHoy();
+    setCorte(c);
+    setMovimientos(m);
+  }, []);
+
   // Carga inicial: estado de la caja + movimientos del día en un solo round-trip.
   useEffect(() => {
     let activo = true;
@@ -142,8 +151,11 @@ export default function CajaPage() {
     }
     setProcesando(true);
     try {
-      const mov = await registrarMovimiento(movTipo, monto, concepto);
-      setMovimientos((prev) => [mov, ...prev]);
+      await registrarMovimiento(movTipo, monto, concepto);
+      // Re-consulta la lista desde la BD en vez de confiar en un push optimista:
+      // si la fila no persistiera, el movimiento NO aparecería aquí (y no habría
+      // que recargar la página para descubrirlo).
+      await recargar();
       setMovMonto("");
       setMovConcepto("");
       setFeedback({
@@ -151,11 +163,12 @@ export default function CajaPage() {
         msg: `${movTipo === "ingreso" ? "Ingreso" : "Egreso"} registrado: ${formatCOP(monto)}.`,
       });
     } catch (e) {
+      console.error("[caja] Error al registrar movimiento:", e);
       setFeedback({ tone: "error", msg: `No se pudo registrar: ${(e as Error).message}` });
     } finally {
       setProcesando(false);
     }
-  }, [movTipo, movMonto, movConcepto]);
+  }, [movTipo, movMonto, movConcepto, recargar]);
 
   const onCerrar = useCallback(async () => {
     const contado = parseMonto(efectivoContado);

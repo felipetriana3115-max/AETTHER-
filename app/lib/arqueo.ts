@@ -12,8 +12,8 @@
  * efectivo de ventas ni el esperado hasta que el servidor los revela.
  */
 
-import { supabase } from "./auth";
-import { mapCorte, type CorteCaja } from "./corte";
+import { supabase, getEmpresaIdActiva } from "./auth";
+import { mapCorte, hoyISO, type CorteCaja } from "./corte";
 
 export type TipoMovimiento = "ingreso" | "egreso";
 
@@ -83,20 +83,40 @@ export async function abrirCaja(base: number): Promise<CorteCaja | null> {
 }
 
 /**
- * Registra un movimiento manual de efectivo. `empresa_id` y `fecha` los pone la
- * BD por DEFAULT (bajo RLS), así que no viajan desde el cliente.
+ * Registra un movimiento manual de efectivo.
+ *
+ * DEFENSA EN PROFUNDIDAD: la BD tiene DEFAULTs (`empresa_id := mi_empresa()`,
+ * `fecha := hoy_negocio()`), pero NO nos apoyamos solo en ellos. Fijamos ambos
+ * desde la sesión viva —igual que `fetchCorteHoy` / `fetchVentasHoyPorMetodo`—
+ * por dos motivos:
+ *   • Si el usuario-tenant tuviera `empresa_id` nulo, el DEFAULT resolvería a
+ *     null y la fila se rechazaría (o caería fuera del filtro de RLS) → el
+ *     movimiento "desaparecía" al recargar. Enviarlo explícito lo hace robusto.
+ *   • `hoyISO()` (America/Bogota) coincide EXACTAMENTE con `hoy_negocio()`, así
+ *     que la fila cae SIEMPRE en el mismo día de negocio que luego lee
+ *     `arqueo_hoy`, sin depender de que el DEFAULT de `fecha` esté migrado.
  */
 export async function registrarMovimiento(
   tipo: TipoMovimiento,
   monto: number,
   concepto: string,
 ): Promise<MovimientoCaja> {
+  const empresa_id = await getEmpresaIdActiva();
+  if (!empresa_id) {
+    throw new Error("No hay una empresa asociada a la sesión. Vuelve a iniciar sesión.");
+  }
+
   const { data, error } = await supabase
     .from("movimientos_caja")
-    .insert({ tipo, monto, concepto })
+    .insert({ tipo, monto, concepto, empresa_id, fecha: hoyISO() })
     .select()
     .single();
-  if (error) throw error;
+  if (error) {
+    // Deja rastro del error crudo de Supabase (código + mensaje) para distinguir
+    // RLS (42501), columna inexistente (42703), grant faltante, etc.
+    console.error("[arqueo] No se pudo registrar el movimiento:", error);
+    throw error;
+  }
   return mapMovimiento(data as Record<string, unknown>);
 }
 
