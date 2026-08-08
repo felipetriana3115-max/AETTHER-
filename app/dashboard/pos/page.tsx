@@ -480,6 +480,62 @@ export default function PosPage() {
     [carrito, total, businessName, online, sincronizar, refresh, clienteSel],
   );
 
+  /**
+   * Sincronización MANUAL (botón de la barra de estado). A diferencia del auto-sync
+   * silencioso, aquí traducimos el ResultadoSync a un mensaje visible: así el cajero
+   * sabe exactamente por qué una venta no subió (sesión sin empresa, red o rechazo
+   * del servidor) en vez de ver que "no pasa nada".
+   */
+  const manejarSync = useCallback(async () => {
+    const r = await sincronizar();
+    if (!r) return; // sin conexión real: el botón ya está deshabilitado offline.
+
+    if (r.sinEmpresa) {
+      setFeedback({
+        tone: "error",
+        msg:
+          "Tu sesión no tiene una empresa asociada, por eso las ventas no se pueden subir. " +
+          "Cierra sesión y vuelve a entrar; si persiste, hay que reparar tu cuenta.",
+      });
+      return;
+    }
+    if (r.conError > 0) {
+      setFeedback({
+        tone: "error",
+        msg: `El servidor rechazó ${r.conError} venta${r.conError === 1 ? "" : "s"} (${
+          r.mensaje ?? "revisa el stock o el cliente"
+        }). Quedan ${r.restantes} en la cola.`,
+      });
+      return;
+    }
+    if (r.detuvoPorRed) {
+      setFeedback({
+        tone: "error",
+        msg: `No hay conexión real con el servidor${
+          r.mensaje ? `: ${r.mensaje}` : ""
+        }. Quedan ${r.restantes} por sincronizar; se reintentará.`,
+      });
+      return;
+    }
+    if (r.enviadas > 0) {
+      setFeedback({
+        tone: "ok",
+        msg:
+          r.restantes === 0
+            ? `${r.enviadas} venta${r.enviadas === 1 ? "" : "s"} sincronizada${
+                r.enviadas === 1 ? "" : "s"
+              } correctamente.`
+            : `${r.enviadas} sincronizada${r.enviadas === 1 ? "" : "s"}; quedan ${r.restantes}.`,
+      });
+      return;
+    }
+    // Nada enviado y sin errores: o ya no había pendientes, o hay otro drenado en curso.
+    setFeedback({
+      tone: "ok",
+      msg: r.restantes === 0 ? "Todo sincronizado." : `Reintentando… quedan ${r.restantes}.`,
+    });
+  }, [sincronizar]);
+
   /** Reimprime la tirilla de la última venta (botón manual del POS). */
   const reimprimir = useCallback(() => {
     if (!ultimaVenta) return;
@@ -528,7 +584,7 @@ export default function PosPage() {
         </div>
         <button
           type="button"
-          onClick={() => void sincronizar()}
+          onClick={() => void manejarSync()}
           disabled={!online || sincronizando || pendientes === 0}
           className="inline-flex items-center gap-2 rounded-lg border border-violet-500/40 bg-violet-500/10 px-3 py-1.5 text-xs font-semibold text-violet-200 transition-colors hover:bg-violet-500/20 disabled:cursor-not-allowed disabled:opacity-40"
         >

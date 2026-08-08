@@ -1,17 +1,21 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { supabase } from "../lib/auth";
+import { supabase, getEmpresaIdActiva } from "../lib/auth";
 import type { Cliente } from "../lib/clientes";
 
 /**
  * Alta/edición de un cliente del CRM.
  *
  * Fuente de verdad: tabla `public.clientes` en Supabase. El aislamiento por
- * empresa lo impone RLS: este formulario NUNCA envía `empresa_id`, lo rellena el
- * DEFAULT `mi_empresa()` del servidor y el `with check` de la política lo valida
- * (mismo patrón que `ventas`/POS). `saldo_pendiente` tampoco se toca aquí: solo lo
- * mueve la RPC `registrar_fiado` desde el panel de fiados.
+ * empresa lo impone RLS (`empresa_id = public.mi_empresa()`).
+ *
+ * En el ALTA enviamos `empresa_id` EXPLÍCITO (resuelto por `getEmpresaIdActiva()`)
+ * en vez de confiar en el DEFAULT `mi_empresa()` del servidor: así el payload deja
+ * de depender del contexto y, si el helper devuelve `null` (usuario sin empresa),
+ * abortamos con un mensaje claro en vez de disparar un RLS opaco. Mismo patrón que
+ * `ProductForm`/`ventas`/POS. `saldo_pendiente` no se toca aquí: solo lo mueve la
+ * RPC `registrar_fiado` desde el panel de fiados.
  */
 
 type Props = {
@@ -76,9 +80,9 @@ export default function ClienteForm({ cliente, onSaved, onCancel }: Props) {
         return;
       }
 
-      // Payload SIN empresa_id ni saldo_pendiente: el primero lo estampa el DEFAULT
-      // mi_empresa() (validado por RLS); el segundo solo lo mueve registrar_fiado.
-      const payload = {
+      // Campos comunes a alta y edición. `saldo_pendiente` no se toca aquí: solo lo
+      // mueve la RPC registrar_fiado.
+      const base = {
         nombre,
         email: form.email.trim() || null,
         telefono: form.telefono.trim() || null,
@@ -88,9 +92,29 @@ export default function ClienteForm({ cliente, onSaved, onCancel }: Props) {
 
       setGuardando(true);
       try {
-        const query = editando
-          ? supabase.from("clientes").update(payload).eq("id", cliente!.id)
-          : supabase.from("clientes").insert(payload);
+        let query;
+        if (editando) {
+          // Edición: RLS acota por `id` a la empresa del usuario; no reescribimos
+          // `empresa_id` (no debe cambiar de dueño).
+          query = supabase.from("clientes").update(base).eq("id", cliente!.id);
+        } else {
+          // Alta: adjuntamos `empresa_id` EXPLÍCITO en vez de confiar en el DEFAULT
+          // del servidor. Si no hay empresa resoluble, no tiene sentido intentar el
+          // INSERT: el `with check` lo rechazaría con un RLS opaco.
+          const empresaId = await getEmpresaIdActiva();
+
+          if (!empresaId) {
+            setError(
+              "Tu usuario no tiene una empresa asignada, así que no se puede crear " +
+                "el cliente. Cierra sesión y vuelve a entrar; si persiste, hay que " +
+                "reparar tu cuenta (usuarios.empresa_id está vacío).",
+            );
+            setGuardando(false);
+            return;
+          }
+
+          query = supabase.from("clientes").insert({ ...base, empresa_id: empresaId });
+        }
 
         const { data, error } = await query
           .select("id, nombre, email, telefono, direccion, notas, saldo_pendiente, created_at")

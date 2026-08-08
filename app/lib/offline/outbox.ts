@@ -94,6 +94,14 @@ export type ResultadoSync = {
   conError: number;
   restantes: number;
   detuvoPorRed: boolean;
+  /**
+   * true si el drenado se detuvo porque la sesión NO resuelve empresa
+   * (`mi_empresa()` nulo → la RPC lanza 42501). No es un fallo de red ni de
+   * negocio: hay que re-loguear o reparar el usuario (usuarios.empresa_id vacío).
+   */
+  sinEmpresa: boolean;
+  /** Motivo de la última parada/rechazo, para mostrarlo en la UI (o null). */
+  mensaje: string | null;
 };
 
 /** Corte devuelto por la RPC, para refrescar la tarjeta "Vendido hoy". */
@@ -121,7 +129,14 @@ let sincronizando = false;
  */
 export async function syncOutbox(): Promise<ResultadoSync> {
   const db = getDB();
-  const res: ResultadoSync = { enviadas: 0, conError: 0, restantes: 0, detuvoPorRed: false };
+  const res: ResultadoSync = {
+    enviadas: 0,
+    conError: 0,
+    restantes: 0,
+    detuvoPorRed: false,
+    sinEmpresa: false,
+    mensaje: null,
+  };
   if (!db || !isOnline() || sincronizando) {
     res.restantes = await contarPendientes();
     res.detuvoPorRed = !isOnline();
@@ -147,6 +162,7 @@ export async function syncOutbox(): Promise<ResultadoSync> {
           });
         }
         res.conError++;
+        res.mensaje = enviado.mensaje ?? "Error de negocio al sincronizar.";
       } else {
         // Error transitorio (red/sesión): incrementa intento y detén el drenado.
         if (v.localId != null) {
@@ -157,6 +173,10 @@ export async function syncOutbox(): Promise<ResultadoSync> {
           });
         }
         res.detuvoPorRed = true;
+        // Distinguimos "sesión sin empresa" (dato roto / re-login) de una caída de
+        // red pura, para que la UI muestre el mensaje accionable correcto.
+        if (enviado.sinEmpresa) res.sinEmpresa = true;
+        res.mensaje = enviado.mensaje ?? "Error transitorio de red.";
         break;
       }
     }
@@ -172,6 +192,8 @@ type EnvioResultado = {
   ok: boolean;
   /** true si el fallo es de negocio (no reintentable sin intervención). */
   negocio?: boolean;
+  /** true si la RPC rechazó por sesión sin empresa (42501): re-login / reparar usuario. */
+  sinEmpresa?: boolean;
   mensaje?: string;
   corte?: CorteRpc;
 };
@@ -204,7 +226,11 @@ async function enviarUna(v: VentaOutbox): Promise<EnvioResultado> {
     }
     // Sin empresa/sesión → transitorio (requiere re-login), no marcar como negocio.
     if (error.code === "42501") {
-      return { ok: false, mensaje: "Sesión sin empresa asociada. Inicia sesión de nuevo." };
+      return {
+        ok: false,
+        sinEmpresa: true,
+        mensaje: "Tu sesión no tiene una empresa asociada, por eso no se pueden subir las ventas.",
+      };
     }
     // Stock insuficiente u otra validación del servidor → conflicto de negocio.
     if (error.code === "P0001" || error.code === "22023") {
@@ -281,7 +307,11 @@ async function enviarFiado(v: VentaOutbox): Promise<EnvioResultado> {
     }
     // Sin empresa/sesión → transitorio (requiere re-login).
     if (error.code === "42501") {
-      return { ok: false, mensaje: "Sesión sin empresa asociada. Inicia sesión de nuevo." };
+      return {
+        ok: false,
+        sinEmpresa: true,
+        mensaje: "Tu sesión no tiene una empresa asociada, por eso no se pueden subir las ventas.",
+      };
     }
     // Stock insuficiente, cliente inexistente u otra validación → conflicto de negocio.
     if (error.code === "P0001" || error.code === "22023") {
