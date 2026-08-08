@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useHotkeys } from "react-hotkeys-hook";
 import PageShell from "../../components/PageShell";
 import { useDashboard } from "../../components/DashboardProvider";
+import { getEmpresaIdActiva } from "../../lib/auth";
 import BarcodeScanner, { type BarcodeScannerHandle } from "../../components/BarcodeScanner";
 import { formatCOP } from "../../lib/data-model";
 import { fetchClientes, type Cliente } from "../../lib/clientes";
@@ -491,6 +492,19 @@ export default function PosPage() {
     if (!r) return; // sin conexión real: el botón ya está deshabilitado offline.
 
     if (r.sinEmpresa) {
+      // La outbox marca `sinEmpresa` ante un 42501, pero ese código también salta
+      // por carreras transitorias (token recién rehidratado cuyo JWT aún no lleva
+      // la empresa). Confirmamos contra la sesión VIVA: si `mi_empresa()` resuelve
+      // un empresa_id real, el rechazo fue un falso positivo y NO debemos asustar
+      // al cajero con "hay que reparar tu cuenta"; basta con reintentar.
+      const empresaId = await getEmpresaIdActiva();
+      if (empresaId) {
+        setFeedback({
+          tone: "error",
+          msg: `No se pudieron subir las ventas por un problema temporal de sesión. Quedan ${r.restantes} en la cola; pulsa Sincronizar de nuevo.`,
+        });
+        return;
+      }
       setFeedback({
         tone: "error",
         msg:
