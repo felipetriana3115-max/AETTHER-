@@ -7,7 +7,13 @@ import EmptyState from "../components/EmptyState";
 import { useDashboard } from "../components/DashboardProvider";
 import { axisScale, formatCOP } from "../lib/data-model";
 import { getMonthlyProjections } from "../lib/analytics/projections";
-import { fetchCortes, hoyISO, type CorteCaja } from "../lib/corte";
+import {
+  fetchCortes,
+  fetchVentasHoyPorMetodo,
+  hoyISO,
+  type CorteCaja,
+  type VentasHoyPorMetodo,
+} from "../lib/corte";
 
 // Orden canónico del año para completar los meses proyectados.
 const YEAR_MONTHS = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"];
@@ -20,6 +26,17 @@ const H = 240;
 const PAD = 8;
 
 type ProjectionPoint = { month: string; value: number; projected: boolean };
+
+/** Fila de la tabla de cierre de turno (subconjunto de CorteCaja que se pinta). */
+type CorteFila = {
+  id: string;
+  fecha: string;
+  total_efectivo: number;
+  total_nequi: number;
+  total_bold: number;
+  num_ventas: number;
+  total_general: number;
+};
 
 // Formatea una fecha `YYYY-MM-DD` a un texto legible en español (sin desfase de
 // zona: se construye la fecha en local a partir de sus componentes).
@@ -42,19 +59,43 @@ export default function ReportesPage() {
   // Cortes de caja (arqueo) desde Supabase — independientes de los datos de Excel.
   const [cortes, setCortes] = useState<CorteCaja[]>([]);
   const [cortesCargando, setCortesCargando] = useState(true);
+  // Ventas de HOY leídas directamente de `ventas` (no dependen de que exista un
+  // corte para hoy): fuente del "Cierre de turno" del día.
+  const [ventasHoy, setVentasHoy] = useState<VentasHoyPorMetodo | null>(null);
   useEffect(() => {
     let activo = true;
     (async () => {
-      const data = await fetchCortes(30);
+      const [data, hoy] = await Promise.all([fetchCortes(30), fetchVentasHoyPorMetodo()]);
       if (!activo) return;
       setCortes(data);
+      setVentasHoy(hoy);
       setCortesCargando(false);
     })();
     return () => {
       activo = false;
     };
   }, []);
-  const corteHoy = useMemo(() => cortes.find((c) => c.fecha === hoyISO()) ?? null, [cortes]);
+
+  // Fila del histórico correspondiente a hoy: se construye desde `ventas` (no
+  // desde `cortes_caja`), para que el cierre del día cuadre aunque el corte no se
+  // haya materializado. Las demás filas (días anteriores) sí vienen del corte.
+  const filasCorte = useMemo(() => {
+    const hoy = hoyISO();
+    const anteriores = cortes.filter((c) => c.fecha !== hoy);
+    const hayVentasHoy = (ventasHoy?.num_ventas ?? 0) > 0;
+    const corteHoyExiste = cortes.some((c) => c.fecha === hoy);
+    if (!hayVentasHoy && !corteHoyExiste) return anteriores;
+    const filaHoy: CorteFila = {
+      id: "hoy",
+      fecha: hoy,
+      total_efectivo: ventasHoy?.total_efectivo ?? 0,
+      total_nequi: ventasHoy?.total_nequi ?? 0,
+      total_bold: ventasHoy?.total_bold ?? 0,
+      num_ventas: ventasHoy?.num_ventas ?? 0,
+      total_general: ventasHoy?.total_general ?? 0,
+    };
+    return [filaHoy, ...anteriores];
+  }, [cortes, ventasHoy]);
 
   // Proyección del próximo mes (media móvil simple de 3 meses) de ingresos y
   // egresos, con la alerta de caja resultante.
@@ -184,34 +225,34 @@ export default function ReportesPage() {
               <div className="rounded-lg border border-emerald-500/25 bg-gradient-to-br from-emerald-500/10 to-transparent p-4">
                 <p className="text-[11px] font-medium uppercase tracking-wide text-emerald-400/80">Total vendido hoy</p>
                 <p className="mt-1 text-2xl font-bold tracking-tight text-emerald-300 tabular-nums">
-                  {formatCOP(corteHoy?.total_general ?? 0)}
+                  {formatCOP(ventasHoy?.total_general ?? 0)}
                 </p>
                 <p className="mt-0.5 text-xs text-zinc-500">
-                  {corteHoy?.num_ventas ?? 0} venta{(corteHoy?.num_ventas ?? 0) === 1 ? "" : "s"}
+                  {ventasHoy?.num_ventas ?? 0} venta{(ventasHoy?.num_ventas ?? 0) === 1 ? "" : "s"}
                 </p>
               </div>
               <div className="rounded-lg border border-zinc-800 bg-zinc-950 p-4">
                 <p className="text-[11px] font-medium uppercase tracking-wide text-zinc-500">Efectivo</p>
                 <p className="mt-1 text-xl font-semibold tracking-tight text-zinc-100 tabular-nums">
-                  {formatCOP(corteHoy?.total_efectivo ?? 0)}
+                  {formatCOP(ventasHoy?.total_efectivo ?? 0)}
                 </p>
               </div>
               <div className="rounded-lg border border-zinc-800 bg-zinc-950 p-4">
                 <p className="text-[11px] font-medium uppercase tracking-wide text-zinc-500">Nequi / Daviplata</p>
                 <p className="mt-1 text-xl font-semibold tracking-tight text-zinc-100 tabular-nums">
-                  {formatCOP(corteHoy?.total_nequi ?? 0)}
+                  {formatCOP(ventasHoy?.total_nequi ?? 0)}
                 </p>
               </div>
               <div className="rounded-lg border border-zinc-800 bg-zinc-950 p-4">
                 <p className="text-[11px] font-medium uppercase tracking-wide text-zinc-500">Bold (tarjeta)</p>
                 <p className="mt-1 text-xl font-semibold tracking-tight text-zinc-100 tabular-nums">
-                  {formatCOP(corteHoy?.total_bold ?? 0)}
+                  {formatCOP(ventasHoy?.total_bold ?? 0)}
                 </p>
               </div>
             </div>
 
             {/* Historial de cortes por día */}
-            {cortes.length === 0 ? (
+            {filasCorte.length === 0 ? (
               <p className="mt-6 rounded-lg border border-dashed border-zinc-800 py-8 text-center text-sm text-zinc-500">
                 Aún no hay ventas registradas en el POS.
               </p>
@@ -229,7 +270,7 @@ export default function ReportesPage() {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-zinc-800/70">
-                    {cortes.map((c) => {
+                    {filasCorte.map((c) => {
                       const esHoy = c.fecha === hoyISO();
                       return (
                         <tr key={c.id} className={esHoy ? "bg-emerald-500/5" : "hover:bg-zinc-800/30"}>

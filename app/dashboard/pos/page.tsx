@@ -8,7 +8,7 @@ import { getEmpresaIdActiva } from "../../lib/auth";
 import BarcodeScanner, { type BarcodeScannerHandle } from "../../components/BarcodeScanner";
 import { formatCOP } from "../../lib/data-model";
 import { fetchClientes, type Cliente } from "../../lib/clientes";
-import { fetchCorteHoy, type CorteCaja } from "../../lib/corte";
+import { fetchVentasHoyPorMetodo, type VentasHoyPorMetodo } from "../../lib/corte";
 import { loadDeviceSettings } from "../../lib/devices";
 import { printReceipt, type ReceiptData } from "../../lib/receipt";
 import { cacheCatalogo, descontarStockLocal, getFrecuentes } from "../../lib/offline/catalog";
@@ -110,8 +110,9 @@ export default function PosPage() {
   // Contador de ids para los artículos comunes. Negativo y decreciente para no
   // colisionar nunca con los ids reales de `productos` (siempre positivos).
   const comunIdRef = useRef(-1);
-  // Corte de caja del día: alimenta la tarjeta "Vendido hoy".
-  const [corteHoy, setCorteHoy] = useState<CorteCaja | null>(null);
+  // Ventas del día por método (leídas de `ventas`, no de `cortes_caja`):
+  // alimentan la tarjeta "Vendido hoy". No dependen de que exista un corte hoy.
+  const [ventasHoy, setVentasHoy] = useState<VentasHoyPorMetodo | null>(null);
   // Última venta cobrada: habilita reimprimir la tirilla tras vaciar el carrito.
   const [ultimaVenta, setUltimaVenta] = useState<ReceiptData | null>(null);
 
@@ -129,7 +130,7 @@ export default function PosPage() {
   // Modo Sin Internet: estado de red + cola local de ventas. Al terminar una
   // sincronización con éxito, refrescamos el corte del servidor (fuente de verdad).
   const { online, pendientes, totalPend, sincronizando, sincronizar, refresh } = useOffline(() => {
-    fetchCorteHoy().then((c) => c && setCorteHoy(c));
+    fetchVentasHoyPorMetodo().then(setVentasHoy);
   });
 
   // Autolimpia el feedback tras unos segundos para no dejar alertas pegadas.
@@ -156,12 +157,12 @@ export default function PosPage() {
     };
   }, []);
 
-  // Carga el corte de caja del día para la tarjeta "Vendido hoy".
+  // Carga las ventas del día para la tarjeta "Vendido hoy".
   useEffect(() => {
     let activo = true;
     (async () => {
-      const corte = await fetchCorteHoy();
-      if (activo) setCorteHoy(corte);
+      const ventas = await fetchVentasHoyPorMetodo();
+      if (activo) setVentasHoy(ventas);
     })();
     return () => {
       activo = false;
@@ -688,8 +689,8 @@ export default function PosPage() {
               <div>
                 <p className="text-[11px] font-medium uppercase tracking-wide text-emerald-400/80">Vendido hoy</p>
                 <p className="text-xs text-zinc-500">
-                  {(corteHoy?.num_ventas ?? 0) + pendientes} venta
-                  {(corteHoy?.num_ventas ?? 0) + pendientes === 1 ? "" : "s"}
+                  {(ventasHoy?.num_ventas ?? 0) + pendientes} venta
+                  {(ventasHoy?.num_ventas ?? 0) + pendientes === 1 ? "" : "s"}
                   {pendientes > 0 && (
                     <span className="text-amber-400"> · {pendientes} sin sincronizar</span>
                   )}
@@ -697,7 +698,7 @@ export default function PosPage() {
               </div>
             </div>
             <span className="text-xl font-bold tracking-tight text-emerald-300 tabular-nums">
-              {formatCOP((corteHoy?.total_general ?? 0) + totalPend)}
+              {formatCOP((ventasHoy?.total_general ?? 0) + totalPend)}
             </span>
           </div>
 

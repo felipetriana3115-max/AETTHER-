@@ -50,6 +50,105 @@ export function hoyISO(): string {
 }
 
 /**
+ * Rango [inicio, fin] del día de negocio de HOY en `America/Bogota`, como ISO
+ * `timestamptz`. Bogotá es UTC−5 fijo (sin horario de verano), así que anclamos
+ * el offset `-05:00` explícitamente: así el filtro sobre `ventas.created_at`
+ * (que es `timestamptz`) cubre EXACTAMENTE la jornada local completa, sin
+ * arrastrar ventas de ayer ni recortar las de la noche por culpa de UTC.
+ *
+ * Se usa con `.gte("created_at", inicio).lte("created_at", fin)` en vez de un
+ * `.eq("created_at", hoy)` rígido (que nunca cuadra contra un timestamp).
+ */
+export function rangoDiaHoy(): { inicio: string; fin: string } {
+  const hoy = hoyISO(); // YYYY-MM-DD en America/Bogota
+  return {
+    inicio: `${hoy}T00:00:00.000-05:00`,
+    fin: `${hoy}T23:59:59.999-05:00`,
+  };
+}
+
+/** Subtotales del día por método de pago, con la misma forma que un corte. */
+export type VentasHoyPorMetodo = {
+  total_general: number;
+  total_efectivo: number;
+  total_nequi: number;
+  total_bold: number;
+  num_ventas: number;
+};
+
+const VENTAS_HOY_VACIO: VentasHoyPorMetodo = {
+  total_general: 0,
+  total_efectivo: 0,
+  total_nequi: 0,
+  total_bold: 0,
+  num_ventas: 0,
+};
+
+/**
+ * Clasifica un `metodo_pago` de texto libre en uno de los tres buckets del
+ * corte. Normaliza con `.toLowerCase()` + `.trim()` y admite variaciones/alias
+ * (efectivo/cash, nequi/daviplata/transferencia, bold/tarjeta/datáfono). Un
+ * método desconocido devuelve `null`: sigue sumando al total general y al conteo
+ * de ventas, pero no se atribuye a ningún método concreto (no lo inventamos).
+ */
+function clasificarMetodo(metodoPago: string): "efectivo" | "nequi" | "bold" | null {
+  const m = metodoPago.trim().toLowerCase();
+  if (!m) return null;
+  if (m.includes("efectivo") || m.includes("cash")) return "efectivo";
+  if (m.includes("nequi") || m.includes("daviplata") || m.includes("transfer")) return "nequi";
+  if (
+    m.includes("bold") ||
+    m.includes("tarjeta") ||
+    m.includes("datafono") ||
+    m.includes("datáfono") ||
+    m.includes("card")
+  ) {
+    return "bold";
+  }
+  return null;
+}
+
+/**
+ * Ventas de HOY agrupadas por método de pago, leídas DIRECTAMENTE de la tabla
+ * `ventas` (no de `cortes_caja`). Esto hace que el desglose del dashboard y el
+ * cierre de turno NO dependan de que exista una fila de corte para hoy: mientras
+ * haya ventas registradas, el cuadre se muestra.
+ *
+ * DEFENSA EN PROFUNDIDAD: además de RLS, filtra explícitamente por la empresa de
+ * la sesión viva (`getEmpresaIdActiva`) y por el rango local del día. Sin empresa
+ * resuelta NO consulta → ceros (nunca ventas de otra empresa).
+ */
+export async function fetchVentasHoyPorMetodo(): Promise<VentasHoyPorMetodo> {
+  const empresaId = await getEmpresaIdActiva();
+  if (!empresaId) return { ...VENTAS_HOY_VACIO };
+
+  const { inicio, fin } = rangoDiaHoy();
+  const { data, error } = await supabase
+    .from("ventas")
+    .select("total, metodo_pago, created_at")
+    .eq("empresa_id", empresaId)
+    .gte("created_at", inicio)
+    .lte("created_at", fin);
+  if (error) {
+    console.warn("[corte] No se pudieron leer las ventas de hoy:", error.message);
+    return { ...VENTAS_HOY_VACIO };
+  }
+
+  const acc: VentasHoyPorMetodo = { ...VENTAS_HOY_VACIO };
+  for (const raw of (data ?? []) as { total: number | string | null; metodo_pago: string | null }[]) {
+    const monto = Number(raw.total ?? 0);
+    if (!Number.isFinite(monto)) continue;
+    acc.total_general += monto;
+    acc.num_ventas += 1;
+    const bucket = clasificarMetodo(raw.metodo_pago ?? "");
+    if (bucket === "efectivo") acc.total_efectivo += monto;
+    else if (bucket === "nequi") acc.total_nequi += monto;
+    else if (bucket === "bold") acc.total_bold += monto;
+  }
+  return acc;
+}
+
+/**
  * PostgREST puede serializar `numeric` como string para preservar precisión.
  * Normalizamos a `number` para poder sumar/formatear sin sorpresas.
  */

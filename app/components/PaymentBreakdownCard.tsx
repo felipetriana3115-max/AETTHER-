@@ -2,18 +2,17 @@
 
 import { useEffect, useState, type ReactNode } from "react";
 import { formatCOP } from "../lib/data-model";
-import { fetchCorteHoy, type CorteCaja } from "../lib/corte";
+import { fetchVentasHoyPorMetodo, type VentasHoyPorMetodo } from "../lib/corte";
 import { supabase } from "../lib/auth";
 
 /**
  * Desglose en tiempo real de lo vendido HOY, agrupado por método de pago
  * (Efectivo · Nequi/Daviplata · Bold).
  *
- * Fuente de verdad: la RPC/corte de caja del día (`public.cortes_caja`, una sola
- * fila por empresa y día, alimentada por `sumar_corte_caja` en cada cobro). El
- * subtotal por método YA viene sumado en el servidor (`total_efectivo`,
- * `total_nequi`, `total_bold`), así que esta tarjeta hace UNA lectura de una fila
- * —no filtra ni suma el histórico de ventas en memoria— y queda aislada por RLS.
+ * Fuente de verdad: la tabla `public.ventas` filtrada por el rango del día local
+ * (`fetchVentasHoyPorMetodo`). Se agrupa por `metodo_pago` normalizado. NO
+ * depende de que exista una fila en `cortes_caja` para hoy: mientras haya ventas
+ * registradas, el cuadre se muestra. Aislado por RLS + `empresa_id` de la sesión.
  *
  * Propósito: que el dueño/cajero cuadre la caja de un vistazo sin abrir la app de
  * Nequi ni el panel de Bold a revisar transacción por transacción.
@@ -21,8 +20,8 @@ import { supabase } from "../lib/auth";
 
 type Metodo = {
   label: string;
-  /** Selector del subtotal ya agregado en el servidor. */
-  pick: (c: CorteCaja) => number;
+  /** Selector del subtotal agregado del día. */
+  pick: (c: VentasHoyPorMetodo) => number;
   accent: string; // color del monto
   ring: string; // borde/realce de la celda
   icon: ReactNode;
@@ -69,10 +68,10 @@ const METODOS: Metodo[] = [
 ];
 
 export default function PaymentBreakdownCard() {
-  const [corteHoy, setCorteHoy] = useState<CorteCaja | null>(null);
+  const [ventasHoy, setVentasHoy] = useState<VentasHoyPorMetodo | null>(null);
   const [cargando, setCargando] = useState(true);
 
-  // Carga el corte del día en cuanto hay sesión. Igual que el resto del
+  // Carga las ventas del día en cuanto hay sesión. Igual que el resto del
   // dashboard (ver DashboardProvider), NO consultamos con sesión vacía: RLS
   // devolvería cero filas. Escuchamos onAuthStateChange para el arranque en frío
   // (INITIAL_SESSION rehidrata la sesión desde storage) y para el login.
@@ -80,9 +79,9 @@ export default function PaymentBreakdownCard() {
     let activo = true;
 
     const cargar = async () => {
-      const corte = await fetchCorteHoy();
+      const ventas = await fetchVentasHoyPorMetodo();
       if (!activo) return;
-      setCorteHoy(corte);
+      setVentasHoy(ventas);
       setCargando(false);
     };
 
@@ -102,7 +101,7 @@ export default function PaymentBreakdownCard() {
     };
   }, []);
 
-  const numVentas = corteHoy?.num_ventas ?? 0;
+  const numVentas = ventasHoy?.num_ventas ?? 0;
 
   return (
     <div className="relative overflow-hidden rounded-xl border border-zinc-800/80 bg-zinc-900/50 p-5">
@@ -116,7 +115,7 @@ export default function PaymentBreakdownCard() {
         </div>
         <div className="text-right">
           <p className="text-2xl font-semibold tracking-tight text-emerald-300 tabular-nums">
-            {formatCOP(corteHoy?.total_general ?? 0)}
+            {formatCOP(ventasHoy?.total_general ?? 0)}
           </p>
           <p className="text-xs text-zinc-500">
             {numVentas} venta{numVentas === 1 ? "" : "s"} hoy
@@ -132,7 +131,7 @@ export default function PaymentBreakdownCard() {
               <p className="text-[11px] font-medium uppercase tracking-wide text-zinc-400">{m.label}</p>
             </div>
             <p className={`mt-2 text-xl font-semibold tracking-tight tabular-nums ${m.accent}`}>
-              {cargando ? "—" : formatCOP(corteHoy ? m.pick(corteHoy) : 0)}
+              {cargando ? "—" : formatCOP(ventasHoy ? m.pick(ventasHoy) : 0)}
             </p>
           </div>
         ))}
