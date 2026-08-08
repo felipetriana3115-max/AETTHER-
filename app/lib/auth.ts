@@ -91,7 +91,38 @@ export function saveSession(user: string, rol?: Rol): void {
   }
 }
 
-/** Cierra la sesión: borra cookies y espejo. Solo desde el cliente. */
+/** Prefijo de TODAS las claves de caché de datos del dashboard (segmentadas por
+ *  empresa). Debe coincidir con las bases de clave usadas en DashboardProvider. */
+const DASHBOARD_CACHE_PREFIX = "mi-dashboard-erp";
+
+/**
+ * Purga de `localStorage` y `sessionStorage` cualquier caché de datos del
+ * dashboard (claves `mi-dashboard-erp*`, segmentadas por empresa). Sin esto, el
+ * siguiente usuario en el MISMO navegador podría ver métricas del tenant anterior
+ * (productos en stock, tendencia de ingresos, etc.) hasta que el servidor
+ * respondiera. Se llama en cada logout.
+ */
+function purgeDashboardCache(): void {
+  for (const storage of [
+    typeof localStorage !== "undefined" ? localStorage : null,
+    typeof sessionStorage !== "undefined" ? sessionStorage : null,
+  ]) {
+    if (!storage) continue;
+    try {
+      const claves: string[] = [];
+      for (let i = 0; i < storage.length; i++) {
+        const k = storage.key(i);
+        if (k && k.startsWith(DASHBOARD_CACHE_PREFIX)) claves.push(k);
+      }
+      for (const k of claves) storage.removeItem(k);
+    } catch {
+      // storage inaccesible (modo privado) → nada que purgar.
+    }
+  }
+}
+
+/** Cierra la sesión: borra cookies, espejo, caché de datos y la sesión de Supabase.
+ *  Solo desde el cliente. */
 export function clearSession(): void {
   document.cookie = `${SESSION_COOKIE}=; path=/; max-age=0; samesite=lax`;
   document.cookie = `${ROLE_COOKIE}=; path=/; max-age=0; samesite=lax`;
@@ -100,11 +131,20 @@ export function clearSession(): void {
     // Borra el tenant cacheado para que el siguiente usuario NO herede la empresa
     // del anterior en este navegador (defensa contra fuga entre cuentas).
     localStorage.removeItem(TENANT_STORAGE_KEY);
+    // Y purga TODO el caché de datos del dashboard (inventario/ventas segmentados
+    // por empresa) en localStorage y sessionStorage: es la fuente de fugas de
+    // métricas (759 productos, tendencia de ingresos, etc.) entre cuentas.
+    purgeDashboardCache();
   } catch {
     // Ignorar: si la cookie ya se borró, la sesión está cerrada.
   }
   // Invalida la empresa resuelta en memoria para el filtrado de consultas.
   empresaActivaCache = null;
+  // Cierra también la sesión de Supabase. Sin esto, `supabase.auth.getUser()`
+  // seguiría devolviendo el usuario anterior (y su empresa) hasta el próximo
+  // login, y el provider recargaría datos del tenant que se acaba de cerrar.
+  // Es asíncrono; no bloqueamos el logout esperándolo (fire-and-forget).
+  void supabase.auth.signOut();
 }
 
 /** Devuelve el usuario de la sesión activa (espejo en localStorage) o null. */

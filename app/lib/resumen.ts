@@ -186,7 +186,7 @@ export type MetricasRentabilidad = {
   rotacion: number;
 };
 
-const METRICAS_VACIAS: MetricasRentabilidad = {
+export const METRICAS_VACIAS: MetricasRentabilidad = {
   ingresos: 0,
   costo: 0,
   unidadesVendidas: 0,

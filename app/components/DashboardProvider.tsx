@@ -1,7 +1,7 @@
 
 "use client";
 
-import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   deriveMonthlyRevenue,
   type InventoryItem,
@@ -13,12 +13,13 @@ import {
   type PurchaseOrder,
   type PurchaseStatus,
 } from "../lib/data-model";
-import { supabase, getTenant } from "../lib/auth";
+import { supabase, getTenant, getEmpresaIdActiva } from "../lib/auth";
 import {
   fetchVentasEmpresa,
   fetchProductosEmpresa,
   fetchTotalVentasEmpresa,
   fetchMetricasRentabilidad,
+  METRICAS_VACIAS,
   type MetricasRentabilidad,
 } from "../lib/resumen";
 
@@ -242,31 +243,68 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
   }, [hydrated, inventory, sales, purchases]);
 
   // ── Carga desde Supabase (fuente de verdad multi-tenant) ─────────────────────
-  // Si hay sesión activa, la data real de la empresa manda sobre lo local: RLS ya
-  // la deja aislada por `empresa_id = mi_empresa()` (resuelto desde `auth.uid()`),
-  // así que NO se filtra por tenant en el cliente. Sin sesión no se toca nada: RLS
-  // devolvería cero filas, y conservamos lo importado localmente como fallback.
+  // La empresa se resuelve de la SESIÓN VIVA (getEmpresaIdActiva → mi_empresa()),
+  // no de localStorage. Cada lectura filtra explícitamente por `empresa_id` además
+  // de RLS (defensa en profundidad). Al CAMBIAR de empresa en el mismo montaje del
+  // provider (p. ej. logout/login de otra cuenta sin recargar la página) se
+  // descarta TODO el estado de la empresa anterior ANTES de pintar la nueva, para
+  // que una cuenta nueva y vacía jamás herede métricas del tenant previo.
+
+  /** empresa_id cuyos datos están cargados en el estado actual (null = ninguna). */
+  const loadedEmpresaRef = useRef<string | null>(null);
+
+  /** Vacía TODO el estado derivado del tenant (métricas incluidas). */
+  const resetTenantState = useCallback((empresaId: string | null) => {
+    loadedEmpresaRef.current = empresaId;
+    setInventory([]);
+    setSales([]);
+    setPurchases([]);
+    setCustomers([]);
+    setSalesTotal(0);
+    setMetricas(METRICAS_VACIAS);
+    setImported(false);
+  }, []);
+
   useEffect(() => {
     let activo = true;
 
-    // Carga real de la empresa. RLS ya aísla por `empresa_id = mi_empresa()`,
-    // así que basta con que la petición viaje con la sesión activa.
     const cargar = async () => {
+      // Fuente autoritativa de la empresa: la sesión viva, NO localStorage.
+      const empresaId = await getEmpresaIdActiva();
+      if (!activo) return;
+
+      // Sin empresa resuelta (sin sesión / super_admin sin empresa): no se consulta
+      // y se limpia cualquier dato heredado. Nunca se muestran filas de otro tenant.
+      if (!empresaId) {
+        resetTenantState(null);
+        return;
+      }
+
+      // Cambió el tenant respecto a lo que hay pintado → descartar lo anterior YA,
+      // antes incluso de que respondan las consultas de la empresa nueva.
+      if (loadedEmpresaRef.current !== empresaId) {
+        resetTenantState(empresaId);
+      }
+
       const [ventas, productos, total, mets] = await Promise.all([
         fetchVentasEmpresa(),
         fetchProductosEmpresa(),
         fetchTotalVentasEmpresa(),
         fetchMetricasRentabilidad(),
       ]);
-      if (!activo) return;
-      // Reemplazamos (no acumulamos) para reflejar el estado real del servidor.
-      if (ventas.length) setSales(ventas);
-      if (productos.length) setInventory(productos);
-      // El total viene del servidor: se aplica SIEMPRE (incluido 0), para que un
-      // dispositivo con localStorage viejo no siga mostrando una cifra fantasma.
+      // La empresa pudo cambiar mientras viajaban las consultas: si ya no
+      // corresponde a la que resolvimos, descartamos esta respuesta (evita pintar
+      // datos de un tenant que ya no es el activo).
+      if (!activo || loadedEmpresaRef.current !== empresaId) return;
+
+      // Reemplazamos (no acumulamos) con la verdad del servidor de ESTA empresa,
+      // aplicando SIEMPRE el resultado —incluido vacío/0— para que una cuenta nueva
+      // y vacía muestre ceros en vez de arrastrar la cifra del tenant anterior.
+      setSales(ventas);
+      setInventory(productos);
       setSalesTotal(total);
-      // Margen y rotación reales: también del servidor, se aplican SIEMPRE.
       setMetricas(mets);
+      setImported(ventas.length > 0 || productos.length > 0);
     };
 
     // 1) Intento inicial: si la sesión YA está hidratada, cargamos de una.
@@ -274,21 +312,26 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
       if (activo && session) cargar();
     });
 
-    // 2) Fuente de verdad para el arranque en frío: onAuthStateChange dispara
-    //    cuando el cliente termina de rehidratar la sesión desde storage (evento
-    //    INITIAL_SESSION) o cuando el usuario inicia sesión (SIGNED_IN). Así NO
-    //    consultamos con sesión vacía —causa del dashboard en $0 en incógnito—.
+    // 2) Fuente de verdad para el arranque en frío y los cambios de cuenta:
+    //    onAuthStateChange dispara al rehidratar (INITIAL_SESSION), al iniciar
+    //    sesión (SIGNED_IN) y al cerrarla (SIGNED_OUT). En SIGNED_OUT limpiamos el
+    //    estado; en el resto recargamos resolviendo la empresa de la sesión viva.
     const {
       data: { subscription },
-    } = supabase.auth.onAuthStateChange((_event, session) => {
-      if (activo && session) cargar();
+    } = supabase.auth.onAuthStateChange((event, session) => {
+      if (!activo) return;
+      if (event === "SIGNED_OUT" || !session) {
+        resetTenantState(null);
+        return;
+      }
+      cargar();
     });
 
     return () => {
       activo = false;
       subscription.unsubscribe();
     };
-  }, []);
+  }, [resetTenantState]);
 
   // ── Nombre de la empresa ─────────────────────────────────────────────────────
   // Se hidrata una vez al montar; el guardado ocurre en el setter para no pisar
