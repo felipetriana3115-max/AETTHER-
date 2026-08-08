@@ -46,11 +46,21 @@ export default function ComprasPage() {
     activeOrders.map((o) => o.supplier).filter((s) => s && s !== "—"),
   ).size;
 
-  // Guarda la orden manual en el estado global; la tabla se re-renderiza sola.
-  // Si la orden nace en estado "Recibido", impacta el inventario de forma atómica
-  // vía la RPC `recibir_compra` (suma el stock al producto o lo crea si no existe).
+  // Persiste la orden manual en Supabase (`public.compras`) vía `addPurchases`, que
+  // inserta y RELEE la tabla para refrescar el estado con la verdad de la BD; así
+  // la orden sobrevive a las recargas. Si la orden nace en estado "Recibido",
+  // impacta además el inventario de forma atómica vía la RPC `recibir_compra`
+  // (suma el stock al producto o lo crea si no existe).
   const handleCreateOrder = async (order: NewPurchase) => {
-    addPurchases([order]);
+    const guardadas = await addPurchases([order]);
+
+    if (guardadas === 0) {
+      showToast(
+        "No se pudo guardar",
+        `La orden para ${order.supplier} no se persistió. Revisa tu conexión o la migración de compras.`,
+      );
+      return;
+    }
 
     if (order.status !== "Recibido") {
       showToast("Orden creada", `Nueva orden para ${order.supplier} registrada.`);

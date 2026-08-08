@@ -19,6 +19,8 @@ import {
   fetchProductosEmpresa,
   fetchTotalVentasEmpresa,
   fetchMetricasRentabilidad,
+  fetchComprasEmpresa,
+  insertCompras,
   METRICAS_VACIAS,
   type MetricasRentabilidad,
 } from "../lib/resumen";
@@ -111,12 +113,12 @@ type DashboardContextValue = {
   salesTotal: number;
   // Rentabilidad (margen real + rotación, calculados en el servidor)
   metricas: MetricasRentabilidad;
-  // Compras
+  // Compras (persistidas en Supabase; refresca el estado tras cada inserción)
   purchases: PurchaseOrder[];
-  addPurchases: (rows: NewPurchase[]) => number;
+  addPurchases: (rows: NewPurchase[]) => Promise<number>;
   // Importación (uno o varios archivos → uno o varios módulos)
   imported: boolean;
-  bulkImport: (bundle: ImportBundle) => BulkImportResult;
+  bulkImport: (bundle: ImportBundle) => Promise<BulkImportResult>;
   // Toast global
   toast: Toast | null;
   showToast: (title: string, message: string) => void;
@@ -286,11 +288,12 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
         resetTenantState(empresaId);
       }
 
-      const [ventas, productos, total, mets] = await Promise.all([
+      const [ventas, productos, total, mets, compras] = await Promise.all([
         fetchVentasEmpresa(),
         fetchProductosEmpresa(),
         fetchTotalVentasEmpresa(),
         fetchMetricasRentabilidad(),
+        fetchComprasEmpresa(),
       ]);
       // La empresa pudo cambiar mientras viajaban las consultas: si ya no
       // corresponde a la que resolvimos, descartamos esta respuesta (evita pintar
@@ -304,7 +307,8 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
       setInventory(productos);
       setSalesTotal(total);
       setMetricas(mets);
-      setImported(ventas.length > 0 || productos.length > 0);
+      setPurchases(compras);
+      setImported(ventas.length > 0 || productos.length > 0 || compras.length > 0);
     };
 
     // 1) Intento inicial: si la sesión YA está hidratada, cargamos de una.
@@ -413,32 +417,31 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
   }, []);
 
   // ── Compras ─────────────────────────────────────────────────────────────
-  const addPurchases = useCallback((rows: NewPurchase[]) => {
+  // Las órdenes se PERSISTEN en Supabase (`public.compras`, aislada por RLS y por
+  // filtro explícito de `empresa_id`), no solo en memoria/localStorage: por eso
+  // sobreviven a las recargas. Tras insertar, se RELEE la tabla para reflejar la
+  // verdad del servidor (folios reales OC-####, orden por fecha) en el estado.
+  const addPurchases = useCallback(async (rows: NewPurchase[]): Promise<number> => {
     if (rows.length === 0) return 0;
-    setPurchases((prev) => {
-      let seq = prev.length;
-      const mapped: PurchaseOrder[] = rows.map((r) => ({
-        id: r.id && r.id.trim() ? r.id.trim() : `OC-${String(++seq).padStart(4, "0")}`,
-        clientId: CURRENT_CLIENT_ID,
-        supplier: r.supplier,
-        items: r.items,
-        units: r.units,
-        cost: r.cost,
-        eta: r.eta,
-        status: r.status,
-      }));
-      return [...mapped, ...prev];
-    });
-    return rows.length;
+    const insertadas = await insertCompras(rows);
+    if (insertadas > 0) {
+      // Fuente de verdad: lo que quedó guardado en la BD de ESTA empresa.
+      const compras = await fetchComprasEmpresa();
+      setPurchases(compras);
+      setImported((prev) => prev || compras.length > 0);
+    }
+    return insertadas;
   }, []);
 
-  /** Inyecta en los cuatro módulos lo que traiga el lote importado. */
+  /** Inyecta en los cuatro módulos lo que traiga el lote importado. Las compras
+   *  se PERSISTEN en Supabase (addPurchases es asíncrono), por eso el resultado
+   *  también lo es: el importador espera a que la BD confirme antes del toast. */
   const bulkImport = useCallback(
-    (bundle: ImportBundle): BulkImportResult => {
+    async (bundle: ImportBundle): Promise<BulkImportResult> => {
       const products = bundle.inventory?.length ? addInventoryItems(bundle.inventory) : 0;
       const custs = bundle.customers?.length ? addCustomers(bundle.customers) : 0;
       const sls = bundle.sales?.length ? addSales(bundle.sales) : 0;
-      const purch = bundle.purchases?.length ? addPurchases(bundle.purchases) : 0;
+      const purch = bundle.purchases?.length ? await addPurchases(bundle.purchases) : 0;
       if (products || custs || sls || purch) setImported(true);
       return { customers: custs, products, sales: sls, purchases: purch };
     },

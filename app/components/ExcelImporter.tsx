@@ -72,7 +72,7 @@ export default function ExcelImporter() {
         return;
       }
 
-      const result = bulkImport(report.bundle);
+      const result = await bulkImport(report.bundle);
       setStatus({ kind: "success", fileName: file.name, result, unknown: report.unknownSheets });
       showToast("Importación exitosa", describe(result));
     },
@@ -114,7 +114,7 @@ export default function ExcelImporter() {
         return;
       }
 
-      const result = bulkImport(report.bundle);
+      const result = await bulkImport(report.bundle);
       setStatus({ kind: "bulkSuccess", files: names, result, unknown: report.unknownSheets });
       showToast("Procesamiento masivo exitoso", describe(result));
     },

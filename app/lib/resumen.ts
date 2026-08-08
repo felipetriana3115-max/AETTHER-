@@ -19,7 +19,8 @@
  */
 
 import { supabase, getEmpresaIdActiva } from "./auth";
-import type { InventoryItem, Sale } from "./data-model";
+import type { InventoryItem, Sale, PurchaseOrder, PurchaseStatus } from "./data-model";
+import type { NewPurchase } from "../components/DashboardProvider";
 
 /** Fila cruda de `public.ventas` (solo las columnas que consumimos). */
 type VentaRow = {
@@ -271,6 +272,97 @@ export async function fetchCatalogoProductos(): Promise<ProductoCatalogo[]> {
       precio_costo: Number(row.precio_costo ?? 0),
     };
   });
+}
+
+// ── Persistencia de órdenes de compra (tabla `public.compras`) ───────────────
+
+/** Fila cruda de `public.compras` (solo las columnas que consumimos). */
+type CompraRow = {
+  folio: number | string; // bigint identity → puede llegar como string desde PostgREST
+  proveedor: string;
+  items: string;
+  unidades: number | string | null;
+  costo: number | string | null; // numeric puede llegar como string
+  eta: string | null;
+  estado: string;
+};
+
+/**
+ * Órdenes de compra de la empresa autenticada, mapeadas a `PurchaseOrder`.
+ * Aisladas por RLS y, además, por filtro explícito por `empresa_id` resuelto de
+ * la sesión viva (defensa en profundidad). Es la ÚNICA fuente de verdad de las
+ * compras: se leen directamente de Supabase, no de localStorage, así sobreviven
+ * a las recargas y son idénticas en todos los dispositivos. Sin sesión/empresa
+ * (o ante error) devuelve [], nunca filas de otra empresa.
+ */
+export async function fetchComprasEmpresa(): Promise<PurchaseOrder[]> {
+  const empresaId = await getEmpresaIdActiva();
+  if (!empresaId) return []; // sin empresa resuelta no se consulta (aislamiento)
+
+  const { data, error } = await supabase
+    .from("compras")
+    .select("*")
+    .eq("empresa_id", empresaId)
+    .order("created_at", { ascending: false });
+
+  if (error) {
+    console.warn(
+      "[resumen] No se pudieron leer las compras:",
+      error.message,
+      "· ¿corriste supabase/2026-08-crear-compras.sql?",
+    );
+    return [];
+  }
+
+  return ((data ?? []) as CompraRow[]).map((c) => ({
+    // Folio legible para la UI (OC-0001…); estable y único por fila.
+    id: `OC-${String(c.folio).padStart(4, "0")}`,
+    clientId: "", // el aislamiento lo impone RLS; el cliente no lo usa
+    supplier: c.proveedor,
+    items: c.items,
+    units: Number(c.unidades ?? 0),
+    cost: Number(c.costo ?? 0),
+    eta: c.eta ?? "Por definir",
+    status: (c.estado as PurchaseStatus) ?? "Pendiente",
+  }));
+}
+
+/**
+ * Inserta una o varias órdenes de compra en `public.compras`, estampando el
+ * `empresa_id` resuelto de la sesión viva (`getEmpresaIdActiva`). El aislamiento
+ * lo garantiza RLS (`with check empresa_id = mi_empresa()`); enviarlo explícito
+ * es defensa en profundidad. Devuelve cuántas filas se insertaron (0 si no hay
+ * empresa resuelta o si la inserción falla).
+ */
+export async function insertCompras(rows: NewPurchase[]): Promise<number> {
+  if (rows.length === 0) return 0;
+
+  const empresaId = await getEmpresaIdActiva();
+  if (!empresaId) return 0; // sin empresa resuelta no se inserta (aislamiento)
+
+  const payload = rows.map((r) => ({
+    empresa_id: empresaId,
+    proveedor: r.supplier,
+    items: r.items,
+    unidades: r.units,
+    costo: r.cost,
+    eta: r.eta || "Por definir",
+    estado: r.status,
+    producto_id: r.productoId ?? null,
+    codigo_barras: r.codigoBarras ?? null,
+  }));
+
+  const { error } = await supabase.from("compras").insert(payload);
+
+  if (error) {
+    console.error(
+      "[resumen] No se pudo guardar la orden de compra:",
+      error.message,
+      "· ¿corriste supabase/2026-08-crear-compras.sql?",
+    );
+    return 0;
+  }
+  return rows.length;
 }
 
 /** Datos mínimos para impactar el inventario al recibir una orden de compra. */
