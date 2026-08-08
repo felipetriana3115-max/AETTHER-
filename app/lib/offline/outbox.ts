@@ -145,6 +145,26 @@ export async function syncOutbox(): Promise<ResultadoSync> {
 
   sincronizando = true;
   try {
+    // GATE DE SESIÓN — evita el falso "sesión sin empresa" en arranque en frío.
+    // `syncOutbox` se dispara al montar el POS y en el evento `online`, y puede
+    // ejecutarse ANTES de que supabase-js rehidrate la sesión desde el storage.
+    // Sin sesión cargada, la RPC viaja como `anon`: como `registrar_venta_offline`
+    // solo tiene GRANT a `authenticated`, el servidor la rechaza con 42501, el
+    // MISMO código que usamos para "empresa nula". Además, sin `auth.uid()`,
+    // `mi_empresa()` evaluaría a nulo. Al hacer `await getUser()` forzamos la
+    // rehidratación (y el refresco del token si expiró): el JWT queda adjunto y
+    // `mi_empresa()` resuelve el empresa_id real en las RPC de abajo.
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    if (!user) {
+      // Sesión aún no disponible (o sin login): NO es un fallo de empresa. Salimos
+      // sin error para que el latido/evento `online` reintente cuando la sesión
+      // esté lista, en vez de mostrar el mensaje alarmante de "sesión sin empresa".
+      res.restantes = await contarPendientes();
+      return res;
+    }
+
     const pendientes = await db.outbox.where("estado").anyOf("pendiente", "error").sortBy("localId");
     for (const v of pendientes) {
       const enviado = await enviarUna(v);
