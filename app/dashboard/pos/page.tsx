@@ -441,18 +441,33 @@ export default function PosPage() {
           if (r && r.conError > 0) {
             setFeedback({
               tone: "error",
-              msg: esFiado
-                ? "Fiado guardado, pero el servidor rechazó la sincronización (revisa el stock o el cliente). Pulsa Sincronizar."
-                : "Venta guardada, pero el servidor rechazó una sincronización (revisa el stock). Pulsa Sincronizar.",
+              // Preferimos el mensaje REAL del servidor (`r.mensaje`) para no dar una
+              // causa equivocada: p. ej. una venta que el servidor marcó como ya
+              // registrada sin insertarla no se arregla "revisando el stock".
+              msg:
+                r.mensaje ??
+                (esFiado
+                  ? "Fiado guardado, pero el servidor rechazó la sincronización (revisa el stock o el cliente). Pulsa Sincronizar."
+                  : "Venta guardada, pero el servidor rechazó una sincronización (revisa el stock). Pulsa Sincronizar."),
             });
-          } else if (r && r.detuvoPorRed) {
+          } else if (!r || r.detuvoPorRed || r.restantes > 0) {
+            // La venta quedó guardada localmente pero AÚN NO se confirmó su subida
+            // al servidor. Esto cubre: sin resultado (`!r`), corte por red, y —lo
+            // importante— cuando `syncOutbox` volvió sin error pero la cola NO se
+            // vació (`restantes > 0`: p. ej. el gate de sesión salió temprano o la
+            // RPC no confirmó la venta). Antes estos casos caían en el `else` y se
+            // marcaban como "Venta cobrada" (éxito FALSO) pese a no haberse subido.
+            // Ahora se reportan como pendiente para no dar por subida una venta que
+            // no lo está; el latido/botón Sincronizar reintentará.
             setFeedback({
               tone: "ok",
               msg: esFiado
-                ? `Fiado a ${nombreFiado} (${formatCOP(total)}) quedó pendiente por conexión; se cargará al reintentar.`
-                : `Venta cobrada (${formatCOP(total)}). Quedó pendiente por conexión; se reintentará.`,
+                ? `Fiado a ${nombreFiado} (${formatCOP(total)}) quedó guardado y pendiente de subir; se reintentará.`
+                : `Venta cobrada (${formatCOP(total)}). Quedó guardada y pendiente de subir; se reintentará.`,
             });
           } else {
+            // Éxito real: la cola se vació sin errores (`restantes === 0`), o sea
+            // que el servidor confirmó la venta.
             setFeedback({ tone: "ok", msg: okMsg });
             // Refrescamos el saldo del cliente en el selector tras cargar el fiado,
             // para que un segundo fiado al mismo cliente muestre su deuda al día.

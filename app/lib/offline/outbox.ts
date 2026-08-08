@@ -60,7 +60,18 @@ export async function enqueueVenta(v: NuevaVenta): Promise<VentaOutbox> {
     ultimoError: null,
     ventaId: null,
   };
-  if (!db) return registro; // sin IndexedDB no persistimos, pero devolvemos el objeto
+  if (!db) {
+    // Sin IndexedDB (navegador embebido tipo WhatsApp/Instagram, modo privado o
+    // almacenamiento bloqueado) NO podemos persistir la venta NI encolarla para
+    // sincronizar. Antes devolvíamos el registro como si se hubiera guardado; como
+    // `syncOutbox`/`contarPendientes` también salen en vacío sin DB, la barra
+    // mostraba "Todo sincronizado" mientras el cobro se perdía en silencio (nunca
+    // llegaba a Supabase). Fallar de forma explícita hace que el POS avise en vez
+    // de tragarse la venta.
+    throw new Error(
+      "El almacenamiento local no está disponible (¿navegador en modo privado o embebido?); la venta no se pudo guardar.",
+    );
+  }
   const localId = await db.outbox.add(registro);
   return { ...registro, localId };
 }
@@ -243,7 +254,33 @@ async function enviarUna(v: VentaOutbox): Promise<EnvioResultado> {
     });
 
     if (!error) {
-      const payload = (data ?? {}) as { corte?: CorteRpc };
+      const payload = (data ?? {}) as {
+        corte?: CorteRpc;
+        duplicada?: boolean;
+        venta_id?: string;
+      };
+      // GUARDA ANTI-FALSO-ÉXITO. En el PRIMER envío de una venta recién cobrada
+      // (`intentos === 0`) el servidor tiene que INSERTARLA, así que debe responder
+      // `duplicada: false` con un `venta_id`. Como cada cobro genera un `clientUuid`
+      // único e irrepetible (y Dexie impide re-encolarlo), es IMPOSIBLE que una
+      // venta nueva ya exista en el servidor en su primer envío.
+      //
+      // Si aun así responde `duplicada: true` (o sin `venta_id`) en el primer
+      // intento, la fila NO se creó: casi siempre es la función `registrar_venta_offline`
+      // desplegada en una versión vieja/rota cuyo cortocircuito de idempotencia no
+      // filtra por `client_uuid` y confunde la venta con una de las ya existentes.
+      // Antes devolvíamos `ok:true` y la cola la borraba → "Todo sincronizado" con la
+      // venta perdida. Ahora la tratamos como problema para NO marcarla como subida.
+      if (v.intentos === 0 && (payload.duplicada === true || !payload.venta_id)) {
+        return {
+          ok: false,
+          negocio: true,
+          mensaje:
+            "El servidor marcó la venta como ya registrada en su primer envío (no se insertó ninguna fila). " +
+            "Re-aplica supabase/2026-08-arqueo-diario.sql: la función registrar_venta_offline desplegada está " +
+            "desactualizada.",
+        };
+      }
       return { ok: true, corte: payload.corte ?? null };
     }
 
