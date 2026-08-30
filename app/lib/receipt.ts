@@ -2,6 +2,14 @@
 
 import { formatCOP } from "./data-model";
 import type { PrinterSettings } from "./devices";
+import type { TirillaConfig } from "./tirilla";
+
+/**
+ * Lo que necesita la tirilla para imprimirse: el formato/hardware
+ * (`PrinterSettings`) MÁS la identidad del negocio (`TirillaConfig`). El llamador
+ * fusiona ambas fuentes (hardware desde localStorage, identidad desde Supabase).
+ */
+export type ReceiptPrinter = PrinterSettings & TirillaConfig;
 
 /**
  * Generación e impresión de la tirilla térmica de venta.
@@ -40,7 +48,7 @@ function esc(value: string): string {
  * Construye el HTML completo de la tirilla. `columns` marca el ancho útil en
  * caracteres para alinear las columnas con fuente monoespaciada.
  */
-export function buildReceiptHtml(data: ReceiptData, printer: PrinterSettings): string {
+export function buildReceiptHtml(data: ReceiptData, printer: ReceiptPrinter): string {
   const { columns, paperWidth, fontFamily, fontSize } = printer;
   // Ancho físico útil aproximado del rollo (se descuentan los márgenes).
   const bodyWidth = paperWidth === "58mm" ? "48mm" : "72mm";
@@ -136,7 +144,7 @@ export function buildReceiptHtml(data: ReceiptData, printer: PrinterSettings): s
  * Imprime la tirilla usando un iframe oculto y el diálogo del navegador. Espera
  * a que el logo cargue antes de invocar `print()` para no imprimirlo en blanco.
  */
-export function printReceipt(data: ReceiptData, printer: PrinterSettings): void {
+export function printReceipt(data: ReceiptData, printer: ReceiptPrinter): void {
   if (typeof window === "undefined") return;
 
   const html = buildReceiptHtml(data, printer);

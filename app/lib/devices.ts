@@ -8,11 +8,13 @@ import { useCallback, useEffect, useState } from "react";
  *
  * Es configuración LOCAL a cada máquina (qué impresora hay conectada, ancho de
  * papel, puerto serial de la báscula…), por eso vive en `localStorage` y no en
- * Supabase — igual que `businessName` (ver DashboardProvider). Los datos de
- * identidad del recibo (NIT, dirección, logo, mensaje) también se guardan aquí
- * porque la tabla `empresas` solo tiene `nit` y añadir columnas exigiría una
- * migración; este enfoque mantiene el alcance acotado y consistente con el resto
- * de preferencias del cliente.
+ * Supabase, y por eso el logout NO la borra (ver `clearSession`): pertenece al
+ * equipo, no al usuario ni al tenant.
+ *
+ * OJO: la IDENTIDAD del recibo (NIT, dirección, teléfono, logo, mensaje) NO va
+ * aquí — pertenece al negocio, así que se guarda por tenant en `empresas` (ver
+ * `tirilla.ts`). Mezclarla en este blob la borraba al cerrar sesión y la filtraba
+ * entre tenants del mismo equipo.
  */
 
 // ── Tipos ──────────────────────────────────────────────────────────────────
@@ -39,12 +41,6 @@ export type PrinterSettings = {
   fontSize: number;
   /** Imprime la tirilla automáticamente al cobrar en el POS. */
   autoPrint: boolean;
-  // Identidad del recibo
-  logoDataUrl: string;
-  nit: string;
-  direccion: string;
-  telefono: string;
-  mensajeAgradecimiento: string;
 };
 
 /** Lector de códigos de barras (por defecto teclado HID / "keyboard wedge"). */
@@ -104,11 +100,6 @@ export const DEFAULT_DEVICE_SETTINGS: DeviceSettings = {
     fontFamily: "'Courier New', ui-monospace, monospace",
     fontSize: 12,
     autoPrint: true,
-    logoDataUrl: "",
-    nit: "",
-    direccion: "",
-    telefono: "",
-    mensajeAgradecimiento: "¡Gracias por tu compra!",
   },
   scanner: {
     enabled: true,
@@ -137,7 +128,9 @@ export const DEFAULT_DEVICE_SETTINGS: DeviceSettings = {
 
 // ── Persistencia (localStorage) ──────────────────────────────────────────────
 
-const DEVICES_KEY = "mi-dashboard-erp:devices:v1";
+/** Clave del hardware de la caja (por equipo). El logout la PRESERVA a propósito
+ *  (ver `clearSession`/`purgeDashboardCache` en auth.ts). */
+export const DEVICES_KEY = "mi-dashboard-erp:devices:v1";
 
 /** Lee la configuración guardada, fusionándola con los valores por defecto. */
 export function loadDeviceSettings(): DeviceSettings {

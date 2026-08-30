@@ -1,7 +1,9 @@
 "use client";
 
 import { useState, type ReactNode } from "react";
+import { useDashboard } from "../DashboardProvider";
 import { useDeviceSettings, type DeviceSettings } from "../../lib/devices";
+import { useTirilla } from "../../lib/tirilla";
 import PrinterConfig from "./PrinterConfig";
 import ScannerConfig from "./ScannerConfig";
 import CashDrawerConfig from "./CashDrawerConfig";
@@ -85,13 +87,25 @@ function statusLabel(key: DeviceKey, s: DeviceSettings): { text: string; active:
 }
 
 export default function DevicesSection() {
+  const { showToast } = useDashboard();
   const { settings, patch, hydrated } = useDeviceSettings();
+  // Identidad del recibo: por tenant, en Supabase (sobrevive al logout).
+  const { tirilla, patch: patchTirilla } = useTirilla((msg) =>
+    showToast("No se pudo guardar la tirilla", msg),
+  );
   const [open, setOpen] = useState<DeviceKey | null>(null);
 
   const renderPanel = (key: DeviceKey) => {
     switch (key) {
       case "printer":
-        return <PrinterConfig settings={settings.printer} onPatch={(c) => patch("printer", c)} />;
+        return (
+          <PrinterConfig
+            settings={settings.printer}
+            onPatch={(c) => patch("printer", c)}
+            tirilla={tirilla}
+            onTirillaPatch={patchTirilla}
+          />
+        );
       case "scanner":
         return <ScannerConfig settings={settings.scanner} onPatch={(c) => patch("scanner", c)} />;
       case "drawer":

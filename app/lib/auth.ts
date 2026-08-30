@@ -106,11 +106,23 @@ export function saveSession(user: string, rol?: Rol, permisos?: readonly string[
 const DASHBOARD_CACHE_PREFIX = "mi-dashboard-erp";
 
 /**
- * Purga de `localStorage` y `sessionStorage` cualquier caché de datos del
- * dashboard (claves `mi-dashboard-erp*`, segmentadas por empresa). Sin esto, el
- * siguiente usuario en el MISMO navegador podría ver métricas del tenant anterior
- * (productos en stock, tendencia de ingresos, etc.) hasta que el servidor
- * respondiera. Se llama en cada logout.
+ * Claves que comparten el prefijo del dashboard pero NO son datos del tenant, sino
+ * configuración del EQUIPO, y por tanto NO deben borrarse al cerrar sesión.
+ *
+ * `mi-dashboard-erp:devices:v1` guarda el hardware de la caja (impresora, cajón,
+ * báscula, lector). Es propio de la máquina y debe persistir entre usuarios/logins
+ * (debe coincidir con `DEVICES_KEY` en devices.ts). NO se importa de allí para no
+ * arrastrar un módulo "use client" (con hooks de React) al runtime edge del proxy,
+ * que también importa este archivo.
+ */
+const PRESERVED_ON_LOGOUT = new Set<string>(["mi-dashboard-erp:devices:v1"]);
+
+/**
+ * Purga de `localStorage` y `sessionStorage` el caché de datos del dashboard
+ * (claves `mi-dashboard-erp*`, segmentadas por empresa), EXCEPTO las de
+ * `PRESERVED_ON_LOGOUT` (hardware del equipo). Sin esta purga, el siguiente
+ * usuario en el MISMO navegador podría ver métricas del tenant anterior (stock,
+ * ingresos, identidad de la tirilla, etc.). Se llama en cada logout.
  */
 function purgeDashboardCache(): void {
   for (const storage of [
@@ -122,7 +134,9 @@ function purgeDashboardCache(): void {
       const claves: string[] = [];
       for (let i = 0; i < storage.length; i++) {
         const k = storage.key(i);
-        if (k && k.startsWith(DASHBOARD_CACHE_PREFIX)) claves.push(k);
+        if (k && k.startsWith(DASHBOARD_CACHE_PREFIX) && !PRESERVED_ON_LOGOUT.has(k)) {
+          claves.push(k);
+        }
       }
       for (const k of claves) storage.removeItem(k);
     } catch {

@@ -9,6 +9,7 @@ import {
   type PrinterConnection,
   type PrinterSettings,
 } from "../../lib/devices";
+import type { TirillaConfig } from "../../lib/tirilla";
 import { buildReceiptHtml, printReceipt, type ReceiptData } from "../../lib/receipt";
 import {
   PrimaryButton,
@@ -38,18 +39,23 @@ function sampleReceipt(businessName: string): ReceiptData {
 }
 
 type Props = {
+  /** Hardware de la impresora (local al equipo, en localStorage). */
   settings: PrinterSettings;
   onPatch: (changes: Partial<PrinterSettings>) => void;
+  /** Identidad del recibo (por tenant, en Supabase). */
+  tirilla: TirillaConfig;
+  onTirillaPatch: (changes: Partial<TirillaConfig>) => void;
 };
 
-export default function PrinterConfig({ settings, onPatch }: Props) {
+export default function PrinterConfig({ settings, onPatch, tirilla, onTirillaPatch }: Props) {
   const { businessName, showToast } = useDashboard();
   const logoInputRef = useRef<HTMLInputElement>(null);
   const [connecting, setConnecting] = useState(false);
 
+  // La tirilla combina el formato/hardware (settings) con la identidad (tirilla).
   const previewHtml = useMemo(
-    () => buildReceiptHtml(sampleReceipt(businessName), settings),
-    [businessName, settings],
+    () => buildReceiptHtml(sampleReceipt(businessName), { ...settings, ...tirilla }),
+    [businessName, settings, tirilla],
   );
 
   const handleLogo = (file: File | undefined) => {
@@ -59,7 +65,7 @@ export default function PrinterConfig({ settings, onPatch }: Props) {
       return;
     }
     const reader = new FileReader();
-    reader.onload = () => onPatch({ logoDataUrl: String(reader.result ?? "") });
+    reader.onload = () => onTirillaPatch({ logoDataUrl: String(reader.result ?? "") });
     reader.readAsDataURL(file);
   };
 
@@ -202,16 +208,16 @@ export default function PrinterConfig({ settings, onPatch }: Props) {
           <div className="flex items-center gap-4">
             <div
               className="flex h-16 w-16 shrink-0 items-center justify-center rounded-lg border border-zinc-800 bg-white bg-contain bg-center bg-no-repeat"
-              style={settings.logoDataUrl ? { backgroundImage: `url(${settings.logoDataUrl})` } : undefined}
+              style={tirilla.logoDataUrl ? { backgroundImage: `url(${tirilla.logoDataUrl})` } : undefined}
             >
-              {!settings.logoDataUrl && <span className="text-[10px] text-zinc-500">Sin logo</span>}
+              {!tirilla.logoDataUrl && <span className="text-[10px] text-zinc-500">Sin logo</span>}
             </div>
             <div className="flex flex-wrap gap-2">
               <SecondaryButton onClick={() => logoInputRef.current?.click()}>
-                {settings.logoDataUrl ? "Cambiar logo" : "Subir logo"}
+                {tirilla.logoDataUrl ? "Cambiar logo" : "Subir logo"}
               </SecondaryButton>
-              {settings.logoDataUrl && (
-                <SecondaryButton onClick={() => onPatch({ logoDataUrl: "" })}>Quitar</SecondaryButton>
+              {tirilla.logoDataUrl && (
+                <SecondaryButton onClick={() => onTirillaPatch({ logoDataUrl: "" })}>Quitar</SecondaryButton>
               )}
             </div>
             <input
@@ -229,15 +235,15 @@ export default function PrinterConfig({ settings, onPatch }: Props) {
           <TextField
             id="printer-nit"
             label="NIT"
-            value={settings.nit}
-            onChange={(v) => onPatch({ nit: v })}
+            value={tirilla.nit}
+            onChange={(v) => onTirillaPatch({ nit: v })}
             placeholder="900.123.456-7"
           />
           <TextField
             id="printer-tel"
             label="Teléfono (opcional)"
-            value={settings.telefono}
-            onChange={(v) => onPatch({ telefono: v })}
+            value={tirilla.telefono}
+            onChange={(v) => onTirillaPatch({ telefono: v })}
             placeholder="+57 300 000 0000"
             type="tel"
             inputMode="tel"
@@ -247,16 +253,16 @@ export default function PrinterConfig({ settings, onPatch }: Props) {
         <TextField
           id="printer-direccion"
           label="Dirección"
-          value={settings.direccion}
-          onChange={(v) => onPatch({ direccion: v })}
+          value={tirilla.direccion}
+          onChange={(v) => onTirillaPatch({ direccion: v })}
           placeholder="Cra 10 #20-30, Bogotá"
         />
 
         <TextAreaField
           id="printer-gracias"
           label="Mensaje de agradecimiento"
-          value={settings.mensajeAgradecimiento}
-          onChange={(v) => onPatch({ mensajeAgradecimiento: v })}
+          value={tirilla.mensajeAgradecimiento}
+          onChange={(v) => onTirillaPatch({ mensajeAgradecimiento: v })}
           placeholder="¡Gracias por tu compra!"
           hint="Aparece al pie de cada tirilla."
         />
@@ -271,7 +277,7 @@ export default function PrinterConfig({ settings, onPatch }: Props) {
             </h4>
             <p className="mt-0.5 text-[11px] text-zinc-600">Con una venta de ejemplo.</p>
           </div>
-          <PrimaryButton onClick={() => printReceipt(sampleReceipt(businessName), settings)}>
+          <PrimaryButton onClick={() => printReceipt(sampleReceipt(businessName), { ...settings, ...tirilla })}>
             <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
               <path d="M6 9V2h12v7" />
               <path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2" />

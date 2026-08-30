@@ -10,6 +10,7 @@ import { formatCOP } from "../../lib/data-model";
 import { fetchClientes, type Cliente } from "../../lib/clientes";
 import { fetchVentasHoyPorMetodo, type VentasHoyPorMetodo } from "../../lib/corte";
 import { loadDeviceSettings } from "../../lib/devices";
+import { fetchTirilla, DEFAULT_TIRILLA, type TirillaConfig } from "../../lib/tirilla";
 import { printReceipt, type ReceiptData } from "../../lib/receipt";
 import { cacheCatalogo, descontarStockLocal, getFrecuentes } from "../../lib/offline/catalog";
 import { enqueueVenta } from "../../lib/offline/outbox";
@@ -116,6 +117,11 @@ export default function PosPage() {
   // Última venta cobrada: habilita reimprimir la tirilla tras vaciar el carrito.
   const [ultimaVenta, setUltimaVenta] = useState<ReceiptData | null>(null);
 
+  // Identidad del recibo (NIT, dirección, logo, mensaje) del tenant, desde Supabase.
+  // En un ref para que los handlers de impresión lean siempre el valor vigente sin
+  // recomputar sus dependencias. `fetchTirilla` cae al caché local si no hay red.
+  const tirillaRef = useRef<TirillaConfig>(DEFAULT_TIRILLA);
+
   // ── Cliente + fiado ──────────────────────────────────────────────────────
   // Directorio del CRM para asociar la venta a un cliente (necesario para fiar).
   const [clientes, setClientes] = useState<Cliente[]>([]);
@@ -139,6 +145,18 @@ export default function PosPage() {
     const t = setTimeout(() => setFeedback(null), 3500);
     return () => clearTimeout(t);
   }, [feedback]);
+
+  // Carga la identidad de la tirilla del tenant (una vez) para imprimirla en los
+  // recibos. Best-effort: si falla, se imprime sin NIT/logo (degradación suave).
+  useEffect(() => {
+    let activo = true;
+    void fetchTirilla().then((cfg) => {
+      if (activo) tirillaRef.current = cfg;
+    });
+    return () => {
+      activo = false;
+    };
+  }, []);
 
   // Carga inicial del grid táctil + cacheo del catálogo para uso sin conexión.
   // `cacheCatalogo` refresca el espejo local completo (lo usan el scanner y la
@@ -422,7 +440,7 @@ export default function PosPage() {
 
         const devices = loadDeviceSettings();
         if (devices.printer.enabled && devices.printer.autoPrint) {
-          printReceipt(recibo, devices.printer);
+          printReceipt(recibo, { ...devices.printer, ...tirillaRef.current });
         }
 
         const okMsg = esFiado
@@ -557,7 +575,7 @@ export default function PosPage() {
   const reimprimir = useCallback(() => {
     if (!ultimaVenta) return;
     const devices = loadDeviceSettings();
-    printReceipt(ultimaVenta, devices.printer);
+    printReceipt(ultimaVenta, { ...devices.printer, ...tirillaRef.current });
   }, [ultimaVenta]);
 
   // ── Render ───────────────────────────────────────────────────────────────────
