@@ -4,6 +4,7 @@ import { useState, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
 import Image from "next/image";
 import { saveSession, signIn } from "../lib/auth";
+import { rutaInicioEmpleado } from "../lib/authz";
 
 /**
  * Pantalla de acceso. Autentica contra Supabase (`signIn`), consulta el rol en
@@ -26,10 +27,17 @@ export default function LoginPage() {
     setError(null);
     setSubmitting(true);
     try {
-      const { rol } = await signIn(email.trim(), password);
-      // Escribe cookie de sesión + cookie de rol (esta última la lee el proxy).
-      saveSession(email.trim(), rol);
-      const destino = rol === "super_admin" ? "/admin" : "/";
+      const { rol, permisos } = await signIn(email.trim(), password);
+      // Escribe cookie de sesión + rol + permisos (las lee el proxy para enrutar).
+      saveSession(email.trim(), rol, permisos);
+      // Destino: super_admin → /admin; admin de empresa → /; empleado → su
+      // primera ruta permitida (o /sin-acceso si no tiene ningún permiso).
+      const destino =
+        rol === "super_admin"
+          ? "/admin"
+          : rol === "empresa_admin"
+            ? "/"
+            : rutaInicioEmpleado(permisos);
       router.push(destino);
       router.refresh();
     } catch (err) {

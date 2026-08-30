@@ -2,13 +2,16 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import type { ReactNode } from "react";
-import { clearSession } from "../lib/auth";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { clearSession, getRol, getPermisos } from "../lib/auth";
+import { esAdmin, puedeAcceder, type Rol } from "../lib/authz";
 
 type NavItem = {
   label: string;
   href: string;
   icon: ReactNode;
+  /** Si es true, solo lo ve el admin de empresa (gestión del tenant). */
+  adminOnly?: boolean;
 };
 
 const navItems: NavItem[] = [
@@ -106,6 +109,21 @@ const navItems: NavItem[] = [
     ),
   },
   {
+    label: "Empleados",
+    href: "/empleados",
+    adminOnly: true,
+    icon: (
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+        <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+        <circle cx="9" cy="7" r="4" />
+        <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
+        <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+        <path d="M19 8v6" />
+        <path d="M22 11h-6" />
+      </svg>
+    ),
+  },
+  {
     label: "Configuración",
     href: "/configuracion",
     icon: (
@@ -127,6 +145,27 @@ type SidebarProps = {
 export default function Sidebar({ open = false, onClose }: SidebarProps) {
   const pathname = usePathname();
   const router = useRouter();
+
+  // Rol y permisos del usuario (cookies-pista) para filtrar la navegación. Se
+  // leen tras montar para evitar desajustes de hidratación (el servidor no ve las
+  // cookies vía document). No es control de acceso: RLS y el proxy son la barrera
+  // real; esto solo evita mostrar enlaces que el empleado no puede abrir.
+  const [mounted, setMounted] = useState(false);
+  const [rol, setRol] = useState<Rol | null>(null);
+  const [permisos, setPermisos] = useState<string[]>([]);
+  useEffect(() => {
+    setRol(getRol());
+    setPermisos(getPermisos());
+    setMounted(true);
+  }, []);
+
+  const visibleItems = useMemo(
+    () =>
+      navItems.filter((item) =>
+        item.adminOnly ? esAdmin(rol) : puedeAcceder(rol, permisos, item.href),
+      ),
+    [rol, permisos],
+  );
 
   function handleLogout() {
     clearSession();
@@ -174,7 +213,7 @@ export default function Sidebar({ open = false, onClose }: SidebarProps) {
 
       {/* Navegación */}
       <nav className="relative flex-1 space-y-1 overflow-y-auto px-3 py-4">
-        {navItems.map((item) => {
+        {(mounted ? visibleItems : navItems).map((item) => {
           const isActive =
             item.href === "/"
               ? pathname === "/"

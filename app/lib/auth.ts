@@ -64,6 +64,13 @@ export const SESSION_COOKIE = "aether_session";
  */
 export const ROLE_COOKIE = "aether_role";
 
+/**
+ * Cookie con los permisos finos del EMPLEADO (CSV, p. ej. "pos,ventas"), leída
+ * por `proxy.ts` para gatear rutas. Igual que ROLE_COOKIE: es una pista de
+ * enrutado/UI, NO control de acceso. El acceso real lo imponen RLS y la API.
+ */
+export const PERMISSIONS_COOKIE = "aether_perms";
+
 /** Roles posibles; debe coincidir con el enum `rol_usuario` de Postgres. */
 export type Rol = "super_admin" | "empresa_admin" | "empresa_empleado";
 
@@ -79,11 +86,14 @@ export type Session = { user: string };
  * Guarda la sesión tras un login correcto: cookie (para el proxy) + espejo en
  * localStorage (para la UI). Solo debe llamarse desde el cliente.
  */
-export function saveSession(user: string, rol?: Rol): void {
+export function saveSession(user: string, rol?: Rol, permisos?: readonly string[]): void {
   document.cookie = `${SESSION_COOKIE}=1; path=/; max-age=${SESSION_MAX_AGE}; samesite=lax`;
   if (rol) {
     document.cookie = `${ROLE_COOKIE}=${rol}; path=/; max-age=${SESSION_MAX_AGE}; samesite=lax`;
   }
+  // Permisos finos para que el proxy pueda gatear rutas del empleado. Se escribe
+  // siempre (aunque venga vacío) para no dejar una cookie obsoleta de otra sesión.
+  document.cookie = `${PERMISSIONS_COOKIE}=${(permisos ?? []).join(",")}; path=/; max-age=${SESSION_MAX_AGE}; samesite=lax`;
   try {
     localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify({ user } satisfies Session));
   } catch {
@@ -126,6 +136,7 @@ function purgeDashboardCache(): void {
 export function clearSession(): void {
   document.cookie = `${SESSION_COOKIE}=; path=/; max-age=0; samesite=lax`;
   document.cookie = `${ROLE_COOKIE}=; path=/; max-age=0; samesite=lax`;
+  document.cookie = `${PERMISSIONS_COOKIE}=; path=/; max-age=0; samesite=lax`;
   try {
     localStorage.removeItem(SESSION_STORAGE_KEY);
     // Borra el tenant cacheado para que el siguiente usuario NO herede la empresa
@@ -145,6 +156,29 @@ export function clearSession(): void {
   // login, y el provider recargaría datos del tenant que se acaba de cerrar.
   // Es asíncrono; no bloqueamos el logout esperándolo (fire-and-forget).
   void supabase.auth.signOut();
+}
+
+/** Lee el valor de una cookie por nombre (cliente). */
+function leerCookie(nombre: string): string | null {
+  if (typeof document === "undefined") return null;
+  const match = document.cookie
+    .split("; ")
+    .find((c) => c.startsWith(`${nombre}=`));
+  return match ? decodeURIComponent(match.slice(nombre.length + 1)) : null;
+}
+
+/** Rol del usuario actual leído de la cookie-pista (para la UI). null si no hay. */
+export function getRol(): Rol | null {
+  const v = leerCookie(ROLE_COOKIE);
+  return v === "super_admin" || v === "empresa_admin" || v === "empresa_empleado"
+    ? v
+    : null;
+}
+
+/** Permisos finos del usuario actual leídos de la cookie-pista (para la UI). */
+export function getPermisos(): string[] {
+  const v = leerCookie(PERMISSIONS_COOKIE);
+  return v ? v.split(",").filter(Boolean) : [];
 }
 
 /** Devuelve el usuario de la sesión activa (espejo en localStorage) o null. */
@@ -212,7 +246,7 @@ function toError(err: unknown, contexto: string): Error {
 export async function signIn(
   email: string,
   password: string,
-): Promise<TenantInfo & { rol: Rol }> {
+): Promise<TenantInfo & { rol: Rol; permisos: string[] }> {
   const { data: authData, error: authError } = await supabase.auth.signInWithPassword({
     email,
     password,
@@ -245,9 +279,13 @@ export async function signIn(
   // por diseño: resuelven el perfil del usuario autenticado (`auth.uid()`) sin
   // depender de la política de lectura. Así el login funciona pase lo que pase con
   // esa política y sin tocar la base de datos.
-  const [rolRes, empresaRes] = await Promise.all([
+  const [rolRes, empresaRes, permisosRes] = await Promise.all([
     supabase.rpc("mi_rol"),
     supabase.rpc("mi_empresa"),
+    // Permisos finos del empleado (helper SECURITY DEFINER `mis_permisos`). Es
+    // best-effort: si falla (helper aún no desplegado), degradamos a []. El admin
+    // no los necesita (su rol le da acceso total).
+    supabase.rpc("mis_permisos"),
   ]);
 
   // La resolución del perfil NO debe tumbar el login. Si el RPC falla (p. ej. el
@@ -319,6 +357,15 @@ export async function signIn(
     tipoNegocio = emp?.tipo_negocio ?? "";
   }
 
+  // Permisos finos: array de strings o [] ante cualquier error/degradación.
+  const permisos: string[] =
+    !permisosRes.error && Array.isArray(permisosRes.data)
+      ? (permisosRes.data as string[])
+      : [];
+  if (permisosRes.error) {
+    console.error("[signIn] mis_permisos() falló (login continúa):", permisosRes.error);
+  }
+
   const tenant: TenantInfo = { empresaId: empresaId as string, tipoNegocio };
 
   try {
@@ -326,7 +373,7 @@ export async function signIn(
   } catch {
     // Modo privado: la UI usará un fallback; no afecta seguridad.
   }
-  return { ...tenant, rol };
+  return { ...tenant, rol, permisos };
 }
 
 /** Lee el tenant cacheado (solo UI). */
