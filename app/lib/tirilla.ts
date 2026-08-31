@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { getEmpresaIdActiva, supabase } from "./auth";
+import { getEmpresaIdActiva, getTenant, supabase } from "./auth";
 
 /**
  * Identidad de la tirilla de venta (NIT, dirección, teléfono, logo y mensaje de
@@ -77,21 +77,53 @@ function saveTirillaCache(empresaId: string, cfg: TirillaConfig): void {
 }
 
 /**
+ * Resuelve el `empresa_id` del usuario para la lectura de la tirilla, TOLERANTE al
+ * arranque en frío.
+ *
+ * En una recarga dura, `fetchTirilla` puede correr antes de que supabase-js
+ * termine de rehidratar la sesión desde las cookies, así que `getEmpresaIdActiva()`
+ * puede devolver `null` de forma transitoria (y ese `null` queda memorizado en su
+ * caché en memoria hasta el próximo cambio de usuario). Reintentamos consultando
+ * `mi_empresa()` directamente (saltando esa caché) con una espera breve, para no
+ * dar por perdida la empresa por una carrera de hidratación.
+ */
+async function resolveEmpresaId(): Promise<string | null> {
+  const cached = await getEmpresaIdActiva();
+  if (cached) return cached;
+  for (let intento = 0; intento < 3; intento++) {
+    await new Promise((r) => setTimeout(r, 150));
+    const { data, error } = await supabase.rpc("mi_empresa");
+    const id = error ? null : ((data as string | null) ?? null);
+    if (id) return id;
+  }
+  return null;
+}
+
+/**
  * Trae la identidad de la tirilla desde Supabase (fuente de verdad) y refresca el
- * caché local. Si no hay empresa o la lectura falla, cae al caché (o defaults).
+ * caché local. NUNCA devuelve defaults vacíos si hay algo mejor: si no se resuelve
+ * la empresa o la lectura falla, cae al caché por tenant (para no borrar en
+ * pantalla lo que el usuario ya guardó).
  */
 export async function fetchTirilla(): Promise<TirillaConfig> {
-  const empresaId = await getEmpresaIdActiva();
-  if (!empresaId) return DEFAULT_TIRILLA;
+  const empresaId = await resolveEmpresaId();
+  if (!empresaId) {
+    // No pudimos resolver la empresa (sesión aún hidratándose / sin red): NO
+    // pisamos con defaults vacíos; usamos el último caché conocido del tenant.
+    console.warn("[fetchTirilla] empresa no resuelta; usando caché del tenant.");
+    return loadTirillaCache(getTenant()?.empresaId ?? null);
+  }
   const { data, error } = await supabase
     .from("empresas")
     .select("nit, direccion, telefono, logo_url, mensaje_recibo")
     .eq("id", empresaId)
     .maybeSingle();
-  if (error || !data) {
+  if (error) {
     // Sin red o RLS negó la lectura → usa lo último cacheado para este tenant.
+    console.error("[fetchTirilla] lectura de 'empresas' falló; usando caché:", error);
     return loadTirillaCache(empresaId);
   }
+  if (!data) return loadTirillaCache(empresaId);
   const cfg = rowToConfig(data as EmpresaTirillaRow);
   saveTirillaCache(empresaId, cfg);
   return cfg;
@@ -122,7 +154,12 @@ export async function saveTirilla(cfg: TirillaConfig): Promise<void> {
  * invoca si un guardado falla.
  */
 export function useTirilla(onError?: (message: string) => void) {
-  const [tirilla, setTirilla] = useState<TirillaConfig>(DEFAULT_TIRILLA);
+  // Arranque optimista: pintamos de inmediato lo último cacheado por tenant (si
+  // existe) para que una recarga NO muestre placeholders/defaults mientras la
+  // lectura a Supabase resuelve. Luego `fetchTirilla` sobreescribe con la verdad.
+  const [tirilla, setTirilla] = useState<TirillaConfig>(() =>
+    loadTirillaCache(getTenant()?.empresaId ?? null),
+  );
   const [hydrated, setHydrated] = useState(false);
 
   // Guardado con debounce: el último estado pendiente + su temporizador.
