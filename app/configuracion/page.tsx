@@ -6,7 +6,6 @@ import { useDashboard } from "../components/DashboardProvider";
 import DevicesSection from "../components/config/DevicesSection";
 import { generateDailySummary } from "../lib/notifications/whatsapp-service";
 import { runDailyReportMock } from "../lib/cron/daily-report-mock";
-import { supabase, getEmpresaIdActiva } from "../lib/auth";
 
 /** Clave de localStorage para las preferencias de notificaciones. */
 const SETTINGS_KEY = "mi-dashboard-erp:settings:v1";
@@ -32,53 +31,10 @@ export default function ConfiguracionPage() {
   const [nameDraft, setNameDraft] = useState(businessName);
   useEffect(() => setNameDraft(businessName), [businessName]);
 
-  // ── Identidad de la tirilla POS (persistida en la fila del tenant) ──────────
-  const [nit, setNit] = useState("");
-  const [direccion, setDireccion] = useState("");
-  const [telefono, setTelefono] = useState("");
-
-  // Precarga los valores actuales de la tirilla del tenant activo. La lectura se
-  // acota a `id = mi_empresa()` vía la política `empresas_select_propia` (RLS
-  // intacto): jamás trae datos de otra empresa.
-  useEffect(() => {
-    let alive = true;
-    void (async () => {
-      const empresaId = await getEmpresaIdActiva();
-      if (!empresaId) return;
-      const { data, error } = await supabase
-        .from("empresas")
-        .select("nit, direccion, telefono")
-        .eq("id", empresaId)
-        .maybeSingle();
-      if (!alive || error || !data) return;
-      setNit(data.nit ?? "");
-      setDireccion(data.direccion ?? "");
-      setTelefono(data.telefono ?? "");
-    })();
-    return () => {
-      alive = false;
-    };
-  }, []);
-
-  // Guarda la identidad de la tirilla vía la RPC `actualizar_tirilla`, acotada al
-  // propio tenant (`mi_empresa()`), sin tocar el logo ni el mensaje de recibo.
-  const handleSaveTirilla = async () => {
-    const { error } = await supabase.rpc("actualizar_tirilla", {
-      p_nit: nit,
-      p_direccion: direccion,
-      p_telefono: telefono,
-      p_logo_url: "",
-      p_mensaje_recibo: "¡Gracias por su compra!",
-    });
-    if (error) {
-      showToast("No se pudo guardar", error.message);
-      return;
-    }
-    showToast(
-      "Tirilla actualizada",
-      "Los datos de la tirilla POS se guardaron correctamente.",
-    );
-  };
+  // La identidad de la tirilla (NIT, dirección, teléfono, mensaje Y LOGO) se
+  // gestiona en la sección nativa "Tirilla de venta" (Dispositivos → Impresora
+  // de Tickets), que persiste todo —incluida la URL del logo— en Supabase vía la
+  // RPC `actualizar_tirilla`. No se duplica aquí para no clobbear el logo.
 
   // ── Persistencia en localStorage ──────────────────────────────────────────
   useEffect(() => {
@@ -209,101 +165,9 @@ export default function ConfiguracionPage() {
           </form>
         </section>
 
-        {/* Datos de la Tirilla POS */}
-        <section className="relative overflow-hidden rounded-xl border border-violet-500/15 bg-zinc-900/50 p-6">
-          <div className="pointer-events-none absolute -right-20 -top-20 h-56 w-56 rounded-full bg-violet-600/10 blur-3xl" />
-
-          <div className="relative flex items-start gap-3">
-            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-violet-500/10 text-violet-300 ring-1 ring-violet-500/20">
-              <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
-                <path d="M4 2v20l2-1 2 1 2-1 2 1 2-1 2 1 2-1 2 1V2l-2 1-2-1-2 1-2-1-2 1-2-1-2 1Z" />
-                <path d="M8 7h8" />
-                <path d="M8 11h8" />
-                <path d="M8 15h5" />
-              </svg>
-            </span>
-            <div>
-              <h3 className="text-sm font-semibold text-zinc-100">
-                Datos de la Tirilla POS
-              </h3>
-              <p className="mt-1 max-w-md text-xs text-zinc-500">
-                NIT, dirección y teléfono que se imprimen en el recibo de venta.
-                Se guardan en tu empresa y siguen al negocio entre equipos.
-              </p>
-            </div>
-          </div>
-
-          <form
-            className="relative mt-6 space-y-4"
-            onSubmit={(e) => {
-              e.preventDefault();
-              void handleSaveTirilla();
-            }}
-          >
-            <div>
-              <label
-                htmlFor="tirilla-nit"
-                className="mb-1.5 block text-xs font-medium text-zinc-400"
-              >
-                NIT
-              </label>
-              <input
-                id="tirilla-nit"
-                type="text"
-                placeholder="900.123.456-7"
-                value={nit}
-                onChange={(e) => setNit(e.target.value)}
-                className="w-full rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2.5 text-sm text-zinc-100 placeholder:text-zinc-600 transition-colors focus:border-violet-500 focus:outline-none focus:ring-1 focus:ring-violet-500"
-              />
-            </div>
-            <div>
-              <label
-                htmlFor="tirilla-direccion"
-                className="mb-1.5 block text-xs font-medium text-zinc-400"
-              >
-                Dirección
-              </label>
-              <input
-                id="tirilla-direccion"
-                type="text"
-                placeholder="Cra 10 #20-30"
-                value={direccion}
-                onChange={(e) => setDireccion(e.target.value)}
-                className="w-full rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2.5 text-sm text-zinc-100 placeholder:text-zinc-600 transition-colors focus:border-violet-500 focus:outline-none focus:ring-1 focus:ring-violet-500"
-              />
-            </div>
-            <div>
-              <label
-                htmlFor="tirilla-telefono"
-                className="mb-1.5 block text-xs font-medium text-zinc-400"
-              >
-                Teléfono
-              </label>
-              <input
-                id="tirilla-telefono"
-                type="tel"
-                inputMode="tel"
-                placeholder="3001112233"
-                value={telefono}
-                onChange={(e) => setTelefono(e.target.value)}
-                className="w-full rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2.5 text-sm text-zinc-100 placeholder:text-zinc-600 transition-colors focus:border-violet-500 focus:outline-none focus:ring-1 focus:ring-violet-500"
-              />
-            </div>
-            <button
-              type="submit"
-              className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg border border-violet-500/30 bg-violet-600/15 px-4 py-2.5 text-sm font-medium text-violet-200 shadow-[0_0_20px_-8px_rgba(139,92,246,0.7)] transition-colors hover:bg-violet-600/25"
-            >
-              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
-                <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z" />
-                <path d="M17 21v-8H7v8" />
-                <path d="M7 3v5h8" />
-              </svg>
-              Guardar tirilla
-            </button>
-          </form>
-        </section>
-
-        {/* Dispositivos de la caja (POS) */}
+        {/* Dispositivos de la caja (POS) — incluye la sección nativa "Tirilla de
+            venta" (Impresora de Tickets) con NIT, dirección, teléfono, mensaje y
+            LOGO, persistidos por tenant en Supabase. */}
         <DevicesSection />
 
         {/* Reporte diario por WhatsApp */}
