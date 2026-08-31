@@ -90,7 +90,7 @@ export default function DevicesSection() {
   const { showToast } = useDashboard();
   const { settings, patch, hydrated } = useDeviceSettings();
   // Identidad del recibo: por tenant, en Supabase (sobrevive al logout).
-  const { tirilla, patch: patchTirilla } = useTirilla((msg) =>
+  const { tirilla, patch: patchTirilla, saveNow: saveTirillaNow } = useTirilla((msg) =>
     showToast("No se pudo guardar la tirilla", msg),
   );
   const [open, setOpen] = useState<DeviceKey | null>(null);
@@ -104,6 +104,7 @@ export default function DevicesSection() {
             onPatch={(c) => patch("printer", c)}
             tirilla={tirilla}
             onTirillaPatch={patchTirilla}
+            onTirillaSave={saveTirillaNow}
           />
         );
       case "scanner":

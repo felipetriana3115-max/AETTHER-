@@ -45,12 +45,21 @@ type Props = {
   /** Identidad del recibo (por tenant, en Supabase). */
   tirilla: TirillaConfig;
   onTirillaPatch: (changes: Partial<TirillaConfig>) => void;
+  /** Guardado explícito e inmediato en Supabase (RPC `actualizar_tirilla`). */
+  onTirillaSave: () => Promise<void>;
 };
 
-export default function PrinterConfig({ settings, onPatch, tirilla, onTirillaPatch }: Props) {
+export default function PrinterConfig({
+  settings,
+  onPatch,
+  tirilla,
+  onTirillaPatch,
+  onTirillaSave,
+}: Props) {
   const { businessName, showToast } = useDashboard();
   const logoInputRef = useRef<HTMLInputElement>(null);
   const [connecting, setConnecting] = useState(false);
+  const [savingTirilla, setSavingTirilla] = useState(false);
 
   // La tirilla combina el formato/hardware (settings) con la identidad (tirilla).
   const previewHtml = useMemo(
@@ -83,6 +92,25 @@ export default function PrinterConfig({ settings, onPatch, tirilla, onTirillaPat
       }
     } finally {
       setConnecting(false);
+    }
+  };
+
+  // Guardado explícito de la tirilla (NIT, dirección, teléfono, logo y mensaje)
+  // en Supabase. El auto-guardado con debounce sigue activo; este botón fuerza el
+  // guardado inmediato y confirma el éxito al usuario.
+  const handleSaveTirilla = async () => {
+    setSavingTirilla(true);
+    try {
+      await onTirillaSave();
+      showToast(
+        "Tirilla guardada",
+        "Los datos de la tirilla se guardaron con éxito en Supabase.",
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "No se pudo guardar la tirilla.";
+      showToast("No se pudo guardar", msg);
+    } finally {
+      setSavingTirilla(false);
     }
   };
 
@@ -266,6 +294,21 @@ export default function PrinterConfig({ settings, onPatch, tirilla, onTirillaPat
           placeholder="¡Gracias por tu compra!"
           hint="Aparece al pie de cada tirilla."
         />
+
+        {/* Guardado explícito en Supabase (además del auto-guardado con debounce). */}
+        <div className="flex flex-wrap items-center justify-end gap-3">
+          <p className="mr-auto text-[11px] text-zinc-600">
+            Los cambios se guardan solos, pero puedes forzar el guardado aquí.
+          </p>
+          <PrimaryButton onClick={handleSaveTirilla} disabled={savingTirilla}>
+            <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+              <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2Z" />
+              <path d="M17 21v-8H7v8" />
+              <path d="M7 3v5h8" />
+            </svg>
+            {savingTirilla ? "Guardando…" : "Guardar Tirilla"}
+          </PrimaryButton>
+        </div>
       </div>
 
       {/* ── Vista previa + prueba ───────────────────────────────────── */}

@@ -128,11 +128,18 @@ export function useTirilla(onError?: (message: string) => void) {
   // Guardado con debounce: el último estado pendiente + su temporizador.
   const pending = useRef<TirillaConfig | null>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Espejo del estado vivo para que `saveNow` guarde lo último sin re-crearse.
+  const latest = useRef<TirillaConfig>(DEFAULT_TIRILLA);
   // Mantiene el último `onError` sin re-crear `flush` (que no depende de él).
   const onErrorRef = useRef(onError);
   useEffect(() => {
     onErrorRef.current = onError;
   }, [onError]);
+
+  // Mantiene `latest` sincronizado con el estado visible en pantalla.
+  useEffect(() => {
+    latest.current = tirilla;
+  }, [tirilla]);
 
   useEffect(() => {
     let alive = true;
@@ -174,9 +181,22 @@ export function useTirilla(onError?: (message: string) => void) {
     [flush],
   );
 
+  // Guardado EXPLÍCITO e inmediato: cancela el debounce pendiente y persiste el
+  // último estado en Supabase (vía `saveTirilla` → RPC `actualizar_tirilla`).
+  // Devuelve la promesa para que la UI pueda confirmar el éxito o mostrar el error.
+  const saveNow = useCallback(async () => {
+    if (timer.current) {
+      clearTimeout(timer.current);
+      timer.current = null;
+    }
+    const cfg = pending.current ?? latest.current;
+    pending.current = null;
+    await saveTirilla(cfg);
+  }, []);
+
   // Al desmontar, guarda cualquier cambio pendiente (p. ej. si el usuario navega
   // fuera antes de que venza el debounce) para no perder lo último tecleado.
   useEffect(() => () => flush(), [flush]);
 
-  return { tirilla, patch, hydrated };
+  return { tirilla, patch, saveNow, hydrated };
 }
