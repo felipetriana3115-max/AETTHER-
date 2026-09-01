@@ -20,7 +20,8 @@ import { useOffline } from "../../lib/offline/useOffline";
  * Punto de Venta (POS) táctil — pensado para retail rápido (superior a Eleventa).
  *
  * Fuente de verdad: tabla `public.productos` en Supabase.
- * Columnas reales: id · descripcion · precio_venta · codigo_barras · stock_actual.
+ * Columnas reales: id · descripcion · precio_venta · codigo_barras · stock_actual
+ * · imagen_url (opcional; sin ella la tarjeta pinta las iniciales).
  * Las leemos con alias PostgREST (`nombre:descripcion`, `precio:precio_venta`)
  * para conservar las claves `nombre`/`precio` que usa el carrito sin renombrar
  * todo el componente.
@@ -44,6 +45,12 @@ type Producto = {
   precio: number;
   codigo_barras: string | null;
   stock_actual: number;
+  /**
+   * Foto opcional del producto (URL pública del bucket `productos` de Storage).
+   * null/ausente → la tarjeta pinta el placeholder de iniciales. Los "artículos
+   * comunes" nunca la traen.
+   */
+  imagen_url?: string | null;
 };
 
 // Una línea puede ser un producto real del inventario o un "artículo común":
@@ -91,6 +98,31 @@ function Placeholder({ nombre }: { nombre: string }) {
     <div className="flex h-14 w-full items-center justify-center rounded-lg bg-gradient-to-br from-violet-600/30 to-fuchsia-600/30 text-lg font-bold text-violet-200">
       {iniciales || "?"}
     </div>
+  );
+}
+
+/**
+ * Miniatura de la tarjeta: la foto del producto si tiene una, y si no (o si la
+ * URL falla al cargar) exactamente el mismo placeholder de iniciales de antes.
+ * Así la imagen es 100% opcional y un enlace roto nunca deja un hueco en el grid.
+ */
+function Miniatura({ nombre, imagenUrl }: { nombre: string; imagenUrl?: string | null }) {
+  const [fallo, setFallo] = useState(false);
+  const url = imagenUrl?.trim();
+
+  if (!url || fallo) return <Placeholder nombre={nombre} />;
+
+  return (
+    // eslint-disable-next-line @next/next/no-img-element -- URL remota de Storage:
+    // miniatura pequeña que no necesita el optimizador de next/image (y evita
+    // configurar remotePatterns por proyecto de Supabase).
+    <img
+      src={url}
+      alt={nombre}
+      loading="lazy"
+      onError={() => setFallo(true)}
+      className="h-14 w-full rounded-lg bg-zinc-900 object-cover"
+    />
   );
 }
 
@@ -680,7 +712,7 @@ export default function PosPage() {
                           : "border-zinc-800 bg-zinc-950 hover:border-violet-500/50 hover:bg-zinc-900 active:scale-95"
                       }`}
                     >
-                      <Placeholder nombre={p.nombre} />
+                      <Miniatura nombre={p.nombre} imagenUrl={p.imagen_url} />
                       <span className="line-clamp-2 min-h-[2.5rem] text-sm font-medium text-zinc-100">
                         {p.nombre}
                       </span>

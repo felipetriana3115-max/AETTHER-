@@ -19,9 +19,14 @@ export function isOnline(): boolean {
   return navigator.onLine;
 }
 
-/** Columnas reales de `public.productos` con los alias que usa el POS. */
+/**
+ * Columnas reales de `public.productos` con los alias que usa el POS.
+ *
+ * `imagen_url` requiere la migración `2026-08-imagen-productos.sql`; sin ella
+ * PostgREST responde 42703 y el catálogo no cargaría.
+ */
 const SELECT_PRODUCTO =
-  "id, nombre:descripcion, precio:precio_venta, codigo_barras, stock_actual";
+  "id, nombre:descripcion, precio:precio_venta, codigo_barras, stock_actual, imagen_url";
 
 /** Normaliza una fila de PostgREST (numeric puede llegar como string). */
 function normalizar(row: Record<string, unknown>): ProductoLocal {
@@ -31,6 +36,8 @@ function normalizar(row: Record<string, unknown>): ProductoLocal {
     precio: Number(row.precio ?? 0),
     codigo_barras: (row.codigo_barras as string | null) ?? null,
     stock_actual: Number(row.stock_actual ?? 0),
+    // Cadena vacía → null: para la UI "sin imagen" es un solo caso.
+    imagen_url: (row.imagen_url as string | null) || null,
   };
 }
 

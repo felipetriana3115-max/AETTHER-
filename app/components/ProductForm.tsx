@@ -1,7 +1,8 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { supabase, getEmpresaIdActiva } from "../lib/auth";
+import { ACCEPT_IMAGEN, subirImagenProducto, validarImagen } from "../lib/productos";
 
 /**
  * Alta/edición de productos (inspirado en Eleventa).
@@ -40,6 +41,13 @@ export type Producto = {
   stock_maximo: number | null;
   /** Fecha de caducidad (ISO `YYYY-MM-DD`) para insumos perecederos; null si no aplica. */
   fecha_vencimiento: string | null;
+  /**
+   * URL pública de la foto del producto en el bucket `productos` de Storage.
+   * Opcional: `null`/ausente = sin imagen y el POS pinta el placeholder de
+   * iniciales. Es `?` porque las lecturas antiguas (o previas a la migración
+   * `2026-08-imagen-productos.sql`) no traen la columna.
+   */
+  imagen_url?: string | null;
 };
 
 type Departamento = { id: number; nombre: string };
@@ -115,13 +123,34 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
   const [ventaManual, setVentaManual] = useState<boolean>(editando);
   const [guardando, setGuardando] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Imagen opcional. `imagenFile` es la selección nueva (aún sin subir);
+  // `imagenUrl` la que ya tiene la fila (null = sin imagen / se quitó).
+  const [imagenFile, setImagenFile] = useState<File | null>(null);
+  const [imagenUrl, setImagenUrl] = useState<string | null>(producto?.imagen_url ?? null);
+  const [previewLocal, setPreviewLocal] = useState<string | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
 
   // Si cambia el producto (p. ej. el padre reusa el form para editar otro),
   // resincronizamos el estado con esa fila.
   useEffect(() => {
     setForm(toFormState(producto));
     setVentaManual(producto != null);
+    setImagenFile(null);
+    setImagenUrl(producto?.imagen_url ?? null);
+    if (fileRef.current) fileRef.current.value = "";
   }, [producto]);
+
+  // Previsualización del archivo recién elegido (sin subirlo). El object URL se
+  // libera al cambiar de archivo o al desmontar para no filtrar memoria.
+  useEffect(() => {
+    if (!imagenFile) {
+      setPreviewLocal(null);
+      return;
+    }
+    const url = URL.createObjectURL(imagenFile);
+    setPreviewLocal(url);
+    return () => URL.revokeObjectURL(url);
+  }, [imagenFile]);
 
   // Carga de departamentos para el selector. RLS ya los aísla por empresa.
   useEffect(() => {
@@ -167,6 +196,32 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
     [],
   );
 
+  // Selección de imagen: validamos tipo/tamaño en el navegador antes de gastar
+  // red (Storage impone los mismos límites en servidor).
+  const seleccionarImagen = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0] ?? null;
+    if (!file) {
+      setImagenFile(null);
+      return;
+    }
+    const invalido = validarImagen(file);
+    if (invalido) {
+      setError(invalido);
+      setImagenFile(null);
+      e.target.value = "";
+      return;
+    }
+    setError(null);
+    setImagenFile(file);
+  }, []);
+
+  /** Deja el producto sin imagen (descarta la selección y la URL guardada). */
+  const quitarImagen = useCallback(() => {
+    setImagenFile(null);
+    setImagenUrl(null);
+    if (fileRef.current) fileRef.current.value = "";
+  }, []);
+
   const guardar = useCallback(
     async (e: React.FormEvent) => {
       e.preventDefault();
@@ -203,17 +258,31 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
 
       setGuardando(true);
       try {
+        // Imagen opcional: si hay archivo nuevo lo subimos ahora y usamos su URL
+        // pública; si no, conservamos la que ya tenía la fila (o null si nunca
+        // tuvo imagen o el usuario la quitó).
+        let urlImagen = imagenUrl;
+        if (imagenFile) {
+          try {
+            urlImagen = await subirImagenProducto(imagenFile);
+          } catch (err) {
+            setError(err instanceof Error ? err.message : "No se pudo subir la imagen.");
+            return;
+          }
+        }
+        const conImagen = { ...base, imagen_url: urlImagen };
+
         let query;
         if (editando) {
           // Edición: RLS acota por `id` a la empresa del usuario; no reescribimos
           // `empresa_id` (no debe cambiar de dueño).
-          query = supabase.from("productos").update(base).eq("id", producto!.id);
+          query = supabase.from("productos").update(conImagen).eq("id", producto!.id);
         } else {
           // Alta: adjuntamos `empresa_id` EXPLÍCITO en vez de confiar en el DEFAULT
           // del servidor. Si no hay empresa resoluble, no tiene sentido intentar el
           // INSERT: el `with check` lo rechazaría con un RLS opaco.
           const empresaId = await getEmpresaIdActiva();
-          const payload = { ...base, empresa_id: empresaId };
+          const payload = { ...conImagen, empresa_id: empresaId };
 
           // Diagnóstico: así se ve exactamente qué viaja al servidor. Si
           // `empresa_id` sale `null`, el problema es el dato del usuario
@@ -247,12 +316,22 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
         }
 
         onSaved?.(data as Producto);
-        if (!editando) setForm(toFormState()); // limpia para cargar el siguiente
+        if (!editando) {
+          setForm(toFormState()); // limpia para cargar el siguiente
+          setImagenFile(null);
+          setImagenUrl(null);
+          if (fileRef.current) fileRef.current.value = "";
+        } else {
+          // Tras editar, la URL subida pasa a ser la "actual" de la fila.
+          setImagenFile(null);
+          setImagenUrl(urlImagen);
+          if (fileRef.current) fileRef.current.value = "";
+        }
       } finally {
         setGuardando(false);
       }
     },
-    [form, editando, producto, onSaved],
+    [form, editando, producto, onSaved, imagenFile, imagenUrl],
   );
 
   return (
@@ -460,6 +539,52 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
         <p className="mt-1 text-xs text-zinc-500">
           Opcional. Solo para insumos perecederos; dispara la alerta de vencimiento.
         </p>
+      </div>
+
+      {/* Imagen del producto (opcional). Si no se elige nada, el POS pinta el
+          placeholder de iniciales. */}
+      <div>
+        <label htmlFor="pf-imagen" className={LABEL}>
+          Imagen del producto
+        </label>
+        <div className="flex items-start gap-3">
+          {/* Previsualización: el archivo recién elegido o la imagen ya guardada. */}
+          {previewLocal || imagenUrl ? (
+            // eslint-disable-next-line @next/next/no-img-element -- URL remota de
+            // Storage / blob local: no pasa por el optimizador de next/image.
+            <img
+              src={previewLocal ?? imagenUrl ?? ""}
+              alt="Previsualización del producto"
+              className="h-20 w-20 shrink-0 rounded-lg border border-zinc-800 object-cover"
+            />
+          ) : (
+            <div className="flex h-20 w-20 shrink-0 items-center justify-center rounded-lg border border-dashed border-zinc-800 bg-zinc-950 text-2xl text-zinc-600">
+              🖼️
+            </div>
+          )}
+          <div className="min-w-0 flex-1">
+            <input
+              id="pf-imagen"
+              ref={fileRef}
+              type="file"
+              accept={ACCEPT_IMAGEN}
+              onChange={seleccionarImagen}
+              className="w-full cursor-pointer rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-400 file:mr-3 file:cursor-pointer file:rounded-md file:border-0 file:bg-violet-500/15 file:px-3 file:py-1.5 file:text-xs file:font-medium file:text-violet-300 hover:file:bg-violet-500/25"
+            />
+            <p className="mt-1 text-xs text-zinc-500">
+              Opcional. PNG o JPG, máximo 2 MB. Sin imagen se muestran las iniciales.
+            </p>
+            {(previewLocal || imagenUrl) && (
+              <button
+                type="button"
+                onClick={quitarImagen}
+                className="mt-1.5 text-xs text-zinc-400 hover:text-red-300"
+              >
+                Quitar imagen
+              </button>
+            )}
+          </div>
+        </div>
       </div>
 
       {/* Acciones */}

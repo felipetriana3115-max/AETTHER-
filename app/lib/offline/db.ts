@@ -36,6 +36,12 @@ export type ProductoLocal = {
   precio: number;
   codigo_barras: string | null;
   stock_actual: number;
+  /**
+   * URL pública de la foto del producto (bucket `productos` de Storage), o null
+   * si no tiene: el POS cae al placeholder de iniciales. No está indexada, así
+   * que no requiere subir la versión del esquema de Dexie.
+   */
+  imagen_url?: string | null;
 };
 
 /** Estado de una venta en la cola de salida. */
