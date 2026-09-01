@@ -1,7 +1,7 @@
 "use client";
 
 import { formatCOP } from "./data-model";
-import type { PrinterSettings } from "./devices";
+import { drawerKickString, kickDrawerViaUsb, type PrinterSettings } from "./devices";
 import type { TirillaConfig } from "./tirilla";
 
 /**
@@ -23,6 +23,28 @@ export type ReceiptPrinter = PrinterSettings & TirillaConfig;
 
 export type ReceiptItem = { nombre: string; qty: number; precio: number };
 export type ReceiptPayment = { metodo: string; monto: number };
+
+/**
+ * Opciones de la impresión. `drawerPin` (0 → pin 2, 1 → pin 5) pide que el
+ * documento lleve incrustado el pulso ESC/POS que abre el cajón monedero;
+ * `null`/ausente imprime la tirilla sin tocar el cajón.
+ */
+export type PrintOptions = { drawerPin?: 0 | 1 | null };
+
+/** Id del nodo donde se inyecta la secuencia ESC/POS del cajón. */
+const KICK_ID = "esc-pos-drawer-kick";
+
+/**
+ * El pulso NO puede viajar en el string HTML: el parser del navegador convierte
+ * el byte NUL (`m = 0`) en U+FFFD y rompería la secuencia. Por eso el HTML solo
+ * lleva un nodo marcador vacío y aquí escribimos los caracteres por DOM, que sí
+ * los admite tal cual.
+ */
+function injectDrawerKick(doc: Document | undefined, pin: 0 | 1 | null | undefined): void {
+  if (!doc || pin == null) return;
+  const slot = doc.getElementById(KICK_ID);
+  if (slot) slot.textContent = drawerKickString(pin);
+}
 
 export type ReceiptData = {
   businessName: string;
@@ -48,7 +70,11 @@ function esc(value: string): string {
  * Construye el HTML completo de la tirilla. `columns` marca el ancho útil en
  * caracteres para alinear las columnas con fuente monoespaciada.
  */
-export function buildReceiptHtml(data: ReceiptData, printer: ReceiptPrinter): string {
+export function buildReceiptHtml(
+  data: ReceiptData,
+  printer: ReceiptPrinter,
+  opts: PrintOptions = {},
+): string {
   const { columns, paperWidth, fontFamily, fontSize } = printer;
   // Ancho físico útil aproximado del rollo (se descuentan los márgenes).
   const bodyWidth = paperWidth === "58mm" ? "48mm" : "72mm";
@@ -90,6 +116,11 @@ export function buildReceiptHtml(data: ReceiptData, printer: ReceiptPrinter): st
     ? `<div class="line center strong">${esc(printer.mensajeAgradecimiento)}</div>`
     : "";
 
+  // Cabecera del documento: nodo (vacío aquí) que `printReceipt` rellena con
+  // `ESC p m 25 250`. Va antes que nada para que el cajón salte al empezar a
+  // imprimir, no al terminar.
+  const kickHtml = opts.drawerPin == null ? "" : `<span id="${KICK_ID}" class="kick"></span>`;
+
   return `<!doctype html>
 <html lang="es">
 <head>
@@ -116,9 +147,13 @@ export function buildReceiptHtml(data: ReceiptData, printer: ReceiptPrinter): st
   .logo { text-align: center; margin-bottom: 4px; }
   .logo img { max-width: 60%; max-height: 90px; object-fit: contain; }
   .sep { margin: 4px 0; }
+  /* Pulso del cajón: debe existir en el flujo (un display:none lo borraría del
+     trabajo de impresión), pero no debe verse ni ocupar papel. */
+  .kick { font-size: 1px; line-height: 0; color: #fff; white-space: pre; }
 </style>
 </head>
 <body>
+  ${kickHtml}
   ${logoHtml}
   <div class="name">${esc(data.businessName)}</div>
   ${nitHtml}
@@ -144,10 +179,22 @@ export function buildReceiptHtml(data: ReceiptData, printer: ReceiptPrinter): st
  * Imprime la tirilla usando un iframe oculto y el diálogo del navegador. Espera
  * a que el logo cargue antes de invocar `print()` para no imprimirlo en blanco.
  */
-export function printReceipt(data: ReceiptData, printer: ReceiptPrinter): void {
+export function printReceipt(
+  data: ReceiptData,
+  printer: ReceiptPrinter,
+  opts: PrintOptions = {},
+): void {
   if (typeof window === "undefined") return;
 
-  const html = buildReceiptHtml(data, printer);
+  // Vía fiable para el cajón cuando la impresora está emparejada por WebUSB: los
+  // bytes crudos van al firmware en paralelo al trabajo de impresión. Si no está
+  // disponible, el pulso incrustado en el documento (`injectDrawerKick`) queda
+  // como respaldo, así que no esperamos a esta promesa.
+  if (opts.drawerPin != null) {
+    void kickDrawerViaUsb(opts.drawerPin);
+  }
+
+  const html = buildReceiptHtml(data, printer, opts);
   const iframe = document.createElement("iframe");
   iframe.setAttribute("aria-hidden", "true");
   iframe.style.position = "fixed";
@@ -176,6 +223,7 @@ export function printReceipt(data: ReceiptData, printer: ReceiptPrinter): void {
 
   iframe.onload = () => {
     const doc = iframe.contentWindow?.document;
+    injectDrawerKick(doc, opts.drawerPin);
     const img = doc?.querySelector("img");
     // Si hay logo y aún no cargó, esperamos su onload/onerror; si no, imprimimos ya.
     if (img && !img.complete) {
@@ -187,4 +235,56 @@ export function printReceipt(data: ReceiptData, printer: ReceiptPrinter): void {
   };
 
   iframe.srcdoc = html;
+}
+
+/** Cómo se logró (o no) abrir el cajón; el POS lo traduce a un mensaje. */
+export type DrawerResult = "usb" | "print" | "unsupported";
+
+/**
+ * Abre el cajón monedero SIN imprimir una tirilla (botón "Abrir Cajón" del POS).
+ *
+ * 1. Intenta el pulso crudo por WebUSB (fiable, sin diálogo de impresión).
+ * 2. Si no hay impresora emparejada, lanza un trabajo de impresión mínimo que
+ *    solo contiene la secuencia `ESC p m 25 250`. El papel que sale es un
+ *    milímetro en blanco; requiere driver de paso directo.
+ */
+export async function openCashDrawer(pin: 0 | 1 = 0): Promise<DrawerResult> {
+  if (typeof window === "undefined") return "unsupported";
+
+  if (await kickDrawerViaUsb(pin)) return "usb";
+
+  const iframe = document.createElement("iframe");
+  iframe.setAttribute("aria-hidden", "true");
+  iframe.style.position = "fixed";
+  iframe.style.right = "0";
+  iframe.style.bottom = "0";
+  iframe.style.width = "0";
+  iframe.style.height = "0";
+  iframe.style.border = "0";
+  document.body.appendChild(iframe);
+
+  iframe.onload = () => {
+    const win = iframe.contentWindow;
+    if (win) {
+      injectDrawerKick(win.document, pin);
+      win.focus();
+      win.print();
+    }
+    window.setTimeout(() => iframe.remove(), 1000);
+  };
+
+  iframe.srcdoc = `<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<style>
+  @page { size: 80mm auto; margin: 0; }
+  html, body { margin: 0; padding: 0; background: #fff; }
+  .kick { font-size: 1px; line-height: 0; color: #fff; white-space: pre; }
+</style>
+</head>
+<body><span id="${KICK_ID}" class="kick"></span></body>
+</html>`;
+
+  return "print";
 }

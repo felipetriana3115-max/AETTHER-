@@ -189,8 +189,32 @@ export function useDeviceSettings() {
 
 // ── Helpers de hardware (Web APIs, con detección de soporte) ─────────────────
 
+/**
+ * Tipos estructurales mínimos de WebUSB (no hay `@types/w3c-web-usb` en el
+ * proyecto). Solo declaramos lo que usamos: emparejar la impresora y escribir
+ * bytes crudos en su endpoint bulk OUT para el pulso del cajón.
+ */
+type UsbEndpoint = { endpointNumber: number; direction: "in" | "out"; type: string };
+type UsbAlternate = { interfaceClass: number; endpoints: UsbEndpoint[] };
+type UsbInterface = { interfaceNumber: number; alternate: UsbAlternate };
+type UsbConfiguration = { configurationValue: number; interfaces: UsbInterface[] };
+type UsbDevice = {
+  productName?: string;
+  manufacturerName?: string;
+  opened: boolean;
+  configuration: UsbConfiguration | null;
+  configurations: UsbConfiguration[];
+  open: () => Promise<void>;
+  selectConfiguration: (value: number) => Promise<void>;
+  claimInterface: (n: number) => Promise<void>;
+  releaseInterface: (n: number) => Promise<void>;
+  transferOut: (endpointNumber: number, data: ArrayBufferView) => Promise<{ status: string }>;
+};
 type UsbNavigator = Navigator & {
-  usb?: { requestDevice: (opts: { filters: unknown[] }) => Promise<{ productName?: string; manufacturerName?: string }> };
+  usb?: {
+    requestDevice: (opts: { filters: unknown[] }) => Promise<UsbDevice>;
+    getDevices?: () => Promise<UsbDevice[]>;
+  };
 };
 type SerialNavigator = Navigator & {
   serial?: { requestPort: () => Promise<unknown> };
@@ -233,4 +257,83 @@ export async function requestSerialPort(): Promise<void> {
  */
 export function drawerKickBytes(pin: 0 | 1): Uint8Array {
   return new Uint8Array([0x1b, 0x70, pin, 0x19, 0xfa]);
+}
+
+/**
+ * El mismo pulso como cadena de caracteres, para colarlo dentro de un trabajo de
+ * impresión del navegador (`String.fromCharCode(27, 112, pin, 25, 250)`).
+ *
+ * OJO: este camino solo dispara el cajón si la impresora está instalada en el
+ * sistema con un driver de paso directo ("Generic / Text Only"): entonces los
+ * caracteres llegan tal cual al firmware y este los interpreta como ESC/POS. Con
+ * el driver gráfico de la POS-80C el documento se rasteriza y la secuencia se
+ * pierde; para ese caso está `kickDrawerViaUsb`, que escribe los bytes crudos.
+ */
+export function drawerKickString(pin: 0 | 1): string {
+  return String.fromCharCode(0x1b, 0x70, pin, 0x19, 0xfa);
+}
+
+/** Clase USB "Printer" (bInterfaceClass = 7). */
+const USB_PRINTER_CLASS = 0x07;
+
+/** Busca en el dispositivo la interfaz de impresora y su endpoint bulk OUT. */
+function findPrinterEndpoint(device: UsbDevice) {
+  for (const cfg of device.configurations ?? []) {
+    for (const itf of cfg.interfaces ?? []) {
+      if (itf.alternate?.interfaceClass !== USB_PRINTER_CLASS) continue;
+      const out = itf.alternate.endpoints?.find((e) => e.direction === "out" && e.type === "bulk");
+      if (out) {
+        return {
+          configurationValue: cfg.configurationValue,
+          interfaceNumber: itf.interfaceNumber,
+          endpointNumber: out.endpointNumber,
+        };
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Envía el pulso ESC/POS por WebUSB a una impresora YA emparejada (la que se
+ * autorizó en Configuración → Dispositivos → Impresora). Es la vía fiable: los
+ * bytes llegan al firmware sin pasar por el driver del sistema.
+ *
+ * Devuelve `true` si el pulso salió; `false` si no hay WebUSB, no hay impresora
+ * emparejada o el navegador no pudo reclamar la interfaz (p. ej. Windows tiene
+ * el dispositivo tomado por su propio driver) — en ese caso el llamador cae al
+ * camino de impresión.
+ */
+export async function kickDrawerViaUsb(pin: 0 | 1): Promise<boolean> {
+  const nav = typeof navigator !== "undefined" ? (navigator as UsbNavigator) : null;
+  if (!nav?.usb?.getDevices) return false;
+
+  let devices: UsbDevice[];
+  try {
+    devices = await nav.usb.getDevices();
+  } catch {
+    return false;
+  }
+
+  for (const device of devices) {
+    const target = findPrinterEndpoint(device);
+    if (!target) continue;
+    try {
+      if (!device.opened) await device.open();
+      if (device.configuration?.configurationValue !== target.configurationValue) {
+        await device.selectConfiguration(target.configurationValue);
+      }
+      await device.claimInterface(target.interfaceNumber);
+      try {
+        await device.transferOut(target.endpointNumber, drawerKickBytes(pin));
+      } finally {
+        // Liberamos la interfaz para no bloquear la impresión normal del sistema.
+        await device.releaseInterface(target.interfaceNumber).catch(() => {});
+      }
+      return true;
+    } catch (e) {
+      console.warn("[cajón] No se pudo enviar el pulso por WebUSB:", e);
+    }
+  }
+  return false;
 }

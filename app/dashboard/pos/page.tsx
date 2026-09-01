@@ -9,9 +9,9 @@ import BarcodeScanner, { type BarcodeScannerHandle } from "../../components/Barc
 import { formatCOP } from "../../lib/data-model";
 import { fetchClientes, type Cliente } from "../../lib/clientes";
 import { fetchVentasHoyPorMetodo, type VentasHoyPorMetodo } from "../../lib/corte";
-import { loadDeviceSettings } from "../../lib/devices";
+import { loadDeviceSettings, type DrawerSettings } from "../../lib/devices";
 import { fetchTirilla, DEFAULT_TIRILLA, type TirillaConfig } from "../../lib/tirilla";
-import { printReceipt, type ReceiptData } from "../../lib/receipt";
+import { openCashDrawer, printReceipt, type ReceiptData } from "../../lib/receipt";
 import { cacheCatalogo, descontarStockLocal, getFrecuentes } from "../../lib/offline/catalog";
 import { enqueueVenta } from "../../lib/offline/outbox";
 import { useOffline } from "../../lib/offline/useOffline";
@@ -87,6 +87,20 @@ const METODOS: { id: MetodoPago; label: string; sub: string; classes: string }[]
   },
 ];
 
+/**
+ * Pin del pulso ESC/POS que debe incrustarse en la tirilla para abrir el cajón
+ * en esta venta, o `null` si no debe abrirse. Depende SOLO de la configuración
+ * local del equipo (`localStorage`), nunca del tenant.
+ *
+ * "Fiado" queda fuera aunque esté activo "cualquier método": no entra dinero a
+ * la caja, así que no hay motivo para destrabar el cajón.
+ */
+function pinCajonPara(metodo: MetodoPago, drawer: DrawerSettings): 0 | 1 | null {
+  if (!drawer.enabled || drawer.trigger !== "printer" || metodo === "Fiado") return null;
+  if (drawer.autoOpenAllMethods) return drawer.pin;
+  return drawer.autoOpenOnCash && metodo === "Efectivo" ? drawer.pin : null;
+}
+
 // Placeholder de imagen: iniciales del producto sobre un degradado.
 function Placeholder({ nombre }: { nombre: string }) {
   const iniciales = nombre
@@ -132,6 +146,8 @@ export default function PosPage() {
   const [carrito, setCarrito] = useState<LineaCarrito[]>([]);
   const [feedback, setFeedback] = useState<Feedback>(null);
   const [cobrando, setCobrando] = useState(false);
+  // Pulso del cajón en vuelo (el intento por WebUSB es asíncrono).
+  const [abriendoCajon, setAbriendoCajon] = useState(false);
   // Línea seleccionada del carrito (para la tecla Delete). Guarda su `id`.
   const [seleccionado, setSeleccionado] = useState<string | number | null>(null);
   // Modal "Artículo común": abierto + campos del formulario.
@@ -471,8 +487,14 @@ export default function PosPage() {
         setUltimaVenta(recibo);
 
         const devices = loadDeviceSettings();
+        // El cajón se abre con el mismo trabajo de impresión de la tirilla: el
+        // pulso ESC/POS viaja en su cabecera. Si no hay impresión automática, lo
+        // emitimos por separado para que el cajero no se quede sin cajón.
+        const drawerPin = pinCajonPara(metodo, devices.drawer);
         if (devices.printer.enabled && devices.printer.autoPrint) {
-          printReceipt(recibo, { ...devices.printer, ...tirillaRef.current });
+          printReceipt(recibo, { ...devices.printer, ...tirillaRef.current }, { drawerPin });
+        } else if (drawerPin != null) {
+          void openCashDrawer(drawerPin);
         }
 
         const okMsg = esFiado
@@ -607,8 +629,31 @@ export default function PosPage() {
   const reimprimir = useCallback(() => {
     if (!ultimaVenta) return;
     const devices = loadDeviceSettings();
+    // Sin `drawerPin`: una copia de la tirilla no debe volver a abrir el cajón.
     printReceipt(ultimaVenta, { ...devices.printer, ...tirillaRef.current });
   }, [ultimaVenta]);
+
+  /**
+   * Abre el cajón sin cobrar (dar cambio, retirar efectivo…). Usa el pin
+   * configurado en Dispositivos y no toca el carrito ni la venta.
+   */
+  const abrirCajon = useCallback(async () => {
+    setAbriendoCajon(true);
+    try {
+      const { drawer } = loadDeviceSettings();
+      const via = await openCashDrawer(drawer.pin);
+      setFeedback(
+        via === "usb"
+          ? { tone: "ok", msg: "Pulso enviado al cajón." }
+          : via === "print"
+            ? { tone: "ok", msg: "Pulso del cajón enviado a la impresora." }
+            : { tone: "error", msg: "Este navegador no puede accionar el cajón." },
+      );
+    } finally {
+      setAbriendoCajon(false);
+      inputRef.current?.focus();
+    }
+  }, []);
 
   // ── Render ───────────────────────────────────────────────────────────────────
 
@@ -937,6 +982,24 @@ export default function PosPage() {
                 Reimprimir tirilla ({formatCOP(ultimaVenta.total)})
               </button>
             )}
+
+            {/* Apertura manual del cajón (dar cambio, retiros): emite el pulso
+                ESC/POS sin registrar ninguna venta. */}
+            <button
+              type="button"
+              onClick={abrirCajon}
+              disabled={abriendoCajon}
+              title="Envía el pulso ESC/POS al cajón monedero sin cobrar"
+              className="mt-2.5 inline-flex w-full items-center justify-center gap-2 rounded-lg border border-zinc-700 py-2.5 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                <rect x="2" y="7" width="20" height="12" rx="2" />
+                <path d="M2 11h20" />
+                <path d="M10 15h4" />
+                <path d="M7 7V5a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v2" />
+              </svg>
+              {abriendoCajon ? "Abriendo…" : "Abrir Cajón"}
+            </button>
           </div>
         </section>
       </div>
