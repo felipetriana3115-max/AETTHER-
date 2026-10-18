@@ -1,7 +1,9 @@
 "use client";
 
+import { useState } from "react";
 import { useDashboard } from "../DashboardProvider";
-import type { DrawerSettings, DrawerTrigger } from "../../lib/devices";
+import { loadDeviceSettings, type DrawerSettings, type DrawerTrigger } from "../../lib/devices";
+import { openCashDrawer } from "../../lib/receipt";
 import { SecondaryButton, SelectField, ToggleRow } from "./primitives";
 
 type Props = {
@@ -11,17 +13,35 @@ type Props = {
 
 export default function CashDrawerConfig({ settings, onPatch }: Props) {
   const { showToast } = useDashboard();
+  const [probando, setProbando] = useState(false);
 
-  // El cajón se abre con un pulso ESC/POS que envía la impresora. Sin una
-  // impresora USB conectada por WebUSB no podemos emitirlo desde el navegador,
-  // así que la "prueba" solo confirma la configuración.
-  const handleTest = () => {
-    showToast(
-      "Apertura de prueba",
-      settings.trigger === "printer"
-        ? `Se enviará el pulso ESC/POS (pin ${settings.pin}) por la impresora al cobrar.`
-        : "El cajón está en modo manual: ábrelo con la llave física.",
-    );
+  // Apertura REAL de prueba: manda el pulso `ESC p m 50 250` por el mismo canal
+  // que usará el POS (USB directo, puente local o impresora del sistema), para
+  // que el cajero compruebe el cajón sin tener que cobrar una venta.
+  const handleTest = async () => {
+    if (settings.trigger !== "printer") {
+      showToast("Cajón manual", "El cajón está en modo manual: ábrelo con la llave física.");
+      return;
+    }
+    setProbando(true);
+    try {
+      const { printer } = loadDeviceSettings();
+      const result = await openCashDrawer(settings.pin, printer);
+      if (result.ok) {
+        showToast(
+          "Pulso enviado",
+          result.via === "usb"
+            ? `Pulso ESC/POS (pin ${settings.pin}) enviado por USB directo.`
+            : result.via === "bridge"
+              ? `Pulso ESC/POS (pin ${settings.pin}) enviado al puente local.`
+              : `Pulso ESC/POS (pin ${settings.pin}) enviado a la impresora del sistema.`,
+        );
+      } else {
+        showToast("El cajón no respondió", result.message);
+      }
+    } finally {
+      setProbando(false);
+    }
   };
 
   return (
@@ -74,8 +94,13 @@ export default function CashDrawerConfig({ settings, onPatch }: Props) {
         />
       </div>
 
-      <div className="flex justify-end">
-        <SecondaryButton onClick={handleTest}>Probar apertura</SecondaryButton>
+      <div className="flex items-center justify-end gap-3">
+        <p className="mr-auto text-[11px] text-zinc-600">
+          La prueba envía el pulso por el método configurado en Impresora.
+        </p>
+        <SecondaryButton onClick={handleTest} disabled={probando}>
+          {probando ? "Enviando pulso…" : "Probar apertura"}
+        </SecondaryButton>
       </div>
     </div>
   );

@@ -1,7 +1,16 @@
 "use client";
 
 import { formatCOP } from "./data-model";
-import { drawerKickString, kickDrawerViaUsb, type PrinterSettings } from "./devices";
+import {
+  UsbPrinterError,
+  drawerKickString,
+  kickDrawerViaUsb,
+  writeToUsbPrinter,
+  type EscPosBytes,
+  type PrinterConnection,
+  type PrinterSettings,
+} from "./devices";
+import { buildDrawerKickJob, buildReceiptEscPos, twoColumns } from "./escpos";
 import type { TirillaConfig } from "./tirilla";
 
 /**
@@ -12,27 +21,62 @@ import type { TirillaConfig } from "./tirilla";
 export type ReceiptPrinter = PrinterSettings & TirillaConfig;
 
 /**
- * Generación e impresión de la tirilla térmica de venta.
+ * Generación e impresión de la tirilla térmica de venta. Hay tres caminos, según
+ * `printer.connection`:
  *
- * La impresión real se hace por el diálogo nativo del navegador (`window.print`)
- * sobre un iframe oculto con CSS pensado para papel térmico. Este camino funciona
- * tanto con impresoras USB como de red ya instaladas en el sistema, y es el más
- * robusto entre modelos (a diferencia de emitir ESC/POS crudo por WebUSB, que
- * depende del firmware de cada impresora).
+ * - `browser`: diálogo nativo (`window.print`) sobre un iframe oculto. Funciona
+ *   con cualquier impresora instalada en el sistema, pero el documento se
+ *   rasteriza: el pulso del cajón solo sobrevive con driver de paso directo.
+ * - `usb`: ESC/POS crudo por WebUSB (ver `escpos.ts` + `writeToUsbPrinter`). Es
+ *   el camino de las All-in-One POS.
+ * - `bridge`: los mismos bytes ESC/POS por HTTP a un puente local.
+ *
+ * IMPORTANTE: los modos `usb` y `bridge` NO caen a `window.print()` cuando algo
+ * falla. Ese repliegue era justo el síntoma reportado en las All-in-One —abría
+ * el PDF del navegador y se perdían la tirilla y el cajón—, así que ahora el
+ * fallo se devuelve al llamador para que pida reconectar el USB.
  */
 
 export type ReceiptItem = { nombre: string; qty: number; precio: number };
 export type ReceiptPayment = { metodo: string; monto: number };
 
 /**
- * Opciones de la impresión. `drawerPin` (0 → pin 2, 1 → pin 5) pide que el
- * documento lleve incrustado el pulso ESC/POS que abre el cajón monedero;
- * `null`/ausente imprime la tirilla sin tocar el cajón.
+ * Opciones de la impresión. `drawerPin` es de TRES estados:
+ *
+ * - `0` / `1`: abre el cajón por ese pin del RJ11 (0 → pin 2, 1 → pin 5).
+ * - `null`: NO abrir el cajón (p. ej. al reimprimir una copia).
+ * - ausente (`undefined`): decide `resolveDrawerPin` — toda orden de 80 mm /
+ *   48 columnas lleva el pulso.
  */
 export type PrintOptions = { drawerPin?: 0 | 1 | null };
 
+/** Canal por el que salió (o debía salir) el trabajo de impresión. */
+export type PrintChannel = PrinterConnection;
+
+/**
+ * Desenlace de una impresión. En caso de fallo `recoverable` marca si reintentar
+ * tiene sentido (reconectar el cable / volver a autorizar la impresora) frente a
+ * un "este navegador no puede", que requiere cambiar de método.
+ */
+export type PrintResult =
+  | { ok: true; via: PrintChannel }
+  | { ok: false; via: PrintChannel; message: string; recoverable: boolean };
+
 /** Id del nodo donde se inyecta la secuencia ESC/POS del cajón. */
 const KICK_ID = "esc-pos-drawer-kick";
+
+/** Tiempo máximo de espera del puente de impresión local. */
+const BRIDGE_TIMEOUT_MS = 8000;
+
+/**
+ * Pin del cajón para este trabajo. Un `drawerPin` explícito (incluido `null`)
+ * manda siempre; si el llamador no dice nada, toda orden de 80 mm / 48 columnas
+ * lleva incrustado el pulso RJ11, que es el formato de caja estándar.
+ */
+export function resolveDrawerPin(printer: ReceiptPrinter, opts: PrintOptions): 0 | 1 | null {
+  if (opts.drawerPin !== undefined) return opts.drawerPin;
+  return printer.paperWidth === "80mm" && printer.columns === 48 ? 0 : null;
+}
 
 /**
  * El pulso NO puede viajar en el string HTML: el parser del navegador convierte
@@ -81,13 +125,8 @@ export function buildReceiptHtml(
 
   const divider = "-".repeat(columns);
 
-  // Línea de dos columnas (texto a la izquierda, valor a la derecha) rellenada
-  // con espacios hasta `columns`. Si el texto no cabe, se recorta.
-  const twoCol = (left: string, right: string): string => {
-    const space = Math.max(1, columns - right.length);
-    const l = left.length > space ? left.slice(0, space - 1) + "…" : left.padEnd(space, " ");
-    return esc(l + right);
-  };
+  // Mismo maquetado que la vía ESC/POS (`twoColumns`), solo que escapado.
+  const twoCol = (left: string, right: string): string => esc(twoColumns(left, right, columns));
 
   const itemsHtml = data.items
     .map((it) => {
@@ -117,7 +156,7 @@ export function buildReceiptHtml(
     : "";
 
   // Cabecera del documento: nodo (vacío aquí) que `printReceipt` rellena con
-  // `ESC p m 25 250`. Va antes que nada para que el cajón salte al empezar a
+  // `ESC p m 50 250`. Va antes que nada para que el cajón salte al empezar a
   // imprimir, no al terminar.
   const kickHtml = opts.drawerPin == null ? "" : `<span id="${KICK_ID}" class="kick"></span>`;
 
@@ -175,26 +214,10 @@ export function buildReceiptHtml(
 </html>`;
 }
 
-/**
- * Imprime la tirilla usando un iframe oculto y el diálogo del navegador. Espera
- * a que el logo cargue antes de invocar `print()` para no imprimirlo en blanco.
- */
-export function printReceipt(
-  data: ReceiptData,
-  printer: ReceiptPrinter,
-  opts: PrintOptions = {},
-): void {
-  if (typeof window === "undefined") return;
+// ── Canales de salida ────────────────────────────────────────────────────────
 
-  // Vía fiable para el cajón cuando la impresora está emparejada por WebUSB: los
-  // bytes crudos van al firmware en paralelo al trabajo de impresión. Si no está
-  // disponible, el pulso incrustado en el documento (`injectDrawerKick`) queda
-  // como respaldo, así que no esperamos a esta promesa.
-  if (opts.drawerPin != null) {
-    void kickDrawerViaUsb(opts.drawerPin);
-  }
-
-  const html = buildReceiptHtml(data, printer, opts);
+/** Inserta un iframe oculto fuera de pantalla y devuelve su elemento. */
+function createHiddenFrame(): HTMLIFrameElement {
   const iframe = document.createElement("iframe");
   iframe.setAttribute("aria-hidden", "true");
   iframe.style.position = "fixed";
@@ -204,64 +227,213 @@ export function printReceipt(
   iframe.style.height = "0";
   iframe.style.border = "0";
   document.body.appendChild(iframe);
-
-  const cleanup = () => {
-    // Da tiempo al navegador a terminar el diálogo antes de retirar el iframe.
-    window.setTimeout(() => iframe.remove(), 1000);
-  };
-
-  const doPrint = () => {
-    const win = iframe.contentWindow;
-    if (!win) {
-      cleanup();
-      return;
-    }
-    win.focus();
-    win.print();
-    cleanup();
-  };
-
-  iframe.onload = () => {
-    const doc = iframe.contentWindow?.document;
-    injectDrawerKick(doc, opts.drawerPin);
-    const img = doc?.querySelector("img");
-    // Si hay logo y aún no cargó, esperamos su onload/onerror; si no, imprimimos ya.
-    if (img && !img.complete) {
-      img.addEventListener("load", doPrint, { once: true });
-      img.addEventListener("error", doPrint, { once: true });
-    } else {
-      doPrint();
-    }
-  };
-
-  iframe.srcdoc = html;
+  return iframe;
 }
 
+/**
+ * Impresión por el diálogo nativo. Espera a que el logo cargue antes de invocar
+ * `print()` para no imprimirlo en blanco.
+ */
+function printViaBrowser(
+  data: ReceiptData,
+  printer: ReceiptPrinter,
+  opts: PrintOptions,
+): Promise<PrintResult> {
+  return new Promise((resolve) => {
+    // Vía fiable para el cajón cuando la impresora está emparejada por WebUSB:
+    // los bytes crudos van al firmware en paralelo al trabajo de impresión. Si no
+    // está disponible, el pulso incrustado en el documento (`injectDrawerKick`)
+    // queda como respaldo, así que no esperamos a esta promesa. Se suelta la
+    // interfaz al terminar: aquí imprime el driver del sistema y necesita el
+    // dispositivo libre.
+    if (opts.drawerPin != null) {
+      void kickDrawerViaUsb(opts.drawerPin, { release: true });
+    }
+
+    const html = buildReceiptHtml(data, printer, opts);
+    const iframe = createHiddenFrame();
+
+    const cleanup = () => {
+      // Da tiempo al navegador a terminar el diálogo antes de retirar el iframe.
+      window.setTimeout(() => iframe.remove(), 1000);
+    };
+
+    const doPrint = () => {
+      const win = iframe.contentWindow;
+      if (!win) {
+        cleanup();
+        resolve({
+          ok: false,
+          via: "browser",
+          message: "El navegador bloqueó la ventana de impresión.",
+          recoverable: true,
+        });
+        return;
+      }
+      win.focus();
+      win.print();
+      cleanup();
+      resolve({ ok: true, via: "browser" });
+    };
+
+    iframe.onload = () => {
+      const doc = iframe.contentWindow?.document;
+      injectDrawerKick(doc, opts.drawerPin);
+      const img = doc?.querySelector("img");
+      // Si hay logo y aún no cargó, esperamos su onload/onerror; si no, imprimimos ya.
+      if (img && !img.complete) {
+        img.addEventListener("load", doPrint, { once: true });
+        img.addEventListener("error", doPrint, { once: true });
+      } else {
+        doPrint();
+      }
+    };
+
+    iframe.srcdoc = html;
+  });
+}
+
+/** Mensaje de usuario para un fallo del driver USB. */
+function usbMessage(error: unknown): string {
+  if (error instanceof UsbPrinterError) return error.message;
+  const detail = error instanceof Error ? error.message : String(error);
+  return `No se pudo hablar con la impresora USB (${detail}).`;
+}
+
+/** Un fallo de USB es recuperable salvo que el navegador no soporte WebUSB. */
+function usbRecoverable(error: unknown): boolean {
+  return !(error instanceof UsbPrinterError && error.kind === "unsupported");
+}
+
+/** POST de los bytes ESC/POS al puente local, con tope de espera. */
+async function sendToBridge(url: string, payload: EscPosBytes): Promise<void> {
+  const target = url.trim();
+  if (!target) throw new Error("Falta la URL del puente de impresión local.");
+
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), BRIDGE_TIMEOUT_MS);
+  try {
+    const res = await fetch(target, {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: payload,
+      signal: controller.signal,
+      // El puente corre en el propio equipo y no comparte sesión con la app.
+      credentials: "omit",
+      cache: "no-store",
+    });
+    if (!res.ok) throw new Error(`el puente respondió ${res.status}`);
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
+function bridgeMessage(error: unknown, url: string): string {
+  if (error instanceof DOMException && error.name === "AbortError") {
+    return `El puente de impresión (${url}) no respondió a tiempo.`;
+  }
+  const detail = error instanceof Error ? error.message : String(error);
+  return `No se pudo enviar la tirilla al puente de impresión (${detail}).`;
+}
+
+// ── API pública ──────────────────────────────────────────────────────────────
+
+/**
+ * Imprime la tirilla por el canal configurado en Dispositivos → Impresora.
+ *
+ * Devuelve siempre un `PrintResult`: en `usb`/`bridge` un fallo NO abre el
+ * diálogo del navegador, se reporta para que la interfaz avise y ofrezca
+ * reintentar.
+ */
+export async function printReceipt(
+  data: ReceiptData,
+  printer: ReceiptPrinter,
+  opts: PrintOptions = {},
+): Promise<PrintResult> {
+  const via: PrintChannel = printer.connection;
+  if (typeof window === "undefined") {
+    return { ok: false, via, message: "Sin navegador: no hay impresión.", recoverable: false };
+  }
+
+  // Pin resuelto una sola vez: las tres vías deben coincidir en si abren o no el
+  // cajón para esta misma venta.
+  const resolved: PrintOptions = { drawerPin: resolveDrawerPin(printer, opts) };
+
+  if (via === "usb") {
+    try {
+      const payload = await buildReceiptEscPos(data, printer, resolved);
+      // `release: false` implícito: la conexión se conserva entre tirillas.
+      await writeToUsbPrinter(payload);
+      return { ok: true, via };
+    } catch (e) {
+      console.error("[tirilla] Impresión USB fallida (sin repliegue a window.print):", e);
+      return { ok: false, via, message: usbMessage(e), recoverable: usbRecoverable(e) };
+    }
+  }
+
+  if (via === "bridge") {
+    try {
+      const payload = await buildReceiptEscPos(data, printer, resolved);
+      await sendToBridge(printer.bridgeUrl, payload);
+      return { ok: true, via };
+    } catch (e) {
+      console.error("[tirilla] Puente de impresión fallido:", e);
+      return { ok: false, via, message: bridgeMessage(e, printer.bridgeUrl), recoverable: true };
+    }
+  }
+
+  return printViaBrowser(data, printer, resolved);
+}
+
+/**
+ * Lo que `openCashDrawer` necesita saber de la impresora: por dónde hablarle.
+ * `PrinterSettings` encaja tal cual (se le pasa `devices.printer`).
+ */
+export type DrawerChannel = { connection: PrinterConnection; bridgeUrl: string };
+
 /** Cómo se logró (o no) abrir el cajón; el POS lo traduce a un mensaje. */
-export type DrawerResult = "usb" | "print" | "unsupported";
+export type DrawerOutcome =
+  | { ok: true; via: "usb" | "bridge" | "print" }
+  | { ok: false; message: string; recoverable: boolean };
 
 /**
  * Abre el cajón monedero SIN imprimir una tirilla (botón "Abrir Cajón" del POS).
  *
- * 1. Intenta el pulso crudo por WebUSB (fiable, sin diálogo de impresión).
- * 2. Si no hay impresora emparejada, lanza un trabajo de impresión mínimo que
- *    solo contiene la secuencia `ESC p m 25 250`. El papel que sale es un
- *    milímetro en blanco; requiere driver de paso directo.
+ * - `usb` / `bridge`: cinco bytes (`ESC p m 50 250`) al endpoint de la impresora.
+ *   Si falla, se informa — NUNCA se lanza un trabajo de impresión del navegador.
+ * - `browser`: intenta primero el pulso crudo por WebUSB y, si no hay impresora
+ *   emparejada, imprime un documento mínimo que solo contiene la secuencia. El
+ *   papel que sale es un milímetro en blanco; requiere driver de paso directo.
  */
-export async function openCashDrawer(pin: 0 | 1 = 0): Promise<DrawerResult> {
-  if (typeof window === "undefined") return "unsupported";
+export async function openCashDrawer(
+  pin: 0 | 1 = 0,
+  printer: DrawerChannel = { connection: "browser", bridgeUrl: "" },
+): Promise<DrawerOutcome> {
+  if (typeof window === "undefined") {
+    return { ok: false, message: "Sin navegador: no hay cajón.", recoverable: false };
+  }
 
-  if (await kickDrawerViaUsb(pin)) return "usb";
+  if (printer.connection === "usb") {
+    try {
+      await writeToUsbPrinter(buildDrawerKickJob(pin));
+      return { ok: true, via: "usb" };
+    } catch (e) {
+      return { ok: false, message: usbMessage(e), recoverable: usbRecoverable(e) };
+    }
+  }
 
-  const iframe = document.createElement("iframe");
-  iframe.setAttribute("aria-hidden", "true");
-  iframe.style.position = "fixed";
-  iframe.style.right = "0";
-  iframe.style.bottom = "0";
-  iframe.style.width = "0";
-  iframe.style.height = "0";
-  iframe.style.border = "0";
-  document.body.appendChild(iframe);
+  if (printer.connection === "bridge") {
+    try {
+      await sendToBridge(printer.bridgeUrl, buildDrawerKickJob(pin));
+      return { ok: true, via: "bridge" };
+    } catch (e) {
+      return { ok: false, message: bridgeMessage(e, printer.bridgeUrl), recoverable: true };
+    }
+  }
+
+  if (await kickDrawerViaUsb(pin, { release: true })) return { ok: true, via: "usb" };
+
+  const iframe = createHiddenFrame();
 
   iframe.onload = () => {
     const win = iframe.contentWindow;
@@ -286,5 +458,5 @@ export async function openCashDrawer(pin: 0 | 1 = 0): Promise<DrawerResult> {
 <body><span id="${KICK_ID}" class="kick"></span></body>
 </html>`;
 
-  return "print";
+  return { ok: true, via: "print" };
 }

@@ -1,14 +1,19 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useDashboard } from "../DashboardProvider";
 import {
+  DEFAULT_BRIDGE_URL,
+  describeUsbPrinter,
   isWebUsbSupported,
+  releaseUsbPrinter,
   requestUsbPrinter,
+  writeToUsbPrinter,
   type PaperWidth,
   type PrinterConnection,
   type PrinterSettings,
 } from "../../lib/devices";
+import { buildTestJob } from "../../lib/escpos";
 import type { TirillaConfig } from "../../lib/tirilla";
 import { buildReceiptHtml, printReceipt, type ReceiptData } from "../../lib/receipt";
 import {
@@ -59,13 +64,26 @@ export default function PrinterConfig({
   const { businessName, showToast } = useDashboard();
   const logoInputRef = useRef<HTMLInputElement>(null);
   const [connecting, setConnecting] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [printing, setPrinting] = useState(false);
   const [savingTirilla, setSavingTirilla] = useState(false);
+  // Impresora que el navegador ya tiene autorizada en ESTE equipo (puede venir
+  // de una sesión anterior: el permiso WebUSB sobrevive al logout).
+  const [usbDetectada, setUsbDetectada] = useState<string | null>(null);
 
   // La tirilla combina el formato/hardware (settings) con la identidad (tirilla).
   const previewHtml = useMemo(
     () => buildReceiptHtml(sampleReceipt(businessName), { ...settings, ...tirilla }),
     [businessName, settings, tirilla],
   );
+
+  const refrescarUsb = useCallback(() => {
+    void describeUsbPrinter().then(setUsbDetectada);
+  }, []);
+
+  useEffect(() => {
+    if (settings.connection === "usb") refrescarUsb();
+  }, [settings.connection, refrescarUsb]);
 
   const handleLogo = (file: File | undefined) => {
     if (!file) return;
@@ -81,9 +99,17 @@ export default function PrinterConfig({
   const handleConnectUsb = async () => {
     setConnecting(true);
     try {
-      const label = await requestUsbPrinter();
+      const { label, ready } = await requestUsbPrinter();
       onPatch({ deviceLabel: label });
-      showToast("Impresora emparejada", label);
+      refrescarUsb();
+      if (ready) {
+        showToast("Impresora emparejada", `${label} · lista para recibir ESC/POS.`);
+      } else {
+        showToast(
+          "Autorizada, pero sin canal de impresión",
+          `${label} no expone un endpoint USB de salida. En Windows hay que asignarle el driver WinUSB (Zadig) para que el navegador pueda escribirle.`,
+        );
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : "No se pudo emparejar la impresora.";
       // Cancelar el diálogo del navegador también lanza; no lo tratamos como error ruidoso.
@@ -92,6 +118,50 @@ export default function PrinterConfig({
       }
     } finally {
       setConnecting(false);
+    }
+  };
+
+  /** Dos líneas y corte: confirma que los bytes llegan al firmware. */
+  const handleTestUsb = async () => {
+    setTesting(true);
+    try {
+      await writeToUsbPrinter(buildTestJob());
+      showToast("Conexión USB correcta", "La impresora recibió los bytes ESC/POS de prueba.");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "No se pudo escribir en la impresora.";
+      showToast("Sin respuesta de la impresora", msg);
+    } finally {
+      setTesting(false);
+      refrescarUsb();
+    }
+  };
+
+  /** Suelta la interfaz para devolverle la impresora al driver del sistema. */
+  const handleReleaseUsb = async () => {
+    await releaseUsbPrinter();
+    showToast("Impresora liberada", "La interfaz USB queda libre para el driver del sistema.");
+  };
+
+  // Imprime la venta de ejemplo por el MISMO camino que una venta real (incluido
+  // el pulso del cajón), para que la prueba valide de verdad el canal elegido.
+  const handleTestPrint = async () => {
+    setPrinting(true);
+    try {
+      const result = await printReceipt(sampleReceipt(businessName), { ...settings, ...tirilla });
+      if (result.ok) {
+        showToast(
+          "Tirilla enviada",
+          result.via === "usb"
+            ? "Enviada por USB directo (ESC/POS crudo)."
+            : result.via === "bridge"
+              ? "Enviada al puente de impresión local."
+              : "Enviada al diálogo de impresión del navegador.",
+        );
+      } else {
+        showToast("No se pudo imprimir", result.message);
+      }
+    } finally {
+      setPrinting(false);
     }
   };
 
@@ -115,6 +185,8 @@ export default function PrinterConfig({
   };
 
   const usbSupported = isWebUsbSupported();
+  // El nombre real del dispositivo autorizado manda sobre la etiqueta guardada.
+  const etiquetaUsb = usbDetectada ?? settings.deviceLabel;
 
   return (
     <div className="space-y-8">
@@ -138,10 +210,11 @@ export default function PrinterConfig({
             value={settings.connection}
             onChange={(v) => onPatch({ connection: v })}
             options={[
-              { value: "browser", label: "Diálogo del navegador (recomendado)" },
-              { value: "usb", label: "USB directo (WebUSB)" },
+              { value: "browser", label: "Diálogo del navegador" },
+              { value: "usb", label: "USB directo (WebUSB · ESC/POS)" },
+              { value: "bridge", label: "Puente de impresión local (HTTP)" },
             ]}
-            hint="El diálogo del navegador usa la impresora instalada en el sistema."
+            hint="En terminales All-in-One usa USB directo o el puente: el diálogo del navegador rasteriza la tirilla y pierde el pulso del cajón."
           />
           <SelectField<PaperWidth>
             id="printer-paper"
@@ -165,6 +238,11 @@ export default function PrinterConfig({
               { value: 42, label: "42 caracteres" },
               { value: 48, label: "48 caracteres" },
             ]}
+            hint={
+              settings.paperWidth === "80mm" && settings.columns === 48
+                ? "80 mm / 48 columnas: cada orden lleva el pulso de apertura del cajón (RJ11)."
+                : undefined
+            }
           />
           <SelectField<number>
             id="printer-fontsize"
@@ -191,28 +269,66 @@ export default function PrinterConfig({
         </div>
 
         {settings.connection === "usb" && (
-          <div className="rounded-lg border border-zinc-800 bg-black/30 p-4">
+          <div className="space-y-3 rounded-lg border border-zinc-800 bg-black/30 p-4">
             {usbSupported ? (
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div className="min-w-0 text-xs text-zinc-400">
-                  {settings.deviceLabel ? (
-                    <>
-                      Emparejada: <span className="text-zinc-200">{settings.deviceLabel}</span>
-                    </>
-                  ) : (
-                    "Ninguna impresora USB emparejada todavía."
-                  )}
+              <>
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="min-w-0 text-xs text-zinc-400">
+                    {etiquetaUsb ? (
+                      <>
+                        Emparejada: <span className="text-zinc-200">{etiquetaUsb}</span>
+                      </>
+                    ) : (
+                      "Ninguna impresora USB emparejada todavía."
+                    )}
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <SecondaryButton onClick={handleConnectUsb} disabled={connecting}>
+                      {connecting
+                        ? "Emparejando…"
+                        : usbDetectada
+                          ? "Reconectar impresora"
+                          : "Conectar impresora USB"}
+                    </SecondaryButton>
+                    <SecondaryButton onClick={handleTestUsb} disabled={testing}>
+                      {testing ? "Probando…" : "Probar conexión"}
+                    </SecondaryButton>
+                    <SecondaryButton onClick={handleReleaseUsb}>Liberar</SecondaryButton>
+                  </div>
                 </div>
-                <SecondaryButton onClick={handleConnectUsb} disabled={connecting}>
-                  {connecting ? "Emparejando…" : "Conectar impresora USB"}
-                </SecondaryButton>
-              </div>
+                <p className="text-[11px] leading-relaxed text-zinc-500">
+                  En este modo la tirilla sale como ESC/POS crudo y <strong>no hay repliegue al
+                  diálogo del navegador</strong>: si el USB se cae, el POS avisa y deja reintentar
+                  en vez de abrir el PDF genérico. En Windows la impresora necesita el driver
+                  WinUSB (Zadig) para que el navegador pueda reclamar su interfaz.
+                </p>
+              </>
             ) : (
               <p className="text-xs text-amber-300/80">
-                Este navegador no soporta WebUSB. Usa el método “Diálogo del navegador”, que
-                imprime con la impresora instalada en el sistema.
+                Este navegador no soporta WebUSB. Usa Chrome o Edge sobre HTTPS, o cambia al
+                “Puente de impresión local”.
               </p>
             )}
+          </div>
+        )}
+
+        {settings.connection === "bridge" && (
+          <div className="space-y-3 rounded-lg border border-zinc-800 bg-black/30 p-4">
+            <TextField
+              id="printer-bridge"
+              label="URL del puente de impresión"
+              value={settings.bridgeUrl}
+              onChange={(v) => onPatch({ bridgeUrl: v })}
+              placeholder={DEFAULT_BRIDGE_URL}
+              hint="Servicio en el propio equipo que recibe los bytes ESC/POS por POST y los vuelca en la impresora."
+            />
+            <p className="text-[11px] leading-relaxed text-zinc-500">
+              Evita por completo los permisos de WebUSB: útil cuando la All-in-One no deja
+              liberar la interfaz USB. El puente recibe los bytes ESC/POS por POST
+              (<code>application/octet-stream</code>) y debe responder con las cabeceras CORS
+              del origen de la app; si la app va por HTTPS, además{" "}
+              <code>Access-Control-Allow-Private-Network: true</code>.
+            </p>
           </div>
         )}
       </div>
@@ -318,15 +434,18 @@ export default function PrinterConfig({
             <h4 className="text-xs font-semibold uppercase tracking-wide text-violet-300/80">
               Vista previa de la tirilla
             </h4>
-            <p className="mt-0.5 text-[11px] text-zinc-600">Con una venta de ejemplo.</p>
+            <p className="mt-0.5 text-[11px] text-zinc-600">
+              Con una venta de ejemplo. La prueba sale por el método elegido arriba, igual que
+              una venta real.
+            </p>
           </div>
-          <PrimaryButton onClick={() => printReceipt(sampleReceipt(businessName), { ...settings, ...tirilla })}>
+          <PrimaryButton onClick={handleTestPrint} disabled={printing}>
             <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
               <path d="M6 9V2h12v7" />
               <path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2" />
               <path d="M6 14h12v8H6z" />
             </svg>
-            Imprimir prueba
+            {printing ? "Enviando…" : "Imprimir prueba"}
           </PrimaryButton>
         </div>
 

@@ -9,7 +9,7 @@ import BarcodeScanner, { type BarcodeScannerHandle } from "../../components/Barc
 import { formatCOP } from "../../lib/data-model";
 import { fetchClientes, type Cliente } from "../../lib/clientes";
 import { fetchVentasHoyPorMetodo, type VentasHoyPorMetodo } from "../../lib/corte";
-import { loadDeviceSettings, type DrawerSettings } from "../../lib/devices";
+import { loadDeviceSettings, type DrawerSettings, type PrinterSettings } from "../../lib/devices";
 import { fetchTirilla, DEFAULT_TIRILLA, type TirillaConfig } from "../../lib/tirilla";
 import { openCashDrawer, printReceipt, type ReceiptData } from "../../lib/receipt";
 import { cacheCatalogo, descontarStockLocal, getFrecuentes } from "../../lib/offline/catalog";
@@ -88,6 +88,17 @@ const METODOS: { id: MetodoPago; label: string; sub: string; classes: string }[]
 ];
 
 /**
+ * Tirilla que NO salió por el canal directo (USB o puente). Guardamos el recibo
+ * y su pin para poder reintentar exactamente el mismo trabajo desde el aviso.
+ */
+type ImpresionFallida = {
+  msg: string;
+  recibo: ReceiptData;
+  drawerPin: 0 | 1 | null;
+  reintentable: boolean;
+};
+
+/**
  * Pin del pulso ESC/POS que debe incrustarse en la tirilla para abrir el cajón
  * en esta venta, o `null` si no debe abrirse. Depende SOLO de la configuración
  * local del equipo (`localStorage`), nunca del tenant.
@@ -164,6 +175,11 @@ export default function PosPage() {
   const [ventasHoy, setVentasHoy] = useState<VentasHoyPorMetodo | null>(null);
   // Última venta cobrada: habilita reimprimir la tirilla tras vaciar el carrito.
   const [ultimaVenta, setUltimaVenta] = useState<ReceiptData | null>(null);
+  // Aviso de impresión fallida (USB caído / puente sin responder). Vive aparte
+  // del `feedback` porque NO debe autodesaparecer: el cajero tiene que ver que
+  // esa venta se quedó sin tirilla y poder reintentarla.
+  const [avisoImpresion, setAvisoImpresion] = useState<ImpresionFallida | null>(null);
+  const [reintentandoImpresion, setReintentandoImpresion] = useState(false);
 
   // Identidad del recibo (NIT, dirección, logo, mensaje) del tenant, desde Supabase.
   // En un ref para que los handlers de impresión lean siempre el valor vigente sin
@@ -401,6 +417,53 @@ export default function PosPage() {
   // El escaneo por `codigo_barras` lo maneja ahora <BarcodeScanner>, que emite el
   // producto hallado por `onScan` y lo pasamos a `agregar` mapeando sus columnas.
 
+  // ── Impresión ────────────────────────────────────────────────────────────────
+
+  /**
+   * Envía la tirilla por el canal configurado (navegador, USB directo o puente).
+   *
+   * En USB/puente `printReceipt` NO cae a `window.print()`: devuelve el fallo y
+   * aquí lo convertimos en un aviso persistente con reintento. Antes, ese
+   * repliegue abría el PDF genérico del navegador en las All-in-One y la venta
+   * se quedaba sin tirilla y sin cajón sin que nadie se enterara.
+   */
+  const imprimirTirilla = useCallback(
+    async (recibo: ReceiptData, printer: PrinterSettings, drawerPin: 0 | 1 | null) => {
+      const resultado = await printReceipt(
+        recibo,
+        { ...printer, ...tirillaRef.current },
+        { drawerPin },
+      );
+      if (resultado.ok) {
+        setAvisoImpresion(null);
+        return true;
+      }
+      setAvisoImpresion({
+        msg: resultado.message,
+        recibo,
+        drawerPin,
+        reintentable: resultado.recoverable,
+      });
+      return false;
+    },
+    [],
+  );
+
+  /** Reintenta el ÚLTIMO trabajo fallido, tal cual (mismo recibo y mismo pin). */
+  const reintentarImpresion = useCallback(async () => {
+    const pendiente = avisoImpresion;
+    if (!pendiente) return;
+    setReintentandoImpresion(true);
+    try {
+      const { printer } = loadDeviceSettings();
+      const ok = await imprimirTirilla(pendiente.recibo, printer, pendiente.drawerPin);
+      if (ok) setFeedback({ tone: "ok", msg: "Tirilla impresa." });
+    } finally {
+      setReintentandoImpresion(false);
+      inputRef.current?.focus();
+    }
+  }, [avisoImpresion, imprimirTirilla]);
+
   // ── Cobro (transacción de venta) ─────────────────────────────────────────────
 
   /**
@@ -492,9 +555,11 @@ export default function PosPage() {
         // emitimos por separado para que el cajero no se quede sin cajón.
         const drawerPin = pinCajonPara(metodo, devices.drawer);
         if (devices.printer.enabled && devices.printer.autoPrint) {
-          printReceipt(recibo, { ...devices.printer, ...tirillaRef.current }, { drawerPin });
+          // Sin `await`: la venta no se bloquea por la impresora. Un fallo del
+          // canal directo cae en `avisoImpresion`, no en el diálogo del navegador.
+          void imprimirTirilla(recibo, devices.printer, drawerPin);
         } else if (drawerPin != null) {
-          void openCashDrawer(drawerPin);
+          void openCashDrawer(drawerPin, devices.printer);
         }
 
         const okMsg = esFiado
@@ -553,7 +618,7 @@ export default function PosPage() {
         setCobrando(false);
       }
     },
-    [carrito, total, businessName, online, sincronizar, refresh, clienteSel],
+    [carrito, total, businessName, online, sincronizar, refresh, clienteSel, imprimirTirilla],
   );
 
   /**
@@ -626,12 +691,13 @@ export default function PosPage() {
   }, [sincronizar]);
 
   /** Reimprime la tirilla de la última venta (botón manual del POS). */
-  const reimprimir = useCallback(() => {
+  const reimprimir = useCallback(async () => {
     if (!ultimaVenta) return;
-    const devices = loadDeviceSettings();
-    // Sin `drawerPin`: una copia de la tirilla no debe volver a abrir el cajón.
-    printReceipt(ultimaVenta, { ...devices.printer, ...tirillaRef.current });
-  }, [ultimaVenta]);
+    const { printer } = loadDeviceSettings();
+    // `drawerPin: null` EXPLÍCITO: una copia de la tirilla no debe volver a abrir
+    // el cajón, aunque sea una orden de 80 mm / 48 columnas.
+    await imprimirTirilla(ultimaVenta, printer, null);
+  }, [ultimaVenta, imprimirTirilla]);
 
   /**
    * Abre el cajón sin cobrar (dar cambio, retirar efectivo…). Usa el pin
@@ -640,14 +706,18 @@ export default function PosPage() {
   const abrirCajon = useCallback(async () => {
     setAbriendoCajon(true);
     try {
-      const { drawer } = loadDeviceSettings();
-      const via = await openCashDrawer(drawer.pin);
+      const { drawer, printer } = loadDeviceSettings();
+      const resultado = await openCashDrawer(drawer.pin, printer);
       setFeedback(
-        via === "usb"
-          ? { tone: "ok", msg: "Pulso enviado al cajón." }
-          : via === "print"
-            ? { tone: "ok", msg: "Pulso del cajón enviado a la impresora." }
-            : { tone: "error", msg: "Este navegador no puede accionar el cajón." },
+        resultado.ok
+          ? {
+              tone: "ok",
+              msg:
+                resultado.via === "print"
+                  ? "Pulso del cajón enviado a la impresora."
+                  : "Pulso enviado al cajón.",
+            }
+          : { tone: "error", msg: resultado.message },
       );
     } finally {
       setAbriendoCajon(false);
@@ -670,6 +740,39 @@ export default function PosPage() {
         >
           <span className="text-base">{feedback.tone === "error" ? "⚠️" : "✅"}</span>
           {feedback.msg}
+        </div>
+      )}
+
+      {/* ── Aviso de impresión directa fallida ──
+          No autodesaparece y no se pisa con el feedback de la venta: la venta SÍ
+          quedó registrada, lo que falló es la impresora. */}
+      {avisoImpresion && (
+        <div
+          role="alert"
+          className="mb-4 flex flex-wrap items-center gap-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm font-medium text-amber-200"
+        >
+          <span className="text-base" aria-hidden>🖨️</span>
+          <span className="min-w-0 flex-1">
+            La venta se registró, pero la tirilla no salió. {avisoImpresion.msg}
+          </span>
+          {avisoImpresion.reintentable && (
+            <button
+              type="button"
+              onClick={() => void reintentarImpresion()}
+              disabled={reintentandoImpresion}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-xs font-semibold text-amber-100 transition-colors hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {reintentandoImpresion ? "Reintentando…" : "Reconectar e imprimir"}
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => setAvisoImpresion(null)}
+            aria-label="Descartar aviso de impresión"
+            className="rounded-lg px-2 py-1 text-xs text-amber-300/70 transition-colors hover:bg-amber-500/10 hover:text-amber-100"
+          >
+            ✕
+          </button>
         </div>
       )}
 
