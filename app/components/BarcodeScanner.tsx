@@ -32,7 +32,16 @@ import type { ProductoLocal } from "../lib/offline/db";
  * Handle imperativo que el componente expone por `ref`. Permite al padre (p. ej.
  * el POS tras cobrar) devolver el foco al escáner sin acoplarse al input interno.
  */
-export type BarcodeScannerHandle = { focus: () => void };
+export type BarcodeScannerHandle = {
+  focus: () => void;
+  /**
+   * Inyecta un código leído por OTRA vía (la cámara del móvil) y dispara la
+   * MISMA búsqueda que el Enter del lector físico. Así el escaneo por cámara
+   * reusa `findByBarcode` tal cual —y con él RLS y el espejo local de la
+   * empresa— en lugar de abrir una segunda ruta de consulta.
+   */
+  escanear: (codigo: string) => void;
+};
 
 /** Producto devuelto por el escaneo (espejo de `public.productos`). */
 export type ProductoEscaneado = ProductoLocal;
@@ -69,9 +78,6 @@ function BarcodeScanner(
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  // Expone `focus()` al padre (p. ej. el POS reenfoca el escáner tras cobrar).
-  useImperativeHandle(ref, () => ({ focus: () => inputRef.current?.focus() }), []);
-
   // Limpia el temporizador pendiente al desmontar.
   useEffect(() => () => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
@@ -82,9 +88,14 @@ function BarcodeScanner(
    * hay coincidencia la emite por `onScan` y limpia el campo (listo para el
    * siguiente). `reportarNoEncontrado` solo se activa con Enter: mientras se
    * escribe no molestamos con avisos de "no encontrado".
+   *
+   * `devolverFoco` existe por la cámara: en un móvil, reenfocar el input al
+   * terminar levantaría el teclado virtual encima del carrito justo después de
+   * cerrar el visor. Con el lector físico (el caso por defecto) sí queremos el
+   * foco de vuelta para encadenar escaneos.
    */
   const buscar = useCallback(
-    async (valorCrudo: string, reportarNoEncontrado: boolean) => {
+    async (valorCrudo: string, reportarNoEncontrado: boolean, devolverFoco = true) => {
       const valor = valorCrudo.trim();
       if (!valor || buscandoRef.current) return;
       if (!reportarNoEncontrado && valor === ultimoRef.current) return;
@@ -107,10 +118,27 @@ function BarcodeScanner(
         onError?.("Error al buscar el producto.");
       } finally {
         buscandoRef.current = false;
-        inputRef.current?.focus(); // devuelve el foco para el siguiente escaneo
+        if (devolverFoco) inputRef.current?.focus(); // listo para el siguiente escaneo
       }
     },
     [onScan, onNotFound, onError],
+  );
+
+  // Expone `focus()` (el POS reenfoca el escáner tras cobrar) y `escanear()`
+  // (código llegado por cámara) sin acoplar al padre con el input interno.
+  useImperativeHandle(
+    ref,
+    () => ({
+      focus: () => inputRef.current?.focus(),
+      escanear: (valor: string) => {
+        // Cancelamos el debounce en vuelo: el código de la cámara manda y no
+        // queremos que una búsqueda a medio teclear lo pise.
+        if (debounceRef.current) clearTimeout(debounceRef.current);
+        setCodigo(valor); // visible en el input, como si lo hubiera tecleado el lector
+        void buscar(valor, true, false);
+      },
+    }),
+    [buscar],
   );
 
   // Búsqueda "al escribir": debounce corto para no consultar en cada tecla y

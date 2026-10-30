@@ -1,11 +1,13 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import dynamic from "next/dynamic";
 import { useHotkeys } from "react-hotkeys-hook";
 import PageShell from "../../components/PageShell";
 import { useDashboard } from "../../components/DashboardProvider";
 import { getEmpresaIdActiva } from "../../lib/auth";
 import BarcodeScanner, { type BarcodeScannerHandle } from "../../components/BarcodeScanner";
+import { soportaCamara } from "../../lib/barcode-camera";
 import { formatCOP } from "../../lib/data-model";
 import { fetchClientes, type Cliente } from "../../lib/clientes";
 import { fetchVentasHoyPorMetodo, type VentasHoyPorMetodo } from "../../lib/corte";
@@ -15,6 +17,13 @@ import { openCashDrawer, printReceipt, type ReceiptData } from "../../lib/receip
 import { cacheCatalogo, descontarStockLocal, getFrecuentes } from "../../lib/offline/catalog";
 import { enqueueVenta } from "../../lib/offline/outbox";
 import { useOffline } from "../../lib/offline/useOffline";
+
+/**
+ * Visor de cámara: se carga bajo demanda (`ssr: false`) porque toca
+ * `navigator.mediaDevices` al montar y arrastra el decodificador ZXing (~300 KB).
+ * Quien cobra con lector USB nunca lo descarga.
+ */
+const CameraScanner = dynamic(() => import("../../components/CameraScanner"), { ssr: false });
 
 /**
  * Punto de Venta (POS) táctil — pensado para retail rápido (superior a Eleventa).
@@ -75,6 +84,13 @@ type PagoEfectivo = { recibido: number; devuelto: number };
 
 /** Denominaciones habituales en Colombia para agilizar la caja táctil. */
 const MONTOS_RAPIDOS = [10000, 20000, 50000, 100000];
+
+/**
+ * `subscribe` vacío para `useSyncExternalStore`: el soporte de cámara del
+ * navegador no cambia en caliente. Fuera del componente para que su identidad
+ * sea estable entre renders.
+ */
+const SIN_SUSCRIPCION = () => () => {};
 
 const METODOS: { id: MetodoPago; label: string; sub: string; classes: string }[] = [
   {
@@ -187,6 +203,8 @@ export default function PosPage() {
   const [comunAbierto, setComunAbierto] = useState(false);
   const [comunNombre, setComunNombre] = useState("");
   const [comunPrecio, setComunPrecio] = useState("");
+  // Visor de cámara (escaneo desde móvil/tablet, sin lector físico).
+  const [camaraAbierta, setCamaraAbierta] = useState(false);
   const inputRef = useRef<BarcodeScannerHandle>(null);
   const comunNombreRef = useRef<HTMLInputElement>(null);
   // Contador de ids para los artículos comunes. Negativo y decreciente para no
@@ -224,6 +242,14 @@ export default function PosPage() {
   const { online, pendientes, totalPend, sincronizando, sincronizar, refresh } = useOffline(() => {
     fetchVentasHoyPorMetodo().then(setVentasHoy);
   });
+
+  /**
+   * ¿Pintamos el botón de cámara junto al input? Es una capacidad del NAVEGADOR
+   * (HTTPS + `getUserMedia`), que el servidor no puede conocer. `useSyncExternalStore`
+   * la lee sin romper la hidratación: el servidor renderiza `false` (sin botón)
+   * y el cliente lo recalcula al montar.
+   */
+  const camaraDisponible = useSyncExternalStore(SIN_SUSCRIPCION, soportaCamara, () => false);
 
   // Autolimpia el feedback tras unos segundos para no dejar alertas pegadas.
   useEffect(() => {
@@ -451,6 +477,20 @@ export default function PosPage() {
 
   // El escaneo por `codigo_barras` lo maneja ahora <BarcodeScanner>, que emite el
   // producto hallado por `onScan` y lo pasamos a `agregar` mapeando sus columnas.
+
+  // ── Escaneo por cámara ───────────────────────────────────────────────────────
+
+  /**
+   * Código leído por la cámara. Cerramos el visor (ya sonó el beep dentro) y
+   * se lo entregamos al <BarcodeScanner>, que lo pinta en el input y corre la
+   * MISMA búsqueda que el lector físico: `findByBarcode` → `onScan` → `agregar`.
+   * Ni la consulta ni el filtrado por empresa cambian; esto solo es otra forma
+   * de teclear el código.
+   */
+  const onCodigoCamara = useCallback((codigo: string) => {
+    setCamaraAbierta(false);
+    inputRef.current?.escanear(codigo);
+  }, []);
 
   // ── Impresión ────────────────────────────────────────────────────────────────
 
@@ -921,12 +961,32 @@ export default function PosPage() {
             <label htmlFor="scan" className="mb-1.5 block text-xs font-medium text-zinc-400">
               Escanea o escribe el código de barras
             </label>
-            <BarcodeScanner
-              ref={inputRef}
-              onScan={(p) => agregar(p)}
-              onNotFound={(codigo) => setFeedback({ tone: "error", msg: `Código ${codigo} no encontrado.` })}
-              onError={(msg) => setFeedback({ tone: "error", msg })}
-            />
+            {/* Tres vías al mismo flujo: tecleado, lector USB (teclea y cierra
+                con Enter) y cámara (botón 📷, solo si el navegador puede abrirla). */}
+            <div className="flex gap-2">
+              <div className="min-w-0 flex-1">
+                <BarcodeScanner
+                  ref={inputRef}
+                  onScan={(p) => agregar(p)}
+                  onNotFound={(codigo) => setFeedback({ tone: "error", msg: `Código ${codigo} no encontrado.` })}
+                  onError={(msg) => setFeedback({ tone: "error", msg })}
+                />
+              </div>
+              {camaraDisponible && (
+                <button
+                  type="button"
+                  onClick={() => setCamaraAbierta(true)}
+                  title="Escanear con la cámara del dispositivo"
+                  aria-label="Escanear el código de barras con la cámara"
+                  className="flex w-14 shrink-0 items-center justify-center rounded-lg border border-violet-500/40 bg-violet-500/10 text-violet-300 transition-colors hover:bg-violet-500/20 active:scale-[0.97]"
+                >
+                  <svg className="h-6 w-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" />
+                    <circle cx="12" cy="13" r="4" />
+                  </svg>
+                </button>
+              )}
+            </div>
 
             {/* Artículo común: ítem suelto sin inventario (botón grande táctil). */}
             <button
@@ -1526,6 +1586,16 @@ export default function PosPage() {
             )}
           </div>
         </div>
+      )}
+
+      {/* Visor de cámara a pantalla completa. Se monta solo al pulsar el botón
+          (ahí se descarga el decodificador) y se cierra tras la primera lectura. */}
+      {camaraAbierta && (
+        <CameraScanner
+          titulo="Escanear producto"
+          onDetectado={onCodigoCamara}
+          onCerrar={() => setCamaraAbierta(false)}
+        />
       )}
     </PageShell>
   );
