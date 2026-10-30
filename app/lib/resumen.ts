@@ -19,8 +19,21 @@
  */
 
 import { supabase, getEmpresaIdActiva } from "./auth";
-import type { InventoryItem, Sale, PurchaseOrder, PurchaseStatus } from "./data-model";
-import type { NewPurchase } from "../components/DashboardProvider";
+import type {
+  InventoryItem,
+  Sale,
+  SaleStatus,
+  Customer,
+  Tier,
+  PurchaseOrder,
+  PurchaseStatus,
+} from "./data-model";
+import type {
+  NewPurchase,
+  NewInventoryItem,
+  NewCustomer,
+  NewSale,
+} from "../components/DashboardProvider";
 
 /** Fila cruda de `public.ventas` (solo las columnas que consumimos). */
 type VentaRow = {
@@ -28,6 +41,12 @@ type VentaRow = {
   total: number | string; // numeric puede llegar como string desde PostgREST
   metodo_pago: string;
   created_at: string; // ISO timestamptz
+  /** Comprador; null en las ventas del POS (mostrador). Columna nueva. */
+  cliente_nombre?: string | null;
+  /** Canal de venta; null = POS. Columna nueva. */
+  canal?: string | null;
+  /** Pagado | Pendiente | Reembolsado. Columna nueva, DEFAULT 'Pagado'. */
+  estado?: SaleStatus | null;
 };
 
 /** Fila cruda de `public.productos` (solo las columnas que consumimos). */
@@ -46,34 +65,57 @@ type ProductoRow = {
  * dashboard. Aisladas por RLS. `date = created_at` (ISO) lo entiende
  * `monthIndexFromDate`, así que los ingresos mensuales se derivan solos.
  */
+const VENTAS_SELECT_BASE = "id, total, metodo_pago, created_at";
+
+/**
+ * `cliente_nombre`, `canal` y `estado` son columnas nuevas
+ * (`supabase/2026-10-import-masivo-crm-ventas.sql`). Mismo patrón defensivo que
+ * `fetchProductosEmpresa`: si la migración aún no se ha corrido, PostgREST
+ * devuelve 42703 y reintentamos sin ellas para que el dashboard siga funcionando
+ * con los valores por defecto del POS.
+ */
 export async function fetchVentasEmpresa(): Promise<Sale[]> {
   const empresaId = await getEmpresaIdActiva();
   if (!empresaId) return []; // sin empresa resuelta no se consulta (aislamiento)
 
-  const { data, error } = await supabase
+  const completo = await supabase
     .from("ventas")
-    .select("id, total, metodo_pago, created_at")
+    .select(`${VENTAS_SELECT_BASE}, cliente_nombre, canal, estado`)
     .eq("empresa_id", empresaId)
     .order("created_at", { ascending: false });
+
+  const debeReintentar = completo.error?.code === "42703";
+  if (debeReintentar) {
+    console.warn(
+      "[resumen] `ventas.cliente_nombre/canal/estado` no existen todavía; corre " +
+        "supabase/2026-10-import-masivo-crm-ventas.sql para importar el histórico de ventas.",
+    );
+  }
+  const { data, error } = debeReintentar
+    ? await supabase
+        .from("ventas")
+        .select(VENTAS_SELECT_BASE)
+        .eq("empresa_id", empresaId)
+        .order("created_at", { ascending: false })
+    : completo;
 
   if (error) {
     console.warn("[resumen] No se pudieron leer las ventas:", error.message);
     return [];
   }
 
-  return (data ?? []).map((v) => {
-    const row = v as VentaRow;
-    return {
-      id: row.id,
-      clientId: "", // el aislamiento lo impone RLS; el cliente no lo usa
-      customer: "Venta POS",
-      channel: "POS",
-      method: row.metodo_pago,
-      amount: Number(row.total ?? 0),
-      status: "Pagado" as const,
-      date: row.created_at,
-    };
-  });
+  return ((data ?? []) as VentaRow[]).map((row) => ({
+    id: row.id,
+    clientId: "", // el aislamiento lo impone RLS; el cliente no lo usa
+    // Las ventas del POS dejan estas columnas nulas: ahí el valor por defecto
+    // describe el origen real; una venta importada trae los datos del archivo.
+    customer: row.cliente_nombre ?? "Venta POS",
+    channel: row.canal ?? "POS",
+    method: row.metodo_pago,
+    amount: Number(row.total ?? 0),
+    status: row.estado ?? "Pagado",
+    date: row.created_at,
+  }));
 }
 
 /**
@@ -162,6 +204,321 @@ export async function fetchProductosEmpresa(): Promise<InventoryItem[]> {
       expiryDate: row.fecha_vencimiento ?? null,
     };
   });
+}
+
+// ── Carga masiva (Excel/CSV → Supabase) ──────────────────────────────────────
+//
+// ESTE es el paso que faltaba en los tres módulos: antes el importador solo
+// llenaba el estado de React, así que al recargar (o al volver a disparar la
+// carga del provider) la lectura del servidor reemplazaba las filas importadas y
+// parecía que la base de datos "las borraba". Nunca hubo un INSERT que RLS
+// pudiera rechazar.
+//
+// Las tres importaciones comparten el mismo contrato y las mismas garantías:
+//  · Una RPC `importar_*_masivo(jsonb)` por módulo, ATÓMICA (todo el lote o
+//    nada) y **SECURITY INVOKER**, así que las políticas RLS de la tabla se
+//    evalúan íntegras dentro de la escritura.
+//  · El `empresa_id` lo estampa el SERVIDOR vía `mi_empresa()`; no viaja en el
+//    payload, de modo que un cuerpo manipulado no puede escribir en otro tenant.
+//    Aquí resolvemos la empresa solo para abortar temprano con un mensaje
+//    legible en vez de disparar un error de RLS opaco (defensa en profundidad,
+//    mismo patrón que `ProductForm` e `insertCompras`).
+//  · Idempotencia: re-importar el mismo archivo no duplica nada.
+
+/** Resultado real de una importación, tal como lo reporta el servidor. */
+export type ResultadoImport = {
+  /** Filas que viajaron al servidor. */
+  recibidos: number;
+  /** Filas utilizables (las vacías o sin nombre se descartan). */
+  validos: number;
+  /** Filas creadas. */
+  insertados: number;
+  /**
+   * Filas que ya existían: ACTUALIZADAS en productos y clientes, OMITIDAS en
+   * ventas (una venta histórica es inmutable, ver la RPC).
+   */
+  actualizados: number;
+  /** Mensaje presentable si la carga falló; `null` si todo fue bien. */
+  error: string | null;
+};
+
+const IMPORT_VACIO: ResultadoImport = {
+  recibidos: 0,
+  validos: 0,
+  insertados: 0,
+  actualizados: 0,
+  error: null,
+};
+
+/**
+ * Tamaño de lote. Cada llamada es ATÓMICA en el servidor, así que un archivo
+ * grande se parte para no acercarse al statement timeout de PostgREST ni mandar
+ * un cuerpo desmesurado. 413 referencias caben en dos lotes.
+ */
+const IMPORT_CHUNK = 250;
+
+/** Error de PostgREST/Postgres, en lo que nos interesa para diagnosticar. */
+type ErrorRpc = { code?: string; message: string; details?: string | null; hint?: string | null };
+
+/** Datos de un módulo importable, para no repetir el runner tres veces. */
+type ModuloImport = {
+  /** Nombre de la RPC en Postgres. */
+  rpc: string;
+  /** Migración que la crea, para guiar al usuario si falta. */
+  sql: string;
+  /** Qué se está guardando, en los mensajes de error ("el inventario", …). */
+  que: string;
+};
+
+/**
+ * Ejecuta una importación por lotes contra su RPC y agrega los conteos reales
+ * que devuelve el servidor. Nunca lanza: devuelve `error` poblado para que el
+ * llamador decida (el provider lo convierte en excepción y el importador lo
+ * pinta). El conteo NO se estima en el cliente — es el que reporta Postgres.
+ */
+async function ejecutarImport(
+  modulo: ModuloImport,
+  items: Record<string, unknown>[],
+): Promise<ResultadoImport> {
+  if (items.length === 0) return { ...IMPORT_VACIO };
+
+  const empresaId = await getEmpresaIdActiva();
+  if (!empresaId) {
+    const error =
+      `Tu usuario no tiene una empresa asignada, así que ${modulo.que} importado ` +
+      "no se puede guardar. Cierra sesión y vuelve a entrar; si persiste, hay que " +
+      "reparar tu cuenta (usuarios.empresa_id está vacío).";
+    console.error(`[import] ${modulo.rpc} abortada:`, error);
+    return { ...IMPORT_VACIO, recibidos: items.length, error };
+  }
+
+  const total: ResultadoImport = { ...IMPORT_VACIO };
+
+  for (let i = 0; i < items.length; i += IMPORT_CHUNK) {
+    const lote = items.slice(i, i + IMPORT_CHUNK);
+
+    const { data, error } = await supabase.rpc(modulo.rpc, { p_items: lote });
+
+    if (error) {
+      // Fallar en voz alta: antes esto era silencioso y el toast decía "éxito"
+      // aunque no se hubiera guardado una sola fila.
+      console.error(
+        `[import] No se pudo guardar el lote (${modulo.rpc}):`,
+        { code: error.code, message: error.message, details: error.details, hint: error.hint },
+        `· ¿corriste supabase/${modulo.sql}?`,
+      );
+      return { ...total, recibidos: items.length, error: mensajeErrorImport(error, modulo) };
+    }
+
+    const r = (data ?? {}) as Record<string, unknown>;
+    total.recibidos += Number(r.recibidos ?? lote.length);
+    total.validos += Number(r.validos ?? 0);
+    total.insertados += Number(r.insertados ?? 0);
+    // Las ventas reportan `omitidas` en vez de `actualizados` (DO NOTHING).
+    total.actualizados += Number(r.actualizados ?? r.omitidas ?? 0);
+  }
+
+  return total;
+}
+
+/** Traduce los fallos típicos de la importación a algo accionable. */
+function mensajeErrorImport(error: ErrorRpc, modulo: ModuloImport): string {
+  // PGRST202 / 42883: la RPC no existe todavía en esta base de datos.
+  if (error.code === "PGRST202" || error.code === "42883") {
+    return (
+      `Falta la función ${modulo.rpc} en la base de datos. Ejecuta ` +
+      `supabase/${modulo.sql} en el SQL Editor de Supabase.`
+    );
+  }
+  // 42501 / 403: falta el GRANT EXECUTE para `authenticated`.
+  if (error.code === "42501" || error.message.includes("permission denied for function")) {
+    return (
+      `Tu usuario no tiene permiso para ejecutar la importación. Falta el ` +
+      `GRANT EXECUTE de ${modulo.rpc} a \`authenticated\`.`
+    );
+  }
+  // 42P10: no existe el índice único destino del ON CONFLICT.
+  if (error.code === "42P10") {
+    return `Falta el índice único que usa ${modulo.rpc}. Ejecuta supabase/${modulo.sql}.`;
+  }
+  // 42P01 / PGRST205: falta la tabla entera (migración base sin correr).
+  if (error.code === "42P01" || error.code === "PGRST205") {
+    return `Falta una tabla que necesita la importación. Ejecuta supabase/${modulo.sql}.`;
+  }
+  return `No se pudo guardar ${modulo.que}: ${error.message}`;
+}
+
+const MODULO_PRODUCTOS: ModuloImport = {
+  rpc: "importar_productos_masivo",
+  sql: "2026-10-import-masivo-productos.sql",
+  que: "el inventario",
+};
+
+const MODULO_CLIENTES: ModuloImport = {
+  rpc: "importar_clientes_masivo",
+  sql: "2026-10-import-masivo-crm-ventas.sql",
+  que: "el directorio de clientes",
+};
+
+const MODULO_VENTAS: ModuloImport = {
+  rpc: "importar_ventas_masivo",
+  sql: "2026-10-import-masivo-crm-ventas.sql",
+  que: "el histórico de ventas",
+};
+
+/**
+ * Persiste en `public.productos` el inventario importado desde Excel/CSV.
+ *
+ * El upsert resuelve el conflicto por `(empresa_id, codigo_barras)`: re-importar
+ * el mismo archivo actualiza las referencias en lugar de duplicarlas, y deja
+ * intactas las columnas que el archivo no trae (precio_costo, margen,
+ * departamento, imagen, vencimiento).
+ */
+export async function upsertProductosImportados(
+  rows: NewInventoryItem[],
+): Promise<ResultadoImport> {
+  return ejecutarImport(
+    MODULO_PRODUCTOS,
+    rows.map((r) => ({
+      sku: r.sku?.trim() || null,
+      nombre: r.name.trim(),
+      stock: r.stock,
+      min_stock: r.minStock ?? 0,
+      precio: r.price,
+    })),
+  );
+}
+
+/**
+ * Persiste en `public.clientes` el directorio importado desde Excel/CSV.
+ *
+ * La RPC empareja por email (clave natural) y, cuando el archivo no lo trae, por
+ * nombre normalizado; actualiza los que ya existen e inserta el resto. No se
+ * crea una restricción única sobre el nombre a propósito: dos homónimos en un
+ * mismo negocio son legítimos y romperían el alta manual del CRM.
+ *
+ * `saldo_pendiente` NUNCA se toca aquí: lo gobierna la RPC `registrar_fiado`.
+ */
+export async function importarClientes(rows: NewCustomer[]): Promise<ResultadoImport> {
+  return ejecutarImport(
+    MODULO_CLIENTES,
+    rows.map((r) => ({
+      nombre: r.name.trim(),
+      email: r.email?.trim() || null,
+      telefono: r.phone?.trim() || null,
+      segmento: r.tier,
+      pedidos: r.orders,
+      total_gastado: r.totalSpent,
+    })),
+  );
+}
+
+/**
+ * Persiste en `public.ventas` el histórico importado desde Excel/CSV.
+ *
+ * Idempotente por `(empresa_id, referencia)` con ON CONFLICT DO NOTHING: una
+ * venta ya importada no se reescribe. Si el archivo no trae folio, el servidor
+ * deriva uno determinista del contenido (+ un sufijo de ocurrencia, para que dos
+ * ventas idénticas el mismo día no se colapsen en una sola).
+ */
+export async function importarVentas(rows: NewSale[]): Promise<ResultadoImport> {
+  // Nº de aparición de cada fila entre las IDÉNTICAS del archivo. Se calcula
+  // aquí, sobre el archivo COMPLETO, y no en SQL con row_number(): la carga va
+  // por lotes y la numeración se reiniciaría en cada lote, de modo que dos
+  // ventas idénticas a ambos lados de un corte recibirían la misma clave
+  // derivada y la segunda se perdería en el ON CONFLICT DO NOTHING.
+  const vistas = new Map<string, number>();
+
+  return ejecutarImport(
+    MODULO_VENTAS,
+    rows.map((r) => {
+      const huella = [
+        r.date ?? "",
+        (r.customer ?? "").trim().toLowerCase(),
+        r.amount,
+        (r.method ?? "").trim().toLowerCase(),
+        r.status,
+      ].join("|");
+      const ocurrencia = (vistas.get(huella) ?? 0) + 1;
+      vistas.set(huella, ocurrencia);
+
+      return {
+        referencia: r.id?.trim() || null,
+        cliente: r.customer?.trim() || null,
+        canal: r.channel?.trim() || null,
+        metodo: r.method?.trim() || null,
+        monto: r.amount,
+        estado: r.status,
+        fecha: r.date || null,
+        ocurrencia,
+      };
+    }),
+  );
+}
+
+// ── Directorio de clientes para el estado del dashboard ──────────────────────
+
+/** Fila cruda de `public.clientes` en lo que consume el dashboard. */
+type ClienteResumenRow = {
+  id: string;
+  nombre: string;
+  email: string | null;
+  telefono: string | null;
+  segmento?: Tier | null;
+  compras_historicas?: number | string | null;
+  total_gastado?: number | string | null;
+};
+
+const CLIENTES_SELECT_BASE = "id, nombre, email, telefono";
+
+/**
+ * Clientes de la empresa autenticada, mapeados al `Customer` que mantiene el
+ * <DashboardProvider>. Aislado por RLS más el filtro explícito por `empresa_id`.
+ *
+ * `segmento`, `compras_historicas` y `total_gastado` son columnas nuevas
+ * (`2026-10-import-masivo-crm-ventas.sql`); igual que en productos y ventas, si
+ * la migración todavía no se ha corrido reintentamos sin ellas (42703) en vez de
+ * dejar el CRM vacío. Si falta la tabla entera (CRM sin migrar) devuelve [].
+ */
+export async function fetchClientesEmpresa(): Promise<Customer[]> {
+  const empresaId = await getEmpresaIdActiva();
+  if (!empresaId) return []; // sin empresa resuelta no se consulta (aislamiento)
+
+  const completo = await supabase
+    .from("clientes")
+    .select(`${CLIENTES_SELECT_BASE}, segmento, compras_historicas, total_gastado`)
+    .eq("empresa_id", empresaId)
+    .order("nombre", { ascending: true });
+
+  const debeReintentar = completo.error?.code === "42703";
+  const { data, error } = debeReintentar
+    ? await supabase
+        .from("clientes")
+        .select(CLIENTES_SELECT_BASE)
+        .eq("empresa_id", empresaId)
+        .order("nombre", { ascending: true })
+    : completo;
+
+  if (error) {
+    // 42P01/PGRST205 = el CRM aún no está migrado; no es un fallo que reportar.
+    if (error.code !== "42P01" && error.code !== "PGRST205") {
+      console.warn("[resumen] No se pudieron leer los clientes:", error.message);
+    }
+    return [];
+  }
+
+  return ((data ?? []) as ClienteResumenRow[]).map((row, i) => ({
+    // `Customer.id` es numérico por el modelo en memoria heredado y nadie lo
+    // consume: el id REAL del CRM es el uuid de `clientes.id`, que usa /clientes.
+    id: i + 1,
+    clientId: "", // el aislamiento lo impone RLS; el cliente no lo usa
+    name: row.nombre,
+    email: row.email ?? "",
+    phone: row.telefono ?? "",
+    orders: Number(row.compras_historicas ?? 0),
+    totalSpent: Number(row.total_gastado ?? 0),
+    tier: row.segmento ?? "Bronce",
+  }));
 }
 
 // ── Métricas de rentabilidad (margen real + rotación) ────────────────────────

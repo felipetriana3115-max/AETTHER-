@@ -20,18 +20,29 @@ import {
   fetchTotalVentasEmpresa,
   fetchMetricasRentabilidad,
   fetchComprasEmpresa,
+  fetchClientesEmpresa,
   insertCompras,
+  upsertProductosImportados,
+  importarClientes,
+  importarVentas,
   METRICAS_VACIAS,
   type MetricasRentabilidad,
 } from "../lib/resumen";
 
-/** Fila de inventario importada desde Excel/CSV, sin id (lo asigna el proveedor). */
+/** Fila de inventario importada desde Excel/CSV, sin id (lo asigna la base de datos). */
 export type NewInventoryItem = {
   name: string;
   category: string;
   stock: number;
   price: number;
   minStock?: number;
+  /**
+   * Código/SKU del archivo, si la hoja trae esa columna. Es la clave natural con
+   * la que el upsert empareja la referencia contra el catálogo
+   * (`productos.codigo_barras`). Si falta, el servidor deriva uno determinista a
+   * partir del nombre para que una re-importación actualice en vez de duplicar.
+   */
+  sku?: string;
 };
 
 /** Fila de cliente importada desde Excel/CSV, sin id (lo asigna el proveedor). */
@@ -100,15 +111,15 @@ type DashboardContextValue = {
   // Identidad de la empresa (configurable por el usuario)
   businessName: string;
   setBusinessName: (name: string) => void;
-  // Inventario
+  // Inventario (persistido en Supabase; refresca el estado tras cada upsert)
   inventory: InventoryItem[];
-  addInventoryItems: (rows: NewInventoryItem[]) => number;
-  // CRM / Clientes
+  addInventoryItems: (rows: NewInventoryItem[]) => Promise<number>;
+  // CRM / Clientes (persistido en `public.clientes`, el mismo CRM de /clientes)
   customers: Customer[];
-  addCustomers: (rows: NewCustomer[]) => number;
-  // Ventas
+  addCustomers: (rows: NewCustomer[]) => Promise<number>;
+  // Ventas (persistidas en `public.ventas`, con fecha/canal/estado del archivo)
   sales: Sale[];
-  addSales: (rows: NewSale[]) => number;
+  addSales: (rows: NewSale[]) => Promise<number>;
   monthlyRevenue: MonthPoint[];
   salesTotal: number;
   // Rentabilidad (margen real + rotación, calculados en el servidor)
@@ -158,14 +169,12 @@ function tenantKey(base: string): string | null {
 /** Nombre por defecto cuando el usuario aún no ha configurado el suyo. */
 const DEFAULT_BUSINESS_NAME = "Mi Empresa";
 
-/**
- * Identificador del inquilino (cliente) actual. Base de la arquitectura
- * multi-inquilino: por ahora es un valor fijo, pero es el ÚNICO punto donde el
- * proveedor obtiene el `clientId` que estampa en cada registro creado.
- * TODO(multi-tenant): reemplazar por el clientId del contexto de autenticación
- * del usuario actual cuando exista la sesión.
- */
-const CURRENT_CLIENT_ID = "default";
+// NOTA: aquí vivía `CURRENT_CLIENT_ID = "default"`, el tenant de pega que el
+// proveedor estampaba en las filas creadas en memoria. Ya no existe ningún
+// registro creado en el cliente: inventario, clientes, ventas y compras se
+// escriben en Supabase y el `empresa_id` lo pone el servidor vía `mi_empresa()`.
+// El `clientId` de los tipos en memoria queda vacío porque el aislamiento real
+// lo impone RLS, no un campo del frontend.
 
 export function DashboardProvider({ children }: { children: ReactNode }) {
   // Nombre de la empresa: configurable y persistente. Arranca con el valor por
@@ -288,12 +297,13 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
         resetTenantState(empresaId);
       }
 
-      const [ventas, productos, total, mets, compras] = await Promise.all([
+      const [ventas, productos, total, mets, compras, clientes] = await Promise.all([
         fetchVentasEmpresa(),
         fetchProductosEmpresa(),
         fetchTotalVentasEmpresa(),
         fetchMetricasRentabilidad(),
         fetchComprasEmpresa(),
+        fetchClientesEmpresa(),
       ]);
       // La empresa pudo cambiar mientras viajaban las consultas: si ya no
       // corresponde a la que resolvimos, descartamos esta respuesta (evita pintar
@@ -308,7 +318,13 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
       setSalesTotal(total);
       setMetricas(mets);
       setPurchases(compras);
-      setImported(ventas.length > 0 || productos.length > 0 || compras.length > 0);
+      setCustomers(clientes);
+      setImported(
+        ventas.length > 0 ||
+          productos.length > 0 ||
+          compras.length > 0 ||
+          clientes.length > 0,
+      );
     };
 
     // 1) Intento inicial: si la sesión YA está hidratada, cargamos de una.
@@ -363,57 +379,76 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
   }, []);
 
   // ── Inventario ─────────────────────────────────────────────────────────────
-  const addInventoryItems = useCallback((rows: NewInventoryItem[]) => {
+  // El inventario importado se PERSISTE en Supabase (`public.productos`, aislada
+  // por RLS y con el `empresa_id` estampado por el servidor), no solo en memoria:
+  // por eso sobrevive a las recargas y a los cambios de módulo. Antes esto solo
+  // hacía `setInventory(...)` con ids y SKUs inventados en el cliente, así que la
+  // siguiente lectura del servidor (ver el efecto `cargar` de arriba) reemplazaba
+  // el estado y las referencias importadas desaparecían.
+  //
+  // Tras el upsert se RELEE el catálogo: el estado queda con la verdad de la BD
+  // (ids reales, SKUs reales, filas fusionadas con las que ya existían).
+  const addInventoryItems = useCallback(async (rows: NewInventoryItem[]): Promise<number> => {
     if (rows.length === 0) return 0;
-    setInventory((prev) => {
-      let nextId = prev.reduce((max, i) => Math.max(max, i.id), 0);
-      const mapped: InventoryItem[] = rows.map((r) => {
-        const id = ++nextId;
-        return {
-          id,
-          clientId: CURRENT_CLIENT_ID,
-          sku: `IMP-${String(id).padStart(4, "0")}`,
-          name: r.name,
-          category: r.category,
-          stock: r.stock,
-          minStock: r.minStock ?? 10,
-          price: r.price,
-        };
-      });
-      return [...mapped, ...prev];
-    });
-    return rows.length;
+
+    const res = await upsertProductosImportados(rows);
+    if (res.error) {
+      // Se propaga para que el importador muestre el fallo en vez de un toast de
+      // éxito mentiroso.
+      throw new Error(res.error);
+    }
+
+    const productos = await fetchProductosEmpresa();
+    setInventory(productos);
+    setImported((prev) => prev || productos.length > 0);
+
+    // Las métricas de rentabilidad dependen del inventario (valor a costo y
+    // rotación), así que se refrescan con la misma verdad del servidor.
+    fetchMetricasRentabilidad().then(setMetricas);
+
+    return res.insertados + res.actualizados;
   }, []);
 
   // ── Clientes ─────────────────────────────────────────────────────────────
-  const addCustomers = useCallback((rows: NewCustomer[]) => {
+  // Los clientes importados se PERSISTEN en `public.clientes` (el mismo CRM que
+  // lee /clientes), no solo en memoria. La RPC empareja por email —o por nombre
+  // si el archivo no trae email— y actualiza en vez de duplicar.
+  const addCustomers = useCallback(async (rows: NewCustomer[]): Promise<number> => {
     if (rows.length === 0) return 0;
-    setCustomers((prev) => {
-      let nextId = prev.reduce((max, c) => Math.max(max, c.id), 0);
-      const mapped: Customer[] = rows.map((r) => ({ id: ++nextId, clientId: CURRENT_CLIENT_ID, ...r }));
-      return [...prev, ...mapped];
-    });
-    return rows.length;
+
+    const res = await importarClientes(rows);
+    if (res.error) throw new Error(res.error);
+
+    const directorio = await fetchClientesEmpresa();
+    setCustomers(directorio);
+    setImported((prev) => prev || directorio.length > 0);
+
+    return res.insertados + res.actualizados;
   }, []);
 
   // ── Ventas ─────────────────────────────────────────────────────────────
-  const addSales = useCallback((rows: NewSale[]) => {
+  // El histórico importado se PERSISTE en `public.ventas` con su fecha, canal,
+  // comprador y estado reales. Tras guardarlo se relee del servidor junto con el
+  // total exacto (RPC) y las métricas, que dependen de las ventas.
+  const addSales = useCallback(async (rows: NewSale[]): Promise<number> => {
     if (rows.length === 0) return 0;
-    setSales((prev) => {
-      let seq = prev.length;
-      const mapped: Sale[] = rows.map((r) => ({
-        id: r.id && r.id.trim() ? r.id.trim() : `TX-${String(++seq).padStart(5, "0")}`,
-        clientId: CURRENT_CLIENT_ID,
-        customer: r.customer,
-        channel: r.channel,
-        method: r.method,
-        amount: r.amount,
-        status: r.status,
-        date: r.date,
-      }));
-      return [...mapped, ...prev];
-    });
-    return rows.length;
+
+    const res = await importarVentas(rows);
+    if (res.error) throw new Error(res.error);
+
+    const [ventas, total, mets] = await Promise.all([
+      fetchVentasEmpresa(),
+      fetchTotalVentasEmpresa(),
+      fetchMetricasRentabilidad(),
+    ]);
+    setSales(ventas);
+    setSalesTotal(total);
+    setMetricas(mets);
+    setImported((prev) => prev || ventas.length > 0);
+
+    // `actualizados` aquí son las ventas OMITIDAS por ya estar importadas: se
+    // cuentan como procesadas para que una re-importación no reporte 0.
+    return res.insertados + res.actualizados;
   }, []);
 
   // ── Compras ─────────────────────────────────────────────────────────────
@@ -433,14 +468,20 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
     return insertadas;
   }, []);
 
-  /** Inyecta en los cuatro módulos lo que traiga el lote importado. Las compras
-   *  se PERSISTEN en Supabase (addPurchases es asíncrono), por eso el resultado
-   *  también lo es: el importador espera a que la BD confirme antes del toast. */
+  /** Inyecta en los cuatro módulos lo que traiga el lote importado. LOS CUATRO se
+   *  PERSISTEN en Supabase antes de resolver, por eso el resultado es asíncrono:
+   *  el importador espera la confirmación de la BD antes del toast, y un fallo de
+   *  persistencia se propaga en vez de simular éxito.
+   *
+   *  El orden es deliberado: clientes ANTES que ventas, para que el histórico de
+   *  ventas de un archivo multi-hoja caiga sobre un CRM ya poblado. Cada módulo
+   *  es atómico por separado (una RPC por lote), no el conjunto: si falla el
+   *  tercero, los dos primeros ya quedaron guardados y el mensaje lo refleja. */
   const bulkImport = useCallback(
     async (bundle: ImportBundle): Promise<BulkImportResult> => {
-      const products = bundle.inventory?.length ? addInventoryItems(bundle.inventory) : 0;
-      const custs = bundle.customers?.length ? addCustomers(bundle.customers) : 0;
-      const sls = bundle.sales?.length ? addSales(bundle.sales) : 0;
+      const products = bundle.inventory?.length ? await addInventoryItems(bundle.inventory) : 0;
+      const custs = bundle.customers?.length ? await addCustomers(bundle.customers) : 0;
+      const sls = bundle.sales?.length ? await addSales(bundle.sales) : 0;
       const purch = bundle.purchases?.length ? await addPurchases(bundle.purchases) : 0;
       if (products || custs || sls || purch) setImported(true);
       return { customers: custs, products, sales: sls, purchases: purch };

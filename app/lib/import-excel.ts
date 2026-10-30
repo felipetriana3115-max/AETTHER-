@@ -289,11 +289,16 @@ function classifyAndMap(
     for (const r of body) {
       const name = text(r, iName);
       if (!name) continue;
+      // El SKU/código del archivo es la clave con la que el upsert empareja la
+      // referencia contra `productos.codigo_barras`. Si la hoja no lo trae, el
+      // servidor deriva uno determinista del nombre.
+      const sku = text(r, iSku);
       rows.push({
         name,
         category: text(r, iCategory) || "Sin categoría",
         stock: toInt(r[iStock]),
         price: toNumber(r[iPrice]),
+        ...(sku ? { sku } : {}),
         ...(iMin >= 0 ? { minStock: toInt(r[iMin]) } : {}),
       });
     }

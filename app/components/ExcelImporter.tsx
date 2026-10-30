@@ -72,7 +72,21 @@ export default function ExcelImporter() {
         return;
       }
 
-      const result = await bulkImport(report.bundle);
+      // La persistencia en Supabase puede fallar (RLS, usuario sin empresa,
+      // migración sin correr). Se muestra el motivo real en vez de un "éxito"
+      // que luego se evapora al recargar.
+      let result: BulkImportResult;
+      try {
+        result = await bulkImport(report.bundle);
+      } catch (err) {
+        console.error("[ExcelImporter] La importación no se pudo guardar:", err);
+        setStatus({
+          kind: "error",
+          message: err instanceof Error ? err.message : "No se pudo guardar la importación.",
+        });
+        return;
+      }
+
       setStatus({ kind: "success", fileName: file.name, result, unknown: report.unknownSheets });
       showToast("Importación exitosa", describe(result));
     },
@@ -114,7 +128,18 @@ export default function ExcelImporter() {
         return;
       }
 
-      const result = await bulkImport(report.bundle);
+      let result: BulkImportResult;
+      try {
+        result = await bulkImport(report.bundle);
+      } catch (err) {
+        console.error("[ExcelImporter] La carga masiva no se pudo guardar:", err);
+        setStatus({
+          kind: "error",
+          message: err instanceof Error ? err.message : "No se pudo guardar la carga masiva.",
+        });
+        return;
+      }
+
       setStatus({ kind: "bulkSuccess", files: names, result, unknown: report.unknownSheets });
       showToast("Procesamiento masivo exitoso", describe(result));
     },

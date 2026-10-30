@@ -78,12 +78,16 @@ export default function CashDrawerConfig({ settings, onPatch }: Props) {
       </div>
 
       <div className="space-y-4 border-t border-zinc-800 pt-5">
+        {/* El efectivo abre el cajón siempre (ver `pinCajonPara` en el POS): entra
+            dinero físico y el cajero necesita sacar el cambio. El interruptor se
+            deja a la vista, marcado y bloqueado, para que la pantalla no prometa
+            un ajuste que el POS ya no consulta. */}
         <ToggleRow
           label="Abrir al cobrar en efectivo"
-          description="Abre el cajón automáticamente cuando el método de pago es Efectivo."
-          checked={settings.autoOpenOnCash}
-          onChange={(v) => onPatch({ autoOpenOnCash: v })}
-          disabled={settings.trigger !== "printer"}
+          description="Siempre activo: un cobro en efectivo abre el cajón para guardar el billete y dar el cambio."
+          checked
+          onChange={() => {}}
+          disabled
         />
         <ToggleRow
           label="Abrir en cualquier método de pago"
