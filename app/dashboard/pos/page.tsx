@@ -64,7 +64,17 @@ type MetodoPago = "Efectivo" | "Nequi/Daviplata" | "Bold" | "Fiado";
 
 type Feedback = { tone: "error" | "ok"; msg: string } | null;
 
+/**
+ * Pago en efectivo capturado en el modal de cobro: lo que entrega el cliente y
+ * el cambio que hay que devolverle. Solo vive en el cliente (UI + tirilla):
+ * NO se envía a la cola ni a la RPC, la venta sigue registrándose igual.
+ */
+type PagoEfectivo = { recibido: number; devuelto: number };
+
 // ── Config de UI ─────────────────────────────────────────────────────────────
+
+/** Denominaciones habituales en Colombia para agilizar la caja táctil. */
+const MONTOS_RAPIDOS = [10000, 20000, 50000, 100000];
 
 const METODOS: { id: MetodoPago; label: string; sub: string; classes: string }[] = [
   {
@@ -103,13 +113,19 @@ type ImpresionFallida = {
  * en esta venta, o `null` si no debe abrirse. Depende SOLO de la configuración
  * local del equipo (`localStorage`), nunca del tenant.
  *
- * "Fiado" queda fuera aunque esté activo "cualquier método": no entra dinero a
- * la caja, así que no hay motivo para destrabar el cajón.
+ * EFECTIVO SIEMPRE ABRE: entra dinero físico y el cajero necesita el cajón para
+ * guardar el billete y sacar el cambio, así que el pulso va sí o sí, sin
+ * depender de los interruptores de Dispositivos. En un equipo sin cajón
+ * conectado el pulso es inocuo (la impresora simplemente lo ignora).
+ *
+ * Para el resto de métodos manda la configuración; "Fiado" queda fuera aunque
+ * esté activo "cualquier método": no entra dinero a la caja, así que no hay
+ * motivo para destrabar el cajón.
  */
 function pinCajonPara(metodo: MetodoPago, drawer: DrawerSettings): 0 | 1 | null {
+  if (metodo === "Efectivo") return drawer.pin;
   if (!drawer.enabled || drawer.trigger !== "printer" || metodo === "Fiado") return null;
-  if (drawer.autoOpenAllMethods) return drawer.pin;
-  return drawer.autoOpenOnCash && metodo === "Efectivo" ? drawer.pin : null;
+  return drawer.autoOpenAllMethods ? drawer.pin : null;
 }
 
 // Placeholder de imagen: iniciales del producto sobre un degradado.
@@ -157,6 +173,12 @@ export default function PosPage() {
   const [carrito, setCarrito] = useState<LineaCarrito[]>([]);
   const [feedback, setFeedback] = useState<Feedback>(null);
   const [cobrando, setCobrando] = useState(false);
+  // Modal de cobro en efectivo: abierto + monto recibido (solo dígitos).
+  const [efectivoAbierto, setEfectivoAbierto] = useState(false);
+  const [recibido, setRecibido] = useState("");
+  // Banner del cambio de la última venta en efectivo. Objeto nuevo en cada cobro
+  // para que el temporizador se reinicie aunque el devuelto sea el mismo monto.
+  const [devuelto, setDevuelto] = useState<{ monto: number } | null>(null);
   // Pulso del cajón en vuelo (el intento por WebUSB es asíncrono).
   const [abriendoCajon, setAbriendoCajon] = useState(false);
   // Línea seleccionada del carrito (para la tecla Delete). Guarda su `id`.
@@ -209,6 +231,14 @@ export default function PosPage() {
     const t = setTimeout(() => setFeedback(null), 3500);
     return () => clearTimeout(t);
   }, [feedback]);
+
+  // El banner del cambio dura más que el feedback: el cajero tiene que contar
+  // el devuelto con el carrito ya vacío.
+  useEffect(() => {
+    if (!devuelto) return;
+    const t = setTimeout(() => setDevuelto(null), 8000);
+    return () => clearTimeout(t);
+  }, [devuelto]);
 
   // Carga la identidad de la tirilla del tenant (una vez) para imprimirla en los
   // recibos. Best-effort: si falla, se imprime sin NIT/logo (degradación suave).
@@ -269,6 +299,11 @@ export default function PosPage() {
 
   const total = useMemo(() => carrito.reduce((s, l) => s + l.precio * l.qty, 0), [carrito]);
   const unidades = useMemo(() => carrito.reduce((s, l) => s + l.qty, 0), [carrito]);
+
+  // Monto tecleado (solo dígitos) y cambio en tiempo real.
+  const montoRecibido = useMemo(() => Number(recibido.replace(/\D/g, "")) || 0, [recibido]);
+  const cambio = montoRecibido - total;
+  const puedeCobrarEfectivo = carrito.length > 0 && total > 0 && montoRecibido >= total;
 
   // Clientes que casan con la búsqueda del selector (nombre / teléfono).
   const clientesFiltrados = useMemo(() => {
@@ -479,7 +514,7 @@ export default function PosPage() {
    *    única transacción atómica; el `clientUuid` evita duplicados en reintentos.
    */
   const cobrar = useCallback(
-    async (metodo: MetodoPago) => {
+    async (metodo: MetodoPago, efectivo?: PagoEfectivo) => {
       if (carrito.length === 0) {
         setFeedback({ tone: "error", msg: "El carrito está vacío." });
         return;
@@ -545,7 +580,17 @@ export default function PosPage() {
           fecha: new Date().toLocaleString("es-CO", { dateStyle: "short", timeStyle: "short" }),
           items: carrito.map((l) => ({ nombre: l.nombre, qty: l.qty, precio: l.precio })),
           total,
-          pagos: [{ metodo: nombreFiado ? `Fiado · ${nombreFiado}` : metodo, monto: total }],
+          // `pagos` es un desglose libre de líneas: aprovechamos las dos extra
+          // para imprimir recibido/cambio sin tocar el formato de la tirilla.
+          pagos: [
+            { metodo: nombreFiado ? `Fiado · ${nombreFiado}` : metodo, monto: total },
+            ...(efectivo
+              ? [
+                  { metodo: "Recibido", monto: efectivo.recibido },
+                  { metodo: "Cambio", monto: efectivo.devuelto },
+                ]
+              : []),
+          ],
         };
         setUltimaVenta(recibo);
 
@@ -564,7 +609,9 @@ export default function PosPage() {
 
         const okMsg = esFiado
           ? `Fiado a ${nombreFiado}: ${formatCOP(total)} cargado a su cuenta.`
-          : `Venta cobrada con ${metodo}: ${formatCOP(total)}.`;
+          : efectivo
+            ? `Venta cobrada con Efectivo: ${formatCOP(total)} · Devuelto ${formatCOP(efectivo.devuelto)}.`
+            : `Venta cobrada con ${metodo}: ${formatCOP(total)}.`;
 
         setCarrito([]);
         // Soltamos el cliente tras fiar para no cargarle sin querer la próxima venta.
@@ -620,6 +667,46 @@ export default function PosPage() {
     },
     [carrito, total, businessName, online, sincronizar, refresh, clienteSel, imprimirTirilla],
   );
+
+  // ── Cobro en efectivo (modal con cálculo de cambio) ──────────────────────────
+
+  /** El botón verde ya no cobra: abre el modal para capturar el monto recibido. */
+  const abrirEfectivo = useCallback(() => {
+    if (carrito.length === 0) {
+      setFeedback({ tone: "error", msg: "El carrito está vacío." });
+      return;
+    }
+    setRecibido("");
+    setEfectivoAbierto(true);
+  }, [carrito.length]);
+
+  const cerrarEfectivo = useCallback(() => {
+    setEfectivoAbierto(false);
+    setRecibido("");
+    inputRef.current?.focus();
+  }, []);
+
+  /** Teclado numérico táctil: dígitos, "00", borrar y limpiar. */
+  const teclearMonto = useCallback((tecla: string) => {
+    setRecibido((prev) => {
+      if (tecla === "back") return prev.slice(0, -1);
+      if (tecla === "clear") return "";
+      return (prev + tecla).replace(/^0+(?=\d)/, "").slice(0, 9);
+    });
+  }, []);
+
+  /**
+   * Confirma el cobro: cierra el modal, deja el banner del devuelto visible y
+   * delega en `cobrar` (misma ruta de siempre: cola local → cajón → tirilla).
+   */
+  const confirmarEfectivo = useCallback(() => {
+    if (cobrando || !puedeCobrarEfectivo) return;
+    const pago: PagoEfectivo = { recibido: montoRecibido, devuelto: montoRecibido - total };
+    setEfectivoAbierto(false);
+    setRecibido("");
+    setDevuelto({ monto: pago.devuelto });
+    void cobrar("Efectivo", pago);
+  }, [cobrando, puedeCobrarEfectivo, montoRecibido, total, cobrar]);
 
   /**
    * Sincronización MANUAL (botón de la barra de estado). A diferencia del auto-sync
@@ -729,6 +816,24 @@ export default function PosPage() {
 
   return (
     <PageShell title="Punto de Venta" subtitle="Caja rápida · Escanea, cobra y descuenta inventario">
+      {/* ── Banner del cambio ──
+          Se pinta al confirmar el cobro y sobrevive al vaciado del carrito para
+          que el cajero cuente el devuelto con calma. */}
+      {devuelto && (
+        <div
+          role="status"
+          className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-emerald-500/40 bg-emerald-500/15 px-5 py-4"
+        >
+          <span className="flex items-center gap-2.5 text-sm font-semibold text-emerald-200">
+            <span className="text-xl" aria-hidden>💵</span>
+            Venta cobrada en efectivo · Cambio/Devuelto a entregar
+          </span>
+          <span className="text-3xl font-bold tabular-nums text-emerald-300">
+            {formatCOP(devuelto.monto)}
+          </span>
+        </div>
+      )}
+
       {feedback && (
         <div
           role="alert"
@@ -1042,7 +1147,7 @@ export default function PosPage() {
                   key={m.id}
                   type="button"
                   disabled={cobrando || carrito.length === 0}
-                  onClick={() => cobrar(m.id)}
+                  onClick={() => (m.id === "Efectivo" ? abrirEfectivo() : cobrar(m.id))}
                   className={`flex h-16 w-full items-center justify-between rounded-xl bg-gradient-to-r px-4 text-left text-white shadow-lg transition-all active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40 ${m.classes}`}
                 >
                   <span>
@@ -1185,6 +1290,144 @@ export default function PosPage() {
               </div>
             </form>
           </div>
+        </div>
+      )}
+
+      {/* ── Modal: Cobro en efectivo (monto recibido + cambio) ──
+          El botón verde abre esto en vez de cobrar directo. Al confirmar se
+          llama a `cobrar("Efectivo", …)`, que es la ruta de venta de siempre
+          (cola local → cajón → tirilla); aquí solo calculamos el devuelto. */}
+      {efectivoAbierto && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="efectivo-titulo"
+          onClick={cerrarEfectivo}
+        >
+          <form
+            className="w-full max-w-sm rounded-2xl border border-emerald-500/30 bg-zinc-900 p-5 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+            onSubmit={(e) => {
+              e.preventDefault();
+              confirmarEfectivo();
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") cerrarEfectivo();
+            }}
+          >
+            <div className="flex items-baseline justify-between gap-3">
+              <h3 id="efectivo-titulo" className="text-base font-semibold text-zinc-100">
+                Cobro en efectivo
+              </h3>
+              <span className="text-xs text-zinc-500">
+                {unidades} und · {carrito.length} ítem{carrito.length === 1 ? "" : "s"}
+              </span>
+            </div>
+
+            {/* Total a cobrar */}
+            <div className="mt-3 flex items-baseline justify-between rounded-xl border border-zinc-800 bg-zinc-950 px-4 py-3">
+              <span className="text-sm text-zinc-400">Total</span>
+              <span className="text-2xl font-bold tabular-nums text-zinc-50">{formatCOP(total)}</span>
+            </div>
+
+            {/* Monto recibido */}
+            <label htmlFor="efectivo-recibido" className="mt-4 mb-1.5 block text-xs font-medium text-zinc-400">
+              Monto recibido
+            </label>
+            <input
+              id="efectivo-recibido"
+              autoFocus
+              inputMode="numeric"
+              value={recibido ? formatCOP(montoRecibido) : ""}
+              onChange={(e) => setRecibido(e.target.value.replace(/\D/g, "").slice(0, 9))}
+              placeholder="$ 0"
+              className="w-full rounded-xl border border-zinc-800 bg-zinc-950 px-4 py-3 text-right text-3xl font-bold tabular-nums text-emerald-300 placeholder:text-zinc-600 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+            />
+
+            {/* Montos rápidos + importe exacto */}
+            <div className="mt-2.5 grid grid-cols-5 gap-2">
+              {MONTOS_RAPIDOS.map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => setRecibido(String(m))}
+                  className="h-12 rounded-lg border border-emerald-500/30 bg-emerald-500/10 text-sm font-semibold text-emerald-200 transition-colors hover:bg-emerald-500/20 active:scale-95"
+                >
+                  ${m / 1000}k
+                </button>
+              ))}
+              <button
+                type="button"
+                onClick={() => setRecibido(String(total))}
+                title="El cliente paga el importe exacto"
+                className="h-12 rounded-lg border border-zinc-700 text-xs font-semibold text-zinc-300 transition-colors hover:bg-zinc-800 active:scale-95"
+              >
+                Exacto
+              </button>
+            </div>
+
+            {/* Teclado numérico táctil */}
+            <div className="mt-2.5 grid grid-cols-3 gap-2">
+              {["1", "2", "3", "4", "5", "6", "7", "8", "9", "00", "0"].map((t) => (
+                <button
+                  key={t}
+                  type="button"
+                  onClick={() => teclearMonto(t)}
+                  className="h-14 rounded-lg border border-zinc-800 bg-zinc-950 text-xl font-semibold text-zinc-100 transition-colors hover:bg-zinc-800 active:scale-95"
+                >
+                  {t}
+                </button>
+              ))}
+              <button
+                type="button"
+                onClick={() => teclearMonto("back")}
+                onDoubleClick={() => teclearMonto("clear")}
+                aria-label="Borrar último dígito"
+                title="Borrar (doble toque: limpiar)"
+                className="h-14 rounded-lg border border-zinc-800 bg-zinc-950 text-xl text-zinc-300 transition-colors hover:bg-red-500/10 hover:text-red-400 active:scale-95"
+              >
+                ⌫
+              </button>
+            </div>
+
+            {/* Cambio en tiempo real */}
+            <div
+              className={`mt-3 flex items-baseline justify-between rounded-xl border px-4 py-3 ${
+                puedeCobrarEfectivo
+                  ? "border-emerald-500/40 bg-emerald-500/10"
+                  : "border-amber-500/30 bg-amber-500/10"
+              }`}
+            >
+              <span className={`text-sm font-medium ${puedeCobrarEfectivo ? "text-emerald-300" : "text-amber-300"}`}>
+                {puedeCobrarEfectivo ? "Cambio / Devuelto" : "Faltan"}
+              </span>
+              <span
+                className={`text-2xl font-bold tabular-nums ${
+                  puedeCobrarEfectivo ? "text-emerald-300" : "text-amber-300"
+                }`}
+              >
+                {formatCOP(puedeCobrarEfectivo ? cambio : Math.max(0, -cambio))}
+              </span>
+            </div>
+
+            <div className="mt-4 flex gap-2.5">
+              <button
+                type="button"
+                onClick={cerrarEfectivo}
+                className="h-14 flex-1 rounded-xl border border-zinc-700 text-sm font-medium text-zinc-300 transition-colors hover:bg-zinc-800"
+              >
+                Cancelar
+              </button>
+              <button
+                type="submit"
+                disabled={!puedeCobrarEfectivo || cobrando}
+                className="h-14 flex-[1.4] rounded-xl bg-gradient-to-r from-emerald-500 to-green-600 text-base font-semibold text-white shadow-lg shadow-emerald-500/30 transition-all active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                {cobrando ? "Cobrando…" : "Cobrar"}
+              </button>
+            </div>
+          </form>
         </div>
       )}
 
