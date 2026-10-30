@@ -1,14 +1,34 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import dynamic from "next/dynamic";
 import { supabase, getEmpresaIdActiva } from "../lib/auth";
 import { ACCEPT_IMAGEN, subirImagenProducto, validarImagen } from "../lib/productos";
+import { soportaCamara } from "../lib/barcode-camera";
+import { findByBarcode } from "../lib/offline/catalog";
+
+/**
+ * El lector por cámara arrastra el decodificador ZXing (~300 KB), así que se
+ * carga SOLO cuando el usuario pulsa el botón. `ssr: false` porque el componente
+ * toca `navigator.mediaDevices` nada más montarse, y eso no existe en el
+ * servidor.
+ */
+const CameraScanner = dynamic(() => import("./CameraScanner"), { ssr: false });
 
 /**
  * Alta/edición de productos (inspirado en Eleventa).
  *
  * Fuente de verdad: tabla `public.productos` en Supabase. El aislamiento por
  * empresa lo impone RLS (`empresa_id = public.mi_empresa()`).
+ *
+ * ALTA RÁPIDA POR CÓDIGO DE BARRAS — hay dos caminos y ambos terminan en el
+ * MISMO `guardar()` de abajo, así que el `empresa_id` explícito y las políticas
+ * valen igual se teclee el código o se escanee:
+ *  - Escritorio con lector USB: el lector es un teclado (modo HID), escribe el
+ *    código en el input y cierra con Enter. Capturamos ese Enter para que NO
+ *    envíe el formulario a medio llenar y lo usamos para saltar al campo
+ *    siguiente.
+ *  - Móvil/tablet: botón 📷 que abre <CameraScanner> y rellena el campo.
  *
  * En el ALTA enviamos `empresa_id` EXPLÍCITO (resuelto por `getEmpresaIdActiva()`)
  * en vez de confiar en el DEFAULT del servidor: así el payload deja de depender
@@ -87,7 +107,16 @@ const TIPOS: { id: TipoProducto; label: string }[] = [
 /** Clase reutilizable para inputs/selects (CSS simple, tema oscuro del proyecto). */
 const INPUT =
   "w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2.5 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-violet-500 focus:outline-none focus:ring-1 focus:ring-violet-500";
+
 const LABEL = "mb-1.5 block text-xs font-medium text-zinc-400";
+
+/**
+ * `subscribe` vacío para `useSyncExternalStore`: el soporte de cámara del
+ * navegador no cambia en caliente, así que no hay nada a lo que suscribirse.
+ * Vive fuera del componente para que su identidad sea estable entre renders (si
+ * no, React resuscribiría en cada uno).
+ */
+const SIN_SUSCRIPCION = () => () => {};
 
 /** Convierte una fila de la BD al estado del formulario (números → string). */
 function toFormState(p?: Producto): FormState {
@@ -130,6 +159,31 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
   const [previewLocal, setPreviewLocal] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
+  // ── Alta rápida por código de barras ──────────────────────────────────────
+  const [escanerAbierto, setEscanerAbierto] = useState(false);
+  // Aviso (no bloqueante) de que ese código ya está en el catálogo de la
+  // empresa. Evita llegar al INSERT y chocar contra el único (error 23505).
+  const [avisoCodigo, setAvisoCodigo] = useState<string | null>(null);
+  const descripcionRef = useRef<HTMLInputElement>(null);
+  const codigoRef = useRef<HTMLInputElement>(null);
+  const precioVentaRef = useRef<HTMLInputElement>(null);
+  // Token de la última comprobación de duplicado: si el usuario escanea otro
+  // código antes de que vuelva la anterior, descartamos la respuesta vieja.
+  const chequeoRef = useRef(0);
+
+  /**
+   * ¿Mostramos el botón de cámara? Es una capacidad del NAVEGADOR, así que en el
+   * servidor no se puede saber. `useSyncExternalStore` es la forma de leerla sin
+   * romper la hidratación: el render del servidor usa `false` (sin botón) y el
+   * cliente lo recalcula al montar. Un `useState` + `useEffect` daría el mismo
+   * resultado visible pero con un render extra en cascada.
+   */
+  const camaraDisponible = useSyncExternalStore(
+    SIN_SUSCRIPCION, // la capacidad no cambia mientras la página está abierta
+    soportaCamara,
+    () => false,
+  );
+
   // Si cambia el producto (p. ej. el padre reusa el form para editar otro),
   // resincronizamos el estado con esa fila.
   useEffect(() => {
@@ -137,6 +191,8 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
     setVentaManual(producto != null);
     setImagenFile(null);
     setImagenUrl(producto?.imagen_url ?? null);
+    setAvisoCodigo(null);
+    chequeoRef.current++; // invalida una comprobación de duplicado en vuelo
     if (fileRef.current) fileRef.current.value = "";
   }, [producto]);
 
@@ -191,9 +247,81 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
     (campo: keyof FormState) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>) => {
       const value = e.target.value;
       if (campo === "precio_venta") setVentaManual(true);
+      // El aviso de "código ya usado" se refiere al valor anterior: al teclear
+      // otro deja de aplicar y lo retiramos en vez de dejarlo mintiendo.
+      if (campo === "codigo_barras") setAvisoCodigo(null);
       setForm((f) => ({ ...f, [campo]: value }));
     },
     [],
+  );
+
+  /**
+   * Punto único por el que entra un código de barras capturado, venga del lector
+   * USB (Enter) o de la cámara. Rellena el campo, avisa si ese código ya existe
+   * en la empresa y manda el foco al siguiente dato que falta, para que el alta
+   * continúe sin tocar el ratón.
+   *
+   * La comprobación de duplicado usa `findByBarcode`, el mismo helper del POS:
+   * filtra por la empresa de la sesión y cae al espejo local sin red, así que no
+   * duplicamos consulta ni nos saltamos el aislamiento por tenant.
+   */
+  const aplicarCodigo = useCallback(
+    (codigoCrudo: string) => {
+      const codigo = codigoCrudo.trim();
+      if (!codigo) return;
+
+      setForm((f) => ({ ...f, codigo_barras: codigo }));
+      setAvisoCodigo(null);
+
+      // Enfocamos lo que de verdad falta: en un alta recién escaneada eso es la
+      // descripción; si ya está escrita (p. ej. se re-escanea para corregir el
+      // código), el siguiente dato útil es el precio de venta.
+      const siguiente = form.descripcion.trim() ? precioVentaRef.current : descripcionRef.current;
+      siguiente?.focus();
+      siguiente?.select();
+
+      const token = ++chequeoRef.current;
+      void (async () => {
+        try {
+          const existente = await findByBarcode(codigo);
+          if (token !== chequeoRef.current) return; // llegó otro escaneo después
+          // En edición, encontrarse a sí mismo no es un duplicado.
+          if (!existente || (editando && Number(existente.id) === producto!.id)) return;
+          setAvisoCodigo(
+            `Ya existe "${existente.nombre}" con este código. Si lo guardas así, ` +
+              "el sistema lo rechazará: edita ese producto o usa otro código.",
+          );
+        } catch (e) {
+          // El aviso es una cortesía; si la consulta falla seguimos y será el
+          // INSERT quien reporte el duplicado (23505).
+          console.warn("[ProductForm] No se pudo verificar el código escaneado:", e);
+        }
+      })();
+    },
+    [form.descripcion, editando, producto],
+  );
+
+  /**
+   * Enter dentro del campo de código: un lector USB en modo HID lo envía al
+   * final de cada lectura. Sin esto, ese Enter enviaría el formulario con el
+   * resto de campos vacíos; aquí lo convertimos en "siguiente campo".
+   */
+  const onCodigoKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLInputElement>) => {
+      if (e.key !== "Enter") return;
+      e.preventDefault();
+      aplicarCodigo(e.currentTarget.value);
+    },
+    [aplicarCodigo],
+  );
+
+  /** Código leído por la cámara: lo aplicamos y cerramos el visor. */
+  const onCodigoEscaneado = useCallback(
+    (codigo: string) => {
+      aplicarCodigo(codigo);
+      setEscanerAbierto(false);
+    },
+    [aplicarCodigo],
   );
 
   // Selección de imagen: validamos tipo/tamaño en el navegador antes de gastar
@@ -316,11 +444,15 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
         }
 
         onSaved?.(data as Producto);
+        setAvisoCodigo(null);
         if (!editando) {
           setForm(toFormState()); // limpia para cargar el siguiente
           setImagenFile(null);
           setImagenUrl(null);
           if (fileRef.current) fileRef.current.value = "";
+          // Alta en cadena: dejamos el cursor en el código, listo para escanear
+          // el siguiente producto sin tocar el ratón.
+          codigoRef.current?.focus();
         } else {
           // Tras editar, la URL subida pasa a ser la "actual" de la fila.
           setImagenFile(null);
@@ -335,277 +467,315 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
   );
 
   return (
-    <form onSubmit={guardar} className="space-y-4">
-      {error && (
-        <div
-          role="alert"
-          className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2.5 text-sm text-red-300"
-        >
-          {error}
-        </div>
-      )}
+    <>
+      <form onSubmit={guardar} className="space-y-4">
+        {error && (
+          <div
+            role="alert"
+            className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2.5 text-sm text-red-300"
+          >
+            {error}
+          </div>
+        )}
 
-      {/* Descripción + código de barras */}
-      <div>
-        <label htmlFor="pf-descripcion" className={LABEL}>
-          Descripción *
-        </label>
-        <input
-          id="pf-descripcion"
-          value={form.descripcion}
-          onChange={set("descripcion")}
-          placeholder="Ej. Coca-Cola 400ml"
-          className={INPUT}
-          autoFocus
-        />
-      </div>
-
-      <div className="grid grid-cols-2 gap-3">
+        {/* Descripción + código de barras */}
         <div>
-          <label htmlFor="pf-codigo" className={LABEL}>
-            Código de barras
+          <label htmlFor="pf-descripcion" className={LABEL}>
+            Descripción *
           </label>
           <input
-            id="pf-codigo"
-            inputMode="numeric"
-            value={form.codigo_barras}
-            onChange={set("codigo_barras")}
-            placeholder="7702001234567"
+            id="pf-descripcion"
+            ref={descripcionRef}
+            value={form.descripcion}
+            onChange={set("descripcion")}
+            placeholder="Ej. Coca-Cola 400ml"
             className={INPUT}
+            autoFocus
           />
         </div>
+
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label htmlFor="pf-codigo" className={LABEL}>
+              Código de barras
+            </label>
+            {/* El input acepta las tres vías: tecleado, lector USB (escribe y
+                cierra con Enter) y cámara (botón 📷). Todas acaban en
+                `aplicarCodigo`. */}
+            <div className="flex gap-2">
+              <input
+                id="pf-codigo"
+                ref={codigoRef}
+                inputMode="numeric"
+                value={form.codigo_barras}
+                onChange={set("codigo_barras")}
+                onKeyDown={onCodigoKeyDown}
+                placeholder="Escanea o escribe…"
+                className={`${INPUT} min-w-0 flex-1`}
+              />
+              {camaraDisponible && (
+                <button
+                  type="button"
+                  onClick={() => setEscanerAbierto(true)}
+                  title="Escanear con la cámara"
+                  aria-label="Escanear el código de barras con la cámara"
+                  className="flex w-11 shrink-0 items-center justify-center rounded-lg border border-violet-500/40 bg-violet-500/10 text-lg text-violet-300 transition-colors hover:bg-violet-500/20 active:scale-[0.97]"
+                >
+                  📷
+                </button>
+              )}
+            </div>
+          </div>
+          <div>
+            <label htmlFor="pf-tipo" className={LABEL}>
+              Tipo
+            </label>
+            <select id="pf-tipo" value={form.tipo} onChange={set("tipo")} className={INPUT}>
+              {TIPOS.map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.label}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        {/* Aviso NO bloqueante: el código ya pertenece a otro producto de la
+            empresa. Se avisa aquí porque el INSERT lo rechazaría (23505) y a esas
+            alturas ya se habría rellenado todo el formulario. */}
+        {avisoCodigo && (
+          <p className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+            {avisoCodigo}
+          </p>
+        )}
+
+        {/* Departamento */}
         <div>
-          <label htmlFor="pf-tipo" className={LABEL}>
-            Tipo
+          <label htmlFor="pf-departamento" className={LABEL}>
+            Departamento
           </label>
-          <select id="pf-tipo" value={form.tipo} onChange={set("tipo")} className={INPUT}>
-            {TIPOS.map((t) => (
-              <option key={t.id} value={t.id}>
-                {t.label}
+          <select
+            id="pf-departamento"
+            value={form.departamento_id}
+            onChange={set("departamento_id")}
+            className={INPUT}
+          >
+            <option value="">— Sin departamento —</option>
+            {departamentos.map((d) => (
+              <option key={d.id} value={d.id}>
+                {d.nombre}
               </option>
             ))}
           </select>
         </div>
-      </div>
 
-      {/* Departamento */}
-      <div>
-        <label htmlFor="pf-departamento" className={LABEL}>
-          Departamento
-        </label>
-        <select
-          id="pf-departamento"
-          value={form.departamento_id}
-          onChange={set("departamento_id")}
-          className={INPUT}
-        >
-          <option value="">— Sin departamento —</option>
-          {departamentos.map((d) => (
-            <option key={d.id} value={d.id}>
-              {d.nombre}
-            </option>
-          ))}
-        </select>
-      </div>
-
-      {/* Precios */}
-      <div className="grid grid-cols-3 gap-3">
-        <div>
-          <label htmlFor="pf-costo" className={LABEL}>
-            Precio costo
-          </label>
-          <input
-            id="pf-costo"
-            inputMode="decimal"
-            value={form.precio_costo}
-            onChange={set("precio_costo")}
-            placeholder="0"
-            className={INPUT}
-          />
-        </div>
-        <div>
-          <label htmlFor="pf-margen" className={LABEL}>
-            Margen %
-          </label>
-          <input
-            id="pf-margen"
-            inputMode="decimal"
-            value={form.margen_ganancia}
-            onChange={set("margen_ganancia")}
-            placeholder="0"
-            className={INPUT}
-          />
-        </div>
-        <div>
-          <label htmlFor="pf-venta" className={LABEL}>
-            Precio venta *
-          </label>
-          <input
-            id="pf-venta"
-            inputMode="decimal"
-            value={form.precio_venta}
-            onChange={set("precio_venta")}
-            placeholder="0"
-            className={INPUT}
-          />
-        </div>
-      </div>
-
-      {/* Ayuda: sugerencia de venta cuando aún no la editaron a mano */}
-      {ventaSugerida != null && ventaManual && Number(form.precio_venta) !== ventaSugerida && (
-        <button
-          type="button"
-          onClick={() => {
-            setVentaManual(false);
-            setForm((f) => ({ ...f, precio_venta: String(ventaSugerida) }));
-          }}
-          className="text-xs text-violet-400 hover:text-violet-300"
-        >
-          Usar precio sugerido por margen: {ventaSugerida}
-        </button>
-      )}
-
-      <div className="grid grid-cols-2 gap-3">
-        <div>
-          <label htmlFor="pf-mayoreo" className={LABEL}>
-            Precio mayoreo
-          </label>
-          <input
-            id="pf-mayoreo"
-            inputMode="decimal"
-            value={form.precio_mayoreo}
-            onChange={set("precio_mayoreo")}
-            placeholder="Opcional"
-            className={INPUT}
-          />
-        </div>
-        <div>
-          <label htmlFor="pf-stock" className={LABEL}>
-            Stock actual
-          </label>
-          <input
-            id="pf-stock"
-            inputMode="decimal"
-            value={form.stock_actual}
-            onChange={set("stock_actual")}
-            placeholder="0"
-            className={INPUT}
-          />
-        </div>
-      </div>
-
-      {/* Stock mínimo / máximo (para alertas de reposición) */}
-      <div className="grid grid-cols-2 gap-3">
-        <div>
-          <label htmlFor="pf-stock-min" className={LABEL}>
-            Stock mínimo
-          </label>
-          <input
-            id="pf-stock-min"
-            inputMode="decimal"
-            value={form.stock_minimo}
-            onChange={set("stock_minimo")}
-            placeholder="0"
-            className={INPUT}
-          />
-        </div>
-        <div>
-          <label htmlFor="pf-stock-max" className={LABEL}>
-            Stock máximo
-          </label>
-          <input
-            id="pf-stock-max"
-            inputMode="decimal"
-            value={form.stock_maximo}
-            onChange={set("stock_maximo")}
-            placeholder="Opcional"
-            className={INPUT}
-          />
-        </div>
-      </div>
-
-      {/* Fecha de vencimiento (para insumos perecederos → alerta de vencimiento) */}
-      <div>
-        <label htmlFor="pf-vencimiento" className={LABEL}>
-          Fecha de vencimiento
-        </label>
-        <input
-          id="pf-vencimiento"
-          type="date"
-          value={form.fecha_vencimiento}
-          onChange={set("fecha_vencimiento")}
-          className={INPUT}
-        />
-        <p className="mt-1 text-xs text-zinc-500">
-          Opcional. Solo para insumos perecederos; dispara la alerta de vencimiento.
-        </p>
-      </div>
-
-      {/* Imagen del producto (opcional). Si no se elige nada, el POS pinta el
-          placeholder de iniciales. */}
-      <div>
-        <label htmlFor="pf-imagen" className={LABEL}>
-          Imagen del producto
-        </label>
-        <div className="flex items-start gap-3">
-          {/* Previsualización: el archivo recién elegido o la imagen ya guardada. */}
-          {previewLocal || imagenUrl ? (
-            // eslint-disable-next-line @next/next/no-img-element -- URL remota de
-            // Storage / blob local: no pasa por el optimizador de next/image.
-            <img
-              src={previewLocal ?? imagenUrl ?? ""}
-              alt="Previsualización del producto"
-              className="h-20 w-20 shrink-0 rounded-lg border border-zinc-800 object-cover"
-            />
-          ) : (
-            <div className="flex h-20 w-20 shrink-0 items-center justify-center rounded-lg border border-dashed border-zinc-800 bg-zinc-950 text-2xl text-zinc-600">
-              🖼️
-            </div>
-          )}
-          <div className="min-w-0 flex-1">
+        {/* Precios */}
+        <div className="grid grid-cols-3 gap-3">
+          <div>
+            <label htmlFor="pf-costo" className={LABEL}>
+              Precio costo
+            </label>
             <input
-              id="pf-imagen"
-              ref={fileRef}
-              type="file"
-              accept={ACCEPT_IMAGEN}
-              onChange={seleccionarImagen}
-              className="w-full cursor-pointer rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-400 file:mr-3 file:cursor-pointer file:rounded-md file:border-0 file:bg-violet-500/15 file:px-3 file:py-1.5 file:text-xs file:font-medium file:text-violet-300 hover:file:bg-violet-500/25"
+              id="pf-costo"
+              inputMode="decimal"
+              value={form.precio_costo}
+              onChange={set("precio_costo")}
+              placeholder="0"
+              className={INPUT}
             />
-            <p className="mt-1 text-xs text-zinc-500">
-              Opcional. PNG o JPG, máximo 2 MB. Sin imagen se muestran las iniciales.
-            </p>
-            {(previewLocal || imagenUrl) && (
-              <button
-                type="button"
-                onClick={quitarImagen}
-                className="mt-1.5 text-xs text-zinc-400 hover:text-red-300"
-              >
-                Quitar imagen
-              </button>
-            )}
+          </div>
+          <div>
+            <label htmlFor="pf-margen" className={LABEL}>
+              Margen %
+            </label>
+            <input
+              id="pf-margen"
+              inputMode="decimal"
+              value={form.margen_ganancia}
+              onChange={set("margen_ganancia")}
+              placeholder="0"
+              className={INPUT}
+            />
+          </div>
+          <div>
+            <label htmlFor="pf-venta" className={LABEL}>
+              Precio venta *
+            </label>
+            <input
+              id="pf-venta"
+              ref={precioVentaRef}
+              inputMode="decimal"
+              value={form.precio_venta}
+              onChange={set("precio_venta")}
+              placeholder="0"
+              className={INPUT}
+            />
           </div>
         </div>
-      </div>
 
-      {/* Acciones */}
-      <div className="flex gap-2.5 pt-2">
-        {onCancel && (
+        {/* Ayuda: sugerencia de venta cuando aún no la editaron a mano */}
+        {ventaSugerida != null && ventaManual && Number(form.precio_venta) !== ventaSugerida && (
           <button
             type="button"
-            onClick={onCancel}
-            className="h-11 flex-1 rounded-lg border border-zinc-700 text-sm font-medium text-zinc-300 transition-colors hover:bg-zinc-800"
+            onClick={() => {
+              setVentaManual(false);
+              setForm((f) => ({ ...f, precio_venta: String(ventaSugerida) }));
+            }}
+            className="text-xs text-violet-400 hover:text-violet-300"
           >
-            Cancelar
+            Usar precio sugerido por margen: {ventaSugerida}
           </button>
         )}
-        <button
-          type="submit"
-          disabled={guardando}
-          className="h-11 flex-1 rounded-lg bg-gradient-to-r from-violet-500 to-fuchsia-600 text-sm font-semibold text-white shadow-lg shadow-violet-500/30 transition-all active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50"
-        >
-          {guardando ? "Guardando…" : editando ? "Guardar cambios" : "Agregar producto"}
-        </button>
-      </div>
-    </form>
+
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label htmlFor="pf-mayoreo" className={LABEL}>
+              Precio mayoreo
+            </label>
+            <input
+              id="pf-mayoreo"
+              inputMode="decimal"
+              value={form.precio_mayoreo}
+              onChange={set("precio_mayoreo")}
+              placeholder="Opcional"
+              className={INPUT}
+            />
+          </div>
+          <div>
+            <label htmlFor="pf-stock" className={LABEL}>
+              Stock actual
+            </label>
+            <input
+              id="pf-stock"
+              inputMode="decimal"
+              value={form.stock_actual}
+              onChange={set("stock_actual")}
+              placeholder="0"
+              className={INPUT}
+            />
+          </div>
+        </div>
+
+        {/* Stock mínimo / máximo (para alertas de reposición) */}
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label htmlFor="pf-stock-min" className={LABEL}>
+              Stock mínimo
+            </label>
+            <input
+              id="pf-stock-min"
+              inputMode="decimal"
+              value={form.stock_minimo}
+              onChange={set("stock_minimo")}
+              placeholder="0"
+              className={INPUT}
+            />
+          </div>
+          <div>
+            <label htmlFor="pf-stock-max" className={LABEL}>
+              Stock máximo
+            </label>
+            <input
+              id="pf-stock-max"
+              inputMode="decimal"
+              value={form.stock_maximo}
+              onChange={set("stock_maximo")}
+              placeholder="Opcional"
+              className={INPUT}
+            />
+          </div>
+        </div>
+
+        {/* Fecha de vencimiento (para insumos perecederos → alerta de vencimiento) */}
+        <div>
+          <label htmlFor="pf-vencimiento" className={LABEL}>
+            Fecha de vencimiento
+          </label>
+          <input
+            id="pf-vencimiento"
+            type="date"
+            value={form.fecha_vencimiento}
+            onChange={set("fecha_vencimiento")}
+            className={INPUT}
+          />
+          <p className="mt-1 text-xs text-zinc-500">
+            Opcional. Solo para insumos perecederos; dispara la alerta de vencimiento.
+          </p>
+        </div>
+
+        {/* Imagen del producto (opcional). Si no se elige nada, el POS pinta el
+            placeholder de iniciales. */}
+        <div>
+          <label htmlFor="pf-imagen" className={LABEL}>
+            Imagen del producto
+          </label>
+          <div className="flex items-start gap-3">
+            {/* Previsualización: el archivo recién elegido o la imagen ya guardada. */}
+            {previewLocal || imagenUrl ? (
+              // eslint-disable-next-line @next/next/no-img-element -- URL remota de
+              // Storage / blob local: no pasa por el optimizador de next/image.
+              <img
+                src={previewLocal ?? imagenUrl ?? ""}
+                alt="Previsualización del producto"
+                className="h-20 w-20 shrink-0 rounded-lg border border-zinc-800 object-cover"
+              />
+            ) : (
+              <div className="flex h-20 w-20 shrink-0 items-center justify-center rounded-lg border border-dashed border-zinc-800 bg-zinc-950 text-2xl text-zinc-600">
+                🖼️
+              </div>
+            )}
+            <div className="min-w-0 flex-1">
+              <input
+                id="pf-imagen"
+                ref={fileRef}
+                type="file"
+                accept={ACCEPT_IMAGEN}
+                onChange={seleccionarImagen}
+                className="w-full cursor-pointer rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-400 file:mr-3 file:cursor-pointer file:rounded-md file:border-0 file:bg-violet-500/15 file:px-3 file:py-1.5 file:text-xs file:font-medium file:text-violet-300 hover:file:bg-violet-500/25"
+              />
+              <p className="mt-1 text-xs text-zinc-500">
+                Opcional. PNG o JPG, máximo 2 MB. Sin imagen se muestran las iniciales.
+              </p>
+              {(previewLocal || imagenUrl) && (
+                <button
+                  type="button"
+                  onClick={quitarImagen}
+                  className="mt-1.5 text-xs text-zinc-400 hover:text-red-300"
+                >
+                  Quitar imagen
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Acciones */}
+        <div className="flex gap-2.5 pt-2">
+          {onCancel && (
+            <button
+              type="button"
+              onClick={onCancel}
+              className="h-11 flex-1 rounded-lg border border-zinc-700 text-sm font-medium text-zinc-300 transition-colors hover:bg-zinc-800"
+            >
+              Cancelar
+            </button>
+          )}
+          <button
+            type="submit"
+            disabled={guardando}
+            className="h-11 flex-1 rounded-lg bg-gradient-to-r from-violet-500 to-fuchsia-600 text-sm font-semibold text-white shadow-lg shadow-violet-500/30 transition-all active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {guardando ? "Guardando…" : editando ? "Guardar cambios" : "Agregar producto"}
+          </button>
+        </div>
+      </form>
+
+      {/* Visor de cámara. Fuera del <form> a propósito: es un diálogo a
+          pantalla completa, no un control del formulario. Solo se monta —y solo
+          entonces se descarga el decodificador— cuando se pulsa el botón. */}
+      {escanerAbierto && (
+        <CameraScanner onDetectado={onCodigoEscaneado} onCerrar={() => setEscanerAbierto(false)} />
+      )}
+    </>
   );
 }
