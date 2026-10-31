@@ -9,9 +9,21 @@ import StockAlertBanner from "./StockAlertBanner";
 import PaymentBreakdownCard from "./PaymentBreakdownCard";
 import { useDashboard } from "./DashboardProvider";
 import { formatCOP, isLowStock } from "../lib/data-model";
+import { useRolSesion } from "../lib/useRol";
 
 export default function DashboardBody() {
   const { inventory, salesTotal, metricas } = useDashboard();
+
+  /**
+   * Las cifras de dinero del negocio (ventas del día y acumuladas, margen,
+   * tendencia de ingresos) son SOLO para el dueño. Un empleado con rol operativo
+   * ve el panel sin finanzas: stock, alertas, rotación de unidades e inventario.
+   *
+   * Es una restricción de UI (fail-closed: oculta hasta confirmar que es admin).
+   * El acceso real a los datos lo sigue imponiendo RLS en Postgres; aquí no se
+   * relaja ninguna política.
+   */
+  const { esAdministrador } = useRolSesion();
 
   // Métricas derivadas del estado global (reaccionan a la carga masiva).
   const stockProducts = inventory.reduce((sum, i) => sum + i.stock, 0);
@@ -27,18 +39,24 @@ export default function DashboardBody() {
       <StockAlertBanner />
 
       {/* Métricas clave */}
-      <section className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <MetricCard
-          label="Ventas Totales"
-          value={salesLabel}
-          tone="violet"
-          icon={
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
-              <path d="M12 2v20" />
-              <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" />
-            </svg>
-          }
-        />
+      <section
+        className={`grid grid-cols-1 gap-4 sm:grid-cols-2 ${
+          esAdministrador ? "xl:grid-cols-4" : "xl:grid-cols-2"
+        }`}
+      >
+        {esAdministrador && (
+          <MetricCard
+            label="Ventas Totales"
+            value={salesLabel}
+            tone="violet"
+            icon={
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 2v20" />
+                <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" />
+              </svg>
+            }
+          />
+        )}
         <MetricCard
           label="Productos en Stock"
           value={stockProducts.toLocaleString("es-CO")}
@@ -63,33 +81,42 @@ export default function DashboardBody() {
             </svg>
           }
         />
-        <MetricCard
-          label="Margen de Ganancia"
-          value={margenLabel}
-          tone="emerald"
-          icon={
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
-              <path d="M3 3v18h18" />
-              <path d="m19 9-5 5-4-4-3 3" />
-            </svg>
-          }
-        />
+        {esAdministrador && (
+          <MetricCard
+            label="Margen de Ganancia"
+            value={margenLabel}
+            tone="emerald"
+            icon={
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                <path d="M3 3v18h18" />
+                <path d="m19 9-5 5-4-4-3 3" />
+              </svg>
+            }
+          />
+        )}
       </section>
 
-      {/* Desglose en tiempo real de lo vendido hoy por método de pago (cuadre de caja) */}
-      <section>
-        <PaymentBreakdownCard />
-      </section>
+      {/* Desglose en tiempo real de lo vendido hoy por método de pago (cuadre de
+          caja). Es la "Ventas del día": solo para el dueño. */}
+      {esAdministrador && (
+        <section>
+          <PaymentBreakdownCard />
+        </section>
+      )}
 
-      {/* Gráfico + rotación de inventario */}
-      <section className="grid grid-cols-1 gap-6 xl:grid-cols-3">
-        <div className="xl:col-span-2">
-          <SalesChart />
-        </div>
-        <div className="xl:col-span-1">
-          <RotacionPanel />
-        </div>
-      </section>
+      {/* Gráfico de ingresos + rotación. La rotación también se oculta al
+          empleado porque su desglose expone COGS y el inventario valorado a
+          COSTO (precios de compra), no solo unidades. */}
+      {esAdministrador && (
+        <section className="grid grid-cols-1 gap-6 xl:grid-cols-3">
+          <div className="xl:col-span-2">
+            <SalesChart />
+          </div>
+          <div className="xl:col-span-1">
+            <RotacionPanel />
+          </div>
+        </section>
+      )}
 
       {/* Importador de Excel */}
       <section>

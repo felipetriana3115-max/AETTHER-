@@ -28,6 +28,12 @@ import {
   METRICAS_VACIAS,
   type MetricasRentabilidad,
 } from "../lib/resumen";
+import {
+  DEFAULT_BUSINESS_NAME,
+  fetchBusinessName,
+  loadBusinessNameCache,
+  saveBusinessName,
+} from "../lib/empresa";
 
 /** Fila de inventario importada desde Excel/CSV, sin id (lo asigna la base de datos). */
 export type NewInventoryItem = {
@@ -108,9 +114,12 @@ export type Toast = {
 };
 
 type DashboardContextValue = {
-  // Identidad de la empresa (configurable por el usuario)
+  // Identidad de la empresa (persistida en `empresas.nombre`, por tenant).
+  // `setBusinessName` es ASÍNCRONO y LANZA si el servidor rechaza el guardado
+  // (p. ej. un empleado intentando renombrar la empresa): la UI debe await-earlo
+  // para no mostrar un "Guardado" que se perdería en el próximo login.
   businessName: string;
-  setBusinessName: (name: string) => void;
+  setBusinessName: (name: string) => Promise<void>;
   // Inventario (persistido en Supabase; refresca el estado tras cada upsert)
   inventory: InventoryItem[];
   addInventoryItems: (rows: NewInventoryItem[]) => Promise<number>;
@@ -149,12 +158,9 @@ const DashboardContext = createContext<DashboardContextValue | null>(null);
 /** Base de la clave de la data importada (se sufija con el empresa_id). */
 const STORAGE_KEY_BASE = "mi-dashboard-erp:v1";
 
-/** Base de la clave del nombre de la empresa (se sufija con el empresa_id). */
-const BUSINESS_NAME_KEY_BASE = "mi-dashboard-erp:businessName:v1";
-
 /** Claves GLOBALES antiguas (pre-segmentación). Se purgan para borrar datos
  *  de otro tenant que hubieran quedado cacheados en navegadores existentes. */
-const LEGACY_KEYS = [STORAGE_KEY_BASE, BUSINESS_NAME_KEY_BASE];
+const LEGACY_KEYS = [STORAGE_KEY_BASE, "mi-dashboard-erp:businessName:v1"];
 
 /**
  * Clave de caché del tenant activo, o `null` si aún no se conoce la empresa
@@ -166,9 +172,6 @@ function tenantKey(base: string): string | null {
   return empresaId ? `${base}:${empresaId}` : null;
 }
 
-/** Nombre por defecto cuando el usuario aún no ha configurado el suyo. */
-const DEFAULT_BUSINESS_NAME = "Mi Empresa";
-
 // NOTA: aquí vivía `CURRENT_CLIENT_ID = "default"`, el tenant de pega que el
 // proveedor estampaba en las filas creadas en memoria. Ya no existe ningún
 // registro creado en el cliente: inventario, clientes, ventas y compras se
@@ -177,8 +180,9 @@ const DEFAULT_BUSINESS_NAME = "Mi Empresa";
 // lo impone RLS, no un campo del frontend.
 
 export function DashboardProvider({ children }: { children: ReactNode }) {
-  // Nombre de la empresa: configurable y persistente. Arranca con el valor por
-  // defecto y se hidrata desde localStorage al montar (ver efecto de abajo).
+  // Nombre de la empresa: su FUENTE DE VERDAD es `empresas.nombre` en Supabase
+  // (ver app/lib/empresa.ts). Arranca con el defecto, se pinta de inmediato con
+  // el caché del tenant y lo sobreescribe la lectura del servidor.
   const [businessName, setBusinessNameState] = useState(DEFAULT_BUSINESS_NAME);
 
   // Sin datos quemados: todo arranca vacío y se llena desde la importación.
@@ -274,6 +278,10 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
     setSalesTotal(0);
     setMetricas(METRICAS_VACIAS);
     setImported(false);
+    // El nombre también es del tenant: se repinta con el caché de la empresa
+    // ENTRANTE (o el defecto) para no arrastrar el rótulo de la anterior; la
+    // lectura de Supabase lo corrige enseguida.
+    setBusinessNameState(loadBusinessNameCache(empresaId) ?? DEFAULT_BUSINESS_NAME);
   }, []);
 
   useEffect(() => {
@@ -297,13 +305,16 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
         resetTenantState(empresaId);
       }
 
-      const [ventas, productos, total, mets, compras, clientes] = await Promise.all([
+      const [ventas, productos, total, mets, compras, clientes, nombre] = await Promise.all([
         fetchVentasEmpresa(),
         fetchProductosEmpresa(),
         fetchTotalVentasEmpresa(),
         fetchMetricasRentabilidad(),
         fetchComprasEmpresa(),
         fetchClientesEmpresa(),
+        // Nombre visible: se relee en cada carga para que sobreviva al logout
+        // (el caché local se purga, la fila del tenant no).
+        fetchBusinessName(),
       ]);
       // La empresa pudo cambiar mientras viajaban las consultas: si ya no
       // corresponde a la que resolvimos, descartamos esta respuesta (evita pintar
@@ -319,6 +330,9 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
       setMetricas(mets);
       setPurchases(compras);
       setCustomers(clientes);
+      // `null` = no se pudo resolver (sin red / RLS); se conserva lo pintado en
+      // vez de revertir visualmente a "Mi Empresa".
+      if (nombre) setBusinessNameState(nombre);
       setImported(
         ventas.length > 0 ||
           productos.length > 0 ||
@@ -354,28 +368,24 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
   }, [resetTenantState]);
 
   // ── Nombre de la empresa ─────────────────────────────────────────────────────
-  // Se hidrata una vez al montar; el guardado ocurre en el setter para no pisar
-  // el valor por defecto durante el primer render en el servidor/cliente.
+  // Primer pintado optimista con el caché del tenant (si lo hay) para que una
+  // recarga no muestre "Mi Empresa" mientras resuelve Supabase. La verdad llega
+  // en el efecto `cargar` de arriba (fetchBusinessName → `empresas.nombre`).
   useEffect(() => {
-    try {
-      const key = tenantKey(BUSINESS_NAME_KEY_BASE);
-      const saved = key ? localStorage.getItem(key) : null;
-      if (saved) setBusinessNameState(saved);
-    } catch {
-      // localStorage inaccesible → se conserva el nombre por defecto.
-    }
+    const cacheado = loadBusinessNameCache(getTenant()?.empresaId ?? null);
+    if (cacheado) setBusinessNameState(cacheado);
   }, []);
 
-  /** Actualiza y persiste el nombre; vacío o solo espacios → vuelve al defecto. */
-  const setBusinessName = useCallback((name: string) => {
-    const next = name.trim() || DEFAULT_BUSINESS_NAME;
-    setBusinessNameState(next);
-    try {
-      const key = tenantKey(BUSINESS_NAME_KEY_BASE);
-      if (key) localStorage.setItem(key, next);
-    } catch {
-      // cuota excedida o modo privado → se ignora el guardado.
-    }
+  /**
+   * Guarda el nombre en la fila del tenant (RPC `actualizar_nombre_empresa`) y
+   * refleja en pantalla lo que quedó realmente guardado. LANZA si el servidor
+   * rechaza el cambio, para que la UI muestre el error en vez de un éxito falso
+   * que se perdería al reiniciar sesión. Vacío → se rechaza (no se renombra a
+   * "Mi Empresa" sin querer).
+   */
+  const setBusinessName = useCallback(async (name: string): Promise<void> => {
+    const guardado = await saveBusinessName(name);
+    setBusinessNameState(guardado);
   }, []);
 
   // ── Inventario ─────────────────────────────────────────────────────────────

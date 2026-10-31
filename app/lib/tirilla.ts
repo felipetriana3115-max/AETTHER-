@@ -1,7 +1,12 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { getEmpresaIdActiva, getTenant, supabase } from "./auth";
+import {
+  getEmpresaIdActiva,
+  getEmpresaIdActivaConReintentos,
+  getTenant,
+  supabase,
+} from "./auth";
 
 /**
  * Identidad de la tirilla de venta (NIT, dirección, teléfono, logo y mensaje de
@@ -87,17 +92,7 @@ function saveTirillaCache(empresaId: string, cfg: TirillaConfig): void {
  * `mi_empresa()` directamente (saltando esa caché) con una espera breve, para no
  * dar por perdida la empresa por una carrera de hidratación.
  */
-async function resolveEmpresaId(): Promise<string | null> {
-  const cached = await getEmpresaIdActiva();
-  if (cached) return cached;
-  for (let intento = 0; intento < 3; intento++) {
-    await new Promise((r) => setTimeout(r, 150));
-    const { data, error } = await supabase.rpc("mi_empresa");
-    const id = error ? null : ((data as string | null) ?? null);
-    if (id) return id;
-  }
-  return null;
-}
+const resolveEmpresaId = getEmpresaIdActivaConReintentos;
 
 /**
  * Trae la identidad de la tirilla desde Supabase (fuente de verdad) y refresca el

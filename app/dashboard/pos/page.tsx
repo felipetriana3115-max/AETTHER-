@@ -17,6 +17,7 @@ import { openCashDrawer, printReceipt, type ReceiptData } from "../../lib/receip
 import { cacheCatalogo, descontarStockLocal, getFrecuentes } from "../../lib/offline/catalog";
 import { enqueueVenta } from "../../lib/offline/outbox";
 import { useOffline } from "../../lib/offline/useOffline";
+import { useRolSesion } from "../../lib/useRol";
 
 /**
  * Visor de cámara: se carga bajo demanda (`ssr: false`) porque toca
@@ -185,6 +186,14 @@ function Miniatura({ nombre, imagenUrl }: { nombre: string; imagenUrl?: string |
 
 export default function PosPage() {
   const { businessName } = useDashboard();
+
+  /**
+   * "Vendido hoy" (el acumulado de caja del día) es una cifra del NEGOCIO: solo
+   * la ve el dueño. El cajero empleado cobra igual, pero sin el total del día a
+   * la vista. Fail-closed: oculta hasta confirmar el rol de administrador.
+   * Es gateo de UI; el aislamiento de datos lo sigue imponiendo RLS.
+   */
+  const { esAdministrador } = useRolSesion();
   const [frecuentes, setFrecuentes] = useState<Producto[]>([]);
   const [carrito, setCarrito] = useState<LineaCarrito[]>([]);
   const [feedback, setFeedback] = useState<Feedback>(null);
@@ -240,7 +249,8 @@ export default function PosPage() {
   // Modo Sin Internet: estado de red + cola local de ventas. Al terminar una
   // sincronización con éxito, refrescamos el corte del servidor (fuente de verdad).
   const { online, pendientes, totalPend, sincronizando, sincronizar, refresh } = useOffline(() => {
-    fetchVentasHoyPorMetodo().then(setVentasHoy);
+    // Solo el dueño ve el acumulado del día; para el empleado ni se consulta.
+    if (esAdministrador) fetchVentasHoyPorMetodo().then(setVentasHoy);
   });
 
   /**
@@ -295,8 +305,11 @@ export default function PosPage() {
     };
   }, []);
 
-  // Carga las ventas del día para la tarjeta "Vendido hoy".
+  // Carga las ventas del día para la tarjeta "Vendido hoy". Solo si quien cobra
+  // es el dueño: al empleado no se le pinta la tarjeta, así que tampoco se
+  // consulta (se re-ejecuta cuando `useRolSesion` confirma el rol).
   useEffect(() => {
+    if (!esAdministrador) return;
     let activo = true;
     (async () => {
       const ventas = await fetchVentasHoyPorMetodo();
@@ -305,7 +318,7 @@ export default function PosPage() {
     return () => {
       activo = false;
     };
-  }, []);
+  }, [esAdministrador]);
 
   // Directorio de clientes para poder fiar. Con red viene de Supabase; si la
   // migración de clientes/fiados no está aplicada, marcamos `faltaFiado` para
@@ -1045,27 +1058,36 @@ export default function PosPage() {
 
         {/* ── Columna derecha: carrito + pago ── */}
         <section className="flex flex-col rounded-xl border border-violet-500/15 bg-zinc-900/50">
-          {/* Vendido hoy: visibilidad del corte de caja sin salir del POS. */}
-          <div className="flex items-center justify-between gap-3 rounded-t-xl border-b border-emerald-500/20 bg-gradient-to-r from-emerald-500/10 to-transparent p-4">
-            <div className="flex items-center gap-2.5">
-              <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-emerald-500/15 text-lg">💰</span>
-              <div>
-                <p className="text-[11px] font-medium uppercase tracking-wide text-emerald-400/80">Vendido hoy</p>
-                <p className="text-xs text-zinc-500">
-                  {(ventasHoy?.num_ventas ?? 0) + pendientes} venta
-                  {(ventasHoy?.num_ventas ?? 0) + pendientes === 1 ? "" : "s"}
-                  {pendientes > 0 && (
-                    <span className="text-amber-400"> · {pendientes} sin sincronizar</span>
-                  )}
-                </p>
+          {/* Vendido hoy: visibilidad del corte de caja sin salir del POS. Es la
+              caja del NEGOCIO, así que solo la ve el dueño; el empleado cobra sin
+              el acumulado del día a la vista (sus ventas pendientes de sincronizar
+              siguen visibles arriba, en la barra de conexión). */}
+          {esAdministrador && (
+            <div className="flex items-center justify-between gap-3 rounded-t-xl border-b border-emerald-500/20 bg-gradient-to-r from-emerald-500/10 to-transparent p-4">
+              <div className="flex items-center gap-2.5">
+                <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-emerald-500/15 text-lg">💰</span>
+                <div>
+                  <p className="text-[11px] font-medium uppercase tracking-wide text-emerald-400/80">Vendido hoy</p>
+                  <p className="text-xs text-zinc-500">
+                    {(ventasHoy?.num_ventas ?? 0) + pendientes} venta
+                    {(ventasHoy?.num_ventas ?? 0) + pendientes === 1 ? "" : "s"}
+                    {pendientes > 0 && (
+                      <span className="text-amber-400"> · {pendientes} sin sincronizar</span>
+                    )}
+                  </p>
+                </div>
               </div>
+              <span className="text-xl font-bold tracking-tight text-emerald-300 tabular-nums">
+                {formatCOP((ventasHoy?.total_general ?? 0) + totalPend)}
+              </span>
             </div>
-            <span className="text-xl font-bold tracking-tight text-emerald-300 tabular-nums">
-              {formatCOP((ventasHoy?.total_general ?? 0) + totalPend)}
-            </span>
-          </div>
+          )}
 
-          <div className="flex items-center justify-between border-b border-zinc-800 p-4">
+          <div
+            className={`flex items-center justify-between border-b border-zinc-800 p-4 ${
+              esAdministrador ? "" : "rounded-t-xl"
+            }`}
+          >
             <h3 className="text-sm font-semibold text-zinc-100">
               Carrito {unidades > 0 && <span className="text-zinc-500">· {unidades} und</span>}
             </h3>

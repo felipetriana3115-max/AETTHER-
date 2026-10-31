@@ -435,6 +435,31 @@ export async function getEmpresaIdActiva(): Promise<string | null> {
   return empresaId;
 }
 
+/**
+ * Igual que `getEmpresaIdActiva()`, pero TOLERANTE al arranque en frío.
+ *
+ * En una recarga dura, una lectura puede correr antes de que supabase-js termine
+ * de rehidratar la sesión desde las cookies, así que `getEmpresaIdActiva()` puede
+ * devolver `null` de forma transitoria (y ese `null` queda memorizado en su caché
+ * en memoria hasta el próximo cambio de usuario). Aquí se reintenta consultando
+ * `mi_empresa()` directamente (saltando esa caché) con esperas breves, para no
+ * dar por perdida la empresa por una carrera de hidratación.
+ */
+export async function getEmpresaIdActivaConReintentos(
+  intentos = 3,
+  esperaMs = 150,
+): Promise<string | null> {
+  const cached = await getEmpresaIdActiva();
+  if (cached) return cached;
+  for (let i = 0; i < intentos; i++) {
+    await new Promise((r) => setTimeout(r, esperaMs));
+    const { data, error } = await supabase.rpc("mi_empresa");
+    const id = error ? null : ((data as string | null) ?? null);
+    if (id) return id;
+  }
+  return null;
+}
+
 export type NuevaEmpresa = {
   email: string;
   password: string;

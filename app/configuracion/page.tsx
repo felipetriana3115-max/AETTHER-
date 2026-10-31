@@ -4,8 +4,10 @@ import { useEffect, useMemo, useState } from "react";
 import PageShell from "../components/PageShell";
 import { useDashboard } from "../components/DashboardProvider";
 import DevicesSection from "../components/config/DevicesSection";
+import PasswordSection from "../components/config/PasswordSection";
 import { generateDailySummary } from "../lib/notifications/whatsapp-service";
 import { runDailyReportMock } from "../lib/cron/daily-report-mock";
+import { useRolSesion } from "../lib/useRol";
 
 /** Clave de localStorage para las preferencias de notificaciones. */
 const SETTINGS_KEY = "mi-dashboard-erp:settings:v1";
@@ -23,13 +25,21 @@ const DEFAULT_SETTINGS: NotificationSettings = {
 export default function ConfiguracionPage() {
   const { sales, inventory, showToast, businessName, setBusinessName } = useDashboard();
 
+  // Solo el dueño renombra la empresa (la RPC `actualizar_nombre_empresa` lo
+  // exige también en el servidor; esto evita ofrecer un botón que fallaría).
+  const { esAdministrador } = useRolSesion();
+
   const [settings, setSettings] = useState<NotificationSettings>(DEFAULT_SETTINGS);
   const [hydrated, setHydrated] = useState(false);
 
   // Borrador editable del nombre de empresa; se sincroniza con el valor global
-  // (incluida su hidratación inicial desde localStorage).
+  // (que se hidrata desde `empresas.nombre` en Supabase).
   const [nameDraft, setNameDraft] = useState(businessName);
   useEffect(() => setNameDraft(businessName), [businessName]);
+
+  // Estado del guardado del nombre (el servidor puede rechazarlo).
+  const [guardandoNombre, setGuardandoNombre] = useState(false);
+  const [errorNombre, setErrorNombre] = useState<string | null>(null);
 
   // La identidad de la tirilla (NIT, dirección, teléfono, mensaje Y LOGO) se
   // gestiona en la sección nativa "Tirilla de venta" (Dispositivos → Impresora
@@ -70,14 +80,26 @@ export default function ConfiguracionPage() {
     [sales, inventory, businessName],
   );
 
-  // Guarda el nombre de empresa en el estado global (que lo persiste en
-  // localStorage). Vacío o solo espacios → el proveedor lo revierte al defecto.
-  const handleSaveName = () => {
-    setBusinessName(nameDraft);
-    showToast(
-      "Nombre actualizado",
-      `El nombre de tu empresa ahora es "${nameDraft.trim() || "Mi Empresa"}".`,
-    );
+  // Guarda el nombre de empresa en SUPABASE (`empresas.nombre` vía la RPC
+  // `actualizar_nombre_empresa`, acotada a `mi_empresa()`), no en localStorage:
+  // por eso ya no se pierde al cerrar sesión. Solo se confirma al usuario cuando
+  // el servidor lo aceptó.
+  const handleSaveName = async () => {
+    const limpio = nameDraft.trim();
+    if (!limpio || guardandoNombre) return;
+    setGuardandoNombre(true);
+    setErrorNombre(null);
+    try {
+      await setBusinessName(limpio);
+      showToast("Nombre actualizado", `El nombre de tu empresa ahora es "${limpio}".`);
+    } catch (e) {
+      const msg =
+        e instanceof Error ? e.message : "No se pudo guardar el nombre de la empresa.";
+      setErrorNombre(msg);
+      showToast("No se pudo guardar", msg);
+    } finally {
+      setGuardandoNombre(false);
+    }
   };
 
   const canSend = settings.dailyReportEnabled && phoneValid;
@@ -122,7 +144,8 @@ export default function ConfiguracionPage() {
               </h3>
               <p className="mt-1 max-w-md text-xs text-zinc-500">
                 Se muestra en la barra superior de todos los módulos y en los
-                reportes automáticos.
+                reportes automáticos. Queda guardado en tu empresa, así que
+                sobrevive al cierre de sesión y te sigue entre equipos.
               </p>
             </div>
           </div>
@@ -131,7 +154,7 @@ export default function ConfiguracionPage() {
             className="relative mt-6 flex flex-col gap-3 sm:flex-row sm:items-end"
             onSubmit={(e) => {
               e.preventDefault();
-              handleSaveName();
+              void handleSaveName();
             }}
           >
             <div className="flex-1">
@@ -146,13 +169,19 @@ export default function ConfiguracionPage() {
                 type="text"
                 placeholder="Mi Empresa"
                 value={nameDraft}
+                disabled={!esAdministrador || guardandoNombre}
                 onChange={(e) => setNameDraft(e.target.value)}
-                className="w-full rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2.5 text-sm text-zinc-100 placeholder:text-zinc-600 transition-colors focus:border-violet-500 focus:outline-none focus:ring-1 focus:ring-violet-500"
+                className="w-full rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2.5 text-sm text-zinc-100 placeholder:text-zinc-600 transition-colors focus:border-violet-500 focus:outline-none focus:ring-1 focus:ring-violet-500 disabled:cursor-not-allowed disabled:opacity-40"
               />
             </div>
             <button
               type="submit"
-              disabled={nameDraft.trim() === businessName.trim()}
+              disabled={
+                !esAdministrador ||
+                guardandoNombre ||
+                nameDraft.trim() === "" ||
+                nameDraft.trim() === businessName.trim()
+              }
               className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg border border-violet-500/30 bg-violet-600/15 px-4 py-2.5 text-sm font-medium text-violet-200 shadow-[0_0_20px_-8px_rgba(139,92,246,0.7)] transition-colors hover:bg-violet-600/25 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-violet-600/15"
             >
               <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
@@ -160,10 +189,24 @@ export default function ConfiguracionPage() {
                 <path d="M17 21v-8H7v8" />
                 <path d="M7 3v5h8" />
               </svg>
-              Guardar
+              {guardandoNombre ? "Guardando…" : "Guardar"}
             </button>
           </form>
+
+          {!esAdministrador && (
+            <p className="relative mt-2 text-[11px] text-zinc-600">
+              Solo el administrador de la empresa puede cambiar este nombre.
+            </p>
+          )}
+          {errorNombre && (
+            <p role="status" className="relative mt-2 text-xs text-red-400">
+              {errorNombre}
+            </p>
+          )}
         </section>
+
+        {/* Seguridad de la cuenta: cambio de contraseña (Supabase Auth) */}
+        <PasswordSection />
 
         {/* Dispositivos de la caja (POS) — incluye la sección nativa "Tirilla de
             venta" (Impresora de Tickets) con NIT, dirección, teléfono, mensaje y
