@@ -13,6 +13,13 @@
 --   · 2026-08-arqueo-diario.sql (función `public.hoy_negocio()`)
 -- Es idempotente (create or replace / add column if not exists).
 --
+-- ⚠️ ORDEN DE EJECUCIÓN: `2026-10-devoluciones-parciales.sql` REEMPLAZA
+-- `registrar_devolucion`, `total_ventas_empresa` y `metricas_rentabilidad_empresa`
+-- con versiones que tienen en cuenta lo ya devuelto parcialmente. Si vuelves a
+-- correr ESTE archivo después de aquel, re-ejecuta el de parciales a
+-- continuación; si no, una devolución total sobre una venta con parciales ya
+-- aprobadas volvería a sumar al inventario unidades que ya se habían repuesto.
+--
 -- QUÉ RESUELVE
 -- ------------
 -- El panel de Transacciones (app/ventas/page.tsx) ya pintaba el estado

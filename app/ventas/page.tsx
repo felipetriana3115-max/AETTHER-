@@ -1,9 +1,10 @@
 "use client";
 
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import PageShell from "../components/PageShell";
 import MetricCard from "../components/MetricCard";
 import EmptyState from "../components/EmptyState";
+import DevolucionesPendientes from "../components/DevolucionesPendientes";
 import { useDashboard } from "../components/DashboardProvider";
 import VentaDetalleModal, { type AccionVenta } from "../components/VentaDetalleModal";
 import { axisScale, formatCompactCOP, formatCOP, type Sale, type SaleStatus } from "../lib/data-model";
@@ -58,22 +59,33 @@ export default function VentasPage() {
   } = useDashboard();
 
   /**
-   * Devolver es cosa del dueño: mueve dinero (egreso de caja) e inventario
-   * sobre una venta ya cerrada. Fail-closed — el botón no aparece hasta
-   * confirmar el rol. El control REAL está en la RPC `registrar_devolucion`,
-   * que exige empresa_admin/super_admin; esto solo evita ofrecer un botón que
-   * fallaría. Ver y reimprimir siguen disponibles para cualquier empleado con
-   * permiso 'ventas'.
+   * SOLICITAR una devolución puede cualquier empleado con permiso 'ventas':
+   * elige los ítems y deja la petición en cola, sin tocar stock ni caja.
+   * APROBARLA es cosa del dueño, porque es el paso que mueve dinero (egreso de
+   * caja), inventario y el cajón. Fail-closed — hasta confirmar el rol se
+   * asume empleado. El control REAL está en la RPC `resolver_devolucion`, que
+   * exige empresa_admin/super_admin; esto solo evita ofrecer un botón que
+   * fallaría.
    */
   const { esAdministrador } = useRolSesion();
 
   // Factura abierta (vista previa / reimpresión / devolución). Null = cerrada.
   const [abierta, setAbierta] = useState<VentaAbierta | null>(null);
 
+  /**
+   * Fuerza la recarga de la bandeja de devoluciones. Se incrementa cuando el
+   * modal deja una solicitud nueva, para que aparezca sin recargar la página.
+   */
+  const [bandejaToken, setBandejaToken] = useState(0);
+  const refrescarBandeja = useCallback(() => setBandejaToken((t) => t + 1), []);
+
   const total = monthlyRevenue.reduce((s, m) => s + m.amount, 0);
   const paidSales = recentSales.filter((s) => s.status === "Pagado");
+  // Ticket NETO: a una venta con devolución parcial se le resta lo reembolsado
+  // (mismo criterio que el gráfico y que la RPC `total_ventas_empresa`).
   const avgTicket = paidSales.length
-    ? paidSales.reduce((s, x) => s + x.amount, 0) / paidSales.length
+    ? paidSales.reduce((s, x) => s + Math.max(0, x.amount - (x.refunded ?? 0)), 0) /
+      paidSales.length
     : 0;
 
   // Escala del eje calculada dinámicamente a partir de los datos vivos.
@@ -195,6 +207,15 @@ export default function VentasPage() {
           </div>
         </section>
 
+        {/* Bandeja de devoluciones: el admin aprueba o rechaza aquí; el
+            empleado solo consulta en qué quedó lo que pidió. La sección se
+            oculta sola cuando no hay ninguna solicitud. */}
+        <DevolucionesPendientes
+          recargarToken={bandejaToken}
+          // Aprobar mueve stock y caja: la verdad la vuelve a poner el servidor.
+          onResuelta={() => void refreshSales()}
+        />
+
         {/* Historial de transacciones */}
         <section className="rounded-xl border border-violet-500/15 bg-zinc-900/50">
           <div className="flex items-center justify-between border-b border-zinc-800 p-5">
@@ -242,6 +263,14 @@ export default function VentasPage() {
                       }`}
                     >
                       {formatCOP(s.amount)}
+                      {/* Devolución PARCIAL: la venta sigue viva, pero el
+                          ingreso real es el neto. Se anota debajo para no
+                          falsear la columna de monto. */}
+                      {s.status !== "Reembolsado" && (s.refunded ?? 0) > 0 && (
+                        <span className="block text-[11px] font-normal text-amber-400">
+                          −{formatCOP(s.refunded ?? 0)} devuelto
+                        </span>
+                      )}
                     </td>
                     <td className="px-5 py-3.5 text-right">
                       <span className={`inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium ring-1 ring-inset ${statusStyles[s.status]}`}>
@@ -250,8 +279,9 @@ export default function VentasPage() {
                     </td>
                     {/* Acciones por transacción. Las tres abren la factura: la
                         de impresión dispara la tirilla al cargarla y la de
-                        devolución salta directo a la confirmación, para que
-                        nadie reembolse sin ver antes qué está reembolsando. */}
+                        devolución salta directo al selector por ítem (con todo
+                        lo devolvible preseleccionado), para que nadie reembolse
+                        sin ver antes qué está reembolsando. */}
                     <td className="px-5 py-3.5">
                       <div className="flex items-center justify-end gap-1.5">
                         <AccionBoton
@@ -273,9 +303,13 @@ export default function VentasPage() {
                             <path d="M6 14h12v8H6z" />
                           </svg>
                         </AccionBoton>
-                        {esAdministrador && s.status !== "Reembolsado" && (
+                        {s.status !== "Reembolsado" && (
                           <AccionBoton
-                            label={`Realizar la devolución de ${folio}`}
+                            label={
+                              esAdministrador
+                                ? `Devolver ítems de ${folio}`
+                                : `Solicitar la devolución de ítems de ${folio}`
+                            }
                             tono="peligro"
                             onClick={() => setAbierta({ venta: s, folio, accion: "devolver" })}
                           >
@@ -310,6 +344,8 @@ export default function VentasPage() {
           // Tras devolver, la verdad la vuelve a poner el servidor: historial,
           // total, métricas e inventario (el stock repuesto).
           onDevuelta={() => void refreshSales()}
+          // Una solicitud pendiente no cambia ventas ni stock: solo la bandeja.
+          onSolicitada={refrescarBandeja}
         />
       )}
     </PageShell>

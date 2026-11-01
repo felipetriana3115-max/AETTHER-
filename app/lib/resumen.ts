@@ -47,6 +47,8 @@ type VentaRow = {
   canal?: string | null;
   /** Pagado | Pendiente | Reembolsado. Columna nueva, DEFAULT 'Pagado'. */
   estado?: SaleStatus | null;
+  /** Reembolsado por devoluciones parciales. Columna nueva, DEFAULT 0. */
+  devuelto_total?: number | string | null;
 };
 
 /** Fila cruda de `public.productos` (solo las columnas que consumimos). */
@@ -69,7 +71,8 @@ const VENTAS_SELECT_BASE = "id, total, metodo_pago, created_at";
 
 /**
  * `cliente_nombre`, `canal` y `estado` son columnas nuevas
- * (`supabase/2026-10-import-masivo-crm-ventas.sql`). Mismo patrón defensivo que
+ * (`supabase/2026-10-import-masivo-crm-ventas.sql`), igual que `devuelto_total`
+ * (`supabase/2026-10-devoluciones-parciales.sql`). Mismo patrón defensivo que
  * `fetchProductosEmpresa`: si la migración aún no se ha corrido, PostgREST
  * devuelve 42703 y reintentamos sin ellas para que el dashboard siga funcionando
  * con los valores por defecto del POS.
@@ -80,15 +83,16 @@ export async function fetchVentasEmpresa(): Promise<Sale[]> {
 
   const completo = await supabase
     .from("ventas")
-    .select(`${VENTAS_SELECT_BASE}, cliente_nombre, canal, estado`)
+    .select(`${VENTAS_SELECT_BASE}, cliente_nombre, canal, estado, devuelto_total`)
     .eq("empresa_id", empresaId)
     .order("created_at", { ascending: false });
 
   const debeReintentar = completo.error?.code === "42703";
   if (debeReintentar) {
     console.warn(
-      "[resumen] `ventas.cliente_nombre/canal/estado` no existen todavía; corre " +
-        "supabase/2026-10-import-masivo-crm-ventas.sql para importar el histórico de ventas.",
+      "[resumen] `ventas.cliente_nombre/canal/estado/devuelto_total` no existen todavía; corre " +
+        "supabase/2026-10-import-masivo-crm-ventas.sql y " +
+        "supabase/2026-10-devoluciones-parciales.sql.",
     );
   }
   const { data, error } = debeReintentar
@@ -115,6 +119,7 @@ export async function fetchVentasEmpresa(): Promise<Sale[]> {
     amount: Number(row.total ?? 0),
     status: row.estado ?? "Pagado",
     date: row.created_at,
+    refunded: Number(row.devuelto_total ?? 0),
   }));
 }
 

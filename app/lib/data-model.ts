@@ -48,6 +48,13 @@ export type Sale = {
   amount: number;
   status: SaleStatus;
   date: string;
+  /**
+   * Importe ya reembolsado por devoluciones PARCIALES (`ventas.devuelto_total`).
+   * Una venta puede estar 'Pagado' y llevar parte devuelta: el ingreso real es
+   * `amount - refunded`. Cuando se devuelve entera pasa a 'Reembolsado' y deja
+   * de contar del todo. Ausente en las bases sin la migración de parciales.
+   */
+  refunded?: number;
 };
 
 export type PurchaseStatus = "Recibido" | "Pendiente" | "Cancelado";
@@ -201,7 +208,9 @@ export function deriveMonthlyRevenue(sales: Sale[]): MonthPoint[] {
     if (s.status === "Reembolsado") continue;
     const idx = monthIndexFromDate(s.date);
     if (idx === null) continue;
-    totals[idx] += s.amount;
+    // Una devolución PARCIAL no saca la venta del mes, pero sí resta lo
+    // reembolsado: mismo criterio que la RPC `total_ventas_empresa`.
+    totals[idx] += Math.max(0, s.amount - (s.refunded ?? 0));
     seen[idx] = true;
   }
 

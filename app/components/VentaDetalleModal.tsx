@@ -1,10 +1,16 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useDashboard } from "./DashboardProvider";
 import { formatCOP, type Sale } from "../lib/data-model";
 import { loadDeviceSettings } from "../lib/devices";
-import { printReceipt, type ReceiptData } from "../lib/receipt";
+import {
+  fetchDisponibleDevolucion,
+  pinCajonDevolucion,
+  solicitarDevolucion,
+  type DisponibleDevolucion,
+} from "../lib/devoluciones";
+import { openCashDrawer, printReceipt, type ReceiptData } from "../lib/receipt";
 import { DEFAULT_TIRILLA, fetchTirilla, type TirillaConfig } from "../lib/tirilla";
 import { useRolSesion } from "../lib/useRol";
 import {
@@ -15,7 +21,7 @@ import {
 
 /**
  * Factura de una transacción: vista previa, reimpresión de la tirilla y
- * devolución.
+ * devolución PARCIAL por ítem.
  *
  * El listado de Transacciones no trae el desglose de líneas (son muchas filas),
  * así que aquí se pide el detalle de ESA venta al abrirse — `ventas.items` en
@@ -23,17 +29,27 @@ import {
  * llega se pinta la cabecera con lo que ya tenía la tabla, así que el modal
  * nunca aparece vacío.
  *
- * La devolución NO se arma aquí con escrituras sueltas: va por la RPC atómica
- * `registrar_devolucion` (ver supabase/2026-10-devoluciones-ventas.sql), que
- * repone el stock del tenant, marca la venta como 'Reembolsado' y registra el
- * egreso de caja en una sola transacción.
+ * LA DEVOLUCIÓN NO SE ARMA AQUÍ. El cliente solo elige pares `{idx, qty}`; el
+ * precio, el nombre y el tope de cada línea los impone el servidor leyendo la
+ * propia venta (RPC `devolucion_disponible` / `solicitar_devolucion`, ver
+ * supabase/2026-10-devoluciones-parciales.sql). Así un cliente manipulado no
+ * puede inflar el reembolso ni devolver más unidades de las vendidas.
+ *
+ * DOS CAMINOS SEGÚN EL ROL:
+ *   · Empleado  → deja una SOLICITUD pendiente. No se mueve stock, ni caja, ni
+ *     el cajón de dinero: eso lo decide después el dueño.
+ *   · Admin     → puede aprobar en el acto (`autoAprobar`), y solo entonces la
+ *     RPC repone el stock, registra el egreso y autoriza el pulso del cajón.
+ *
+ * Las ventas IMPORTADAS sin desglose de líneas no se pueden devolver por ítem:
+ * para ellas se conserva la devolución total del dueño (`registrar_devolucion`).
  */
 
 /**
  * Con qué intención se abrió el modal. Los tres botones de la tabla entran por
  * aquí: así "Reimprimir" y "Devolver" siguen siendo acciones de un clic, pero
- * el cajero SIEMPRE ve antes la factura sobre la que va a actuar (crítico en la
- * devolución, que mueve dinero e inventario).
+ * quien opera SIEMPRE ve antes la factura sobre la que va a actuar (crítico en
+ * la devolución, que mueve dinero e inventario).
  */
 export type AccionVenta = "ver" | "imprimir" | "devolver";
 
@@ -45,8 +61,10 @@ type Props = {
   /** Acción a disparar en cuanto el detalle esté cargado. */
   accionInicial?: AccionVenta;
   onClose: () => void;
-  /** Se invoca tras una devolución efectiva para resincronizar el dashboard. */
+  /** Se invoca tras una devolución EFECTIVA para resincronizar el dashboard. */
   onDevuelta: () => void;
+  /** Se invoca tras dejar una solicitud pendiente (refresca la bandeja). */
+  onSolicitada?: () => void;
 };
 
 /** Fecha legible (es-CO) a partir del ISO de `created_at`. */
@@ -62,12 +80,14 @@ export default function VentaDetalleModal({
   accionInicial = "ver",
   onClose,
   onDevuelta,
+  onSolicitada,
 }: Props) {
   const { businessName, showToast } = useDashboard();
   /**
-   * Solo el dueño devuelve (ver la nota en /ventas). Fail-closed: hasta
-   * confirmar el rol no se ofrece la acción. El control real lo impone la RPC
-   * `registrar_devolucion`, que exige empresa_admin/super_admin.
+   * Solicitar puede cualquiera con acceso a Ventas; APROBAR es cosa del dueño.
+   * Fail-closed: hasta confirmar el rol se asume empleado, así que el botón
+   * ofrece la solicitud, nunca el reembolso inmediato. El control real lo
+   * impone `resolver_devolucion`, que exige empresa_admin/super_admin.
    */
   const { esAdministrador } = useRolSesion();
 
@@ -75,11 +95,17 @@ export default function VentaDetalleModal({
   const [cargando, setCargando] = useState(true);
   const [tirilla, setTirilla] = useState<TirillaConfig>(DEFAULT_TIRILLA);
   const [imprimiendo, setImprimiendo] = useState(false);
-  // Devolución en dos pasos: el botón abre la confirmación con el motivo.
+  // Devolución en dos pasos: el botón abre el selector por ítem + el motivo.
   const [confirmando, setConfirmando] = useState(false);
   const [motivo, setMotivo] = useState("");
-  const [devolviendo, setDevolviendo] = useState(false);
+  const [enviando, setEnviando] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Topes por línea calculados por el servidor (vendido − devuelto − pendiente).
+  const [disponible, setDisponible] = useState<DisponibleDevolucion | null>(null);
+  const [avisoDisponible, setAvisoDisponible] = useState<string | null>(null);
+  /** Cantidad elegida por posición de línea (`idx` de `ventas.items`). */
+  const [cantidades, setCantidades] = useState<Record<number, number>>({});
 
   /**
    * Reimprime la tirilla por el canal configurado en Dispositivos.
@@ -123,18 +149,24 @@ export default function VentaDetalleModal({
 
   /**
    * Detalle de la venta + identidad de la tirilla (para reimprimir con NIT y
-   * logo). En cuanto ambos están, se ejecuta la acción con la que se abrió el
-   * modal: así "Reimprimir" y "Devolver" siguen siendo un solo clic desde la
-   * tabla. El modal se remonta por cada transacción (`key` en el llamador), de
-   * modo que esto corre una sola vez por factura abierta.
+   * logo) + topes devolvibles por línea. En cuanto están, se ejecuta la acción
+   * con la que se abrió el modal: así "Reimprimir" y "Devolver" siguen siendo un
+   * solo clic desde la tabla. El modal se remonta por cada transacción (`key` en
+   * el llamador), de modo que esto corre una sola vez por factura abierta.
    */
   useEffect(() => {
     let activo = true;
     void (async () => {
-      const [d, cfg] = await Promise.all([fetchVentaDetalle(venta.id), fetchTirilla()]);
+      const [d, cfg, disp] = await Promise.all([
+        fetchVentaDetalle(venta.id),
+        fetchTirilla(),
+        fetchDisponibleDevolucion(venta.id),
+      ]);
       if (!activo) return;
       setDetalle(d);
       setTirilla(cfg);
+      setDisponible(disp.data);
+      setAvisoDisponible(disp.error);
       setCargando(false);
       if (!d) {
         setError(
@@ -145,6 +177,16 @@ export default function VentaDetalleModal({
       if (accionInicial === "imprimir") {
         void imprimirCopia(d, cfg);
       } else if (accionInicial === "devolver" && d.estado !== "Reembolsado") {
+        // Entrar por el botón de devolución preselecciona TODO lo devolvible:
+        // el caso habitual (factura completa) queda a un clic, y restar
+        // unidades es solo mover los contadores.
+        setCantidades(
+          Object.fromEntries(
+            (disp.data?.lineas ?? [])
+              .filter((l) => l.disponible > 0)
+              .map((l) => [l.idx, l.disponible]),
+          ),
+        );
         setConfirmando(true);
       }
     })();
@@ -171,10 +213,130 @@ export default function VentaDetalleModal({
   const sumaLineas = lineas.reduce((s, l) => s + l.precio * l.qty, 0);
   const unidades = lineas.reduce((s, l) => s + l.qty, 0);
 
-  /** Procesa la devolución y resincroniza el dashboard con el servidor. */
-  const confirmarDevolucion = useCallback(async () => {
-    if (!detalle || devolviendo) return;
-    setDevolviendo(true);
+  // Líneas con algo todavía devolvible: son las que pueden llevar selector.
+  const devolvibles = useMemo(
+    () => (disponible?.lineas ?? []).filter((l) => l.disponible > 0),
+    [disponible],
+  );
+  /** Venta con desglose: el camino normal (selección por ítem). */
+  const hayDesglose = (disponible?.lineas.length ?? 0) > 0;
+  const devueltoTotal = disponible?.devueltoTotal ?? 0;
+  /** Importe vivo de la factura: lo máximo que aún se puede reembolsar. */
+  const saldoReembolsable = Math.max(0, total - devueltoTotal);
+
+  // Total a reembolsar según lo seleccionado, recalculado en cada cambio y
+  // topado por el saldo vivo (una factura con descuento puede tener líneas que
+  // sumen más de lo cobrado). El servidor aplica exactamente el mismo tope.
+  const { montoSeleccionado, unidadesSeleccionadas } = useMemo(() => {
+    let monto = 0;
+    let uds = 0;
+    for (const l of disponible?.lineas ?? []) {
+      const q = cantidades[l.idx] ?? 0;
+      if (q > 0) {
+        monto += q * l.precio;
+        uds += q;
+      }
+    }
+    return {
+      montoSeleccionado: Math.min(monto, saldoReembolsable),
+      unidadesSeleccionadas: uds,
+    };
+  }, [cantidades, disponible, saldoReembolsable]);
+
+  /** Fija la cantidad de una línea, siempre dentro de `[0, disponible]`. */
+  const setCantidad = useCallback((idx: number, valor: number, tope: number) => {
+    const q = Math.max(0, Math.min(Math.trunc(Number.isFinite(valor) ? valor : 0), tope));
+    setCantidades((prev) => ({ ...prev, [idx]: q }));
+  }, []);
+
+  const seleccionarTodo = useCallback(() => {
+    setCantidades(Object.fromEntries(devolvibles.map((l) => [l.idx, l.disponible])));
+  }, [devolvibles]);
+
+  const limpiarSeleccion = useCallback(() => setCantidades({}), []);
+
+  /**
+   * Envía la selección: como SOLICITUD (empleado) o aprobándola en el acto
+   * (admin). El cajón SOLO se dispara cuando el servidor responde
+   * `abrirCajon: true`, es decir, tras una aprobación real con salida de
+   * efectivo — nunca al dejar una solicitud pendiente.
+   */
+  const enviarSeleccion = useCallback(async () => {
+    if (!detalle || enviando) return;
+    const seleccion = Object.entries(cantidades)
+      .map(([idx, qty]) => ({ idx: Number(idx), qty }))
+      .filter((s) => s.qty > 0);
+    if (seleccion.length === 0) {
+      setError("Selecciona al menos un producto y una cantidad para devolver.");
+      return;
+    }
+
+    setEnviando(true);
+    setError(null);
+    try {
+      const r = await solicitarDevolucion(detalle.id, seleccion, motivo, esAdministrador);
+      if (!r.ok) {
+        setError(r.error ?? "No se pudo registrar la devolución.");
+        return;
+      }
+
+      if (!r.autoAprobada) {
+        showToast(
+          "Devolución solicitada",
+          `${folio}: ${formatCOP(r.monto)} queda pendiente de aprobación del administrador. ` +
+            "No se ha tocado el inventario ni la caja.",
+        );
+        onSolicitada?.();
+        onClose();
+        return;
+      }
+
+      // Aprobada en el acto por el dueño: aquí SÍ se movió stock y caja.
+      const aviso =
+        r.sinProducto > 0
+          ? ` ${r.sinProducto} línea(s) no se pudieron reponer porque el producto ya no está en el catálogo.`
+          : "";
+      showToast(
+        "Devolución procesada",
+        `${folio}: ${formatCOP(r.monto)} reembolsado y ${r.unidades} unidad(es) devueltas al inventario.${aviso}`,
+      );
+
+      // EL CAJÓN, SOLO AHORA. Lo autoriza el servidor (`abrir_cajon`), que es
+      // quien sabe si de verdad salió efectivo; el hardware es local.
+      const { drawer, printer } = loadDeviceSettings();
+      const pin = pinCajonDevolucion(r.abrirCajon, detalle.metodo, drawer);
+      if (pin !== null) {
+        const res = await openCashDrawer(pin, printer);
+        if (!res.ok) showToast("El cajón no respondió", res.message);
+      }
+
+      onDevuelta();
+      onSolicitada?.();
+      onClose();
+    } finally {
+      setEnviando(false);
+    }
+  }, [
+    detalle,
+    enviando,
+    cantidades,
+    motivo,
+    esAdministrador,
+    folio,
+    showToast,
+    onDevuelta,
+    onSolicitada,
+    onClose,
+  ]);
+
+  /**
+   * Devolución TOTAL por la vía antigua (`registrar_devolucion`). Solo aplica a
+   * las ventas importadas que no guardan desglose de líneas: sin `items` no hay
+   * nada que seleccionar, pero el dinero sí hay que devolverlo.
+   */
+  const devolverCompleta = useCallback(async () => {
+    if (!detalle || enviando) return;
+    setEnviando(true);
     setError(null);
     try {
       const r = await registrarDevolucion(detalle.id, motivo);
@@ -188,21 +350,27 @@ export default function VentaDetalleModal({
           "No se volvió a tocar el inventario (la operación es idempotente).",
         );
       } else {
-        const aviso =
-          r.sinProducto > 0
-            ? ` ${r.sinProducto} línea(s) no se pudieron reponer porque el producto ya no está en el catálogo.`
-            : "";
         showToast(
           "Devolución procesada",
-          `${folio}: ${formatCOP(detalle.total)} reembolsado y ${r.unidades} unidad(es) devueltas al inventario.${aviso}`,
+          `${folio}: ${formatCOP(saldoReembolsable)} reembolsado.`,
         );
+        const { drawer, printer } = loadDeviceSettings();
+        const pin = pinCajonDevolucion(
+          detalle.metodo === "Efectivo" && saldoReembolsable > 0,
+          detalle.metodo,
+          drawer,
+        );
+        if (pin !== null) {
+          const res = await openCashDrawer(pin, printer);
+          if (!res.ok) showToast("El cajón no respondió", res.message);
+        }
       }
       onDevuelta();
       onClose();
     } finally {
-      setDevolviendo(false);
+      setEnviando(false);
     }
-  }, [detalle, devolviendo, motivo, folio, showToast, onDevuelta, onClose]);
+  }, [detalle, enviando, motivo, folio, saldoReembolsable, showToast, onDevuelta, onClose]);
 
   return (
     <div
@@ -228,10 +396,16 @@ export default function VentaDetalleModal({
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-2">
-            {devuelta && (
+            {devuelta ? (
               <span className="rounded-full bg-red-500/10 px-2.5 py-1 text-xs font-medium text-red-400 ring-1 ring-inset ring-red-500/20">
                 Reembolsado
               </span>
+            ) : (
+              devueltoTotal > 0 && (
+                <span className="rounded-full bg-amber-500/10 px-2.5 py-1 text-xs font-medium text-amber-300 ring-1 ring-inset ring-amber-500/20">
+                  {formatCOP(devueltoTotal)} devuelto
+                </span>
+              )
             )}
             <button
               type="button"
@@ -309,6 +483,14 @@ export default function VentaDetalleModal({
               <dt className="text-zinc-500">Método de pago</dt>
               <dd className="font-medium text-zinc-200">{metodo}</dd>
             </div>
+            {devueltoTotal > 0 && !devuelta && (
+              <div className="flex items-baseline justify-between">
+                <dt className="text-zinc-500">Ya reembolsado</dt>
+                <dd className="font-medium tabular-nums text-amber-300">
+                  −{formatCOP(devueltoTotal)}
+                </dd>
+              </div>
+            )}
             <div className="flex items-baseline justify-between border-t border-zinc-800 pt-2">
               <dt className="text-sm font-semibold text-zinc-300">Total general</dt>
               <dd
@@ -328,26 +510,169 @@ export default function VentaDetalleModal({
             </p>
           )}
 
+          {/* El aviso de migración solo estorba al devolver: ver y reimprimir
+              no dependen de `devolucion_disponible`. */}
+          {avisoDisponible && confirmando && !cargando && (
+            <p className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">
+              {avisoDisponible}
+            </p>
+          )}
+
           {error && (
             <p role="alert" className="mt-3 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
               {error}
             </p>
           )}
 
-          {/* Confirmación de la devolución (segundo paso). Reservada al dueño:
-              el empleado no la ve ni aunque el modal se abriera con la acción. */}
-          {confirmando && !devuelta && esAdministrador && (
+          {/* ── Selector de devolución parcial (segundo paso) ──────────────
+              Las cantidades salen de `devolucion_disponible`: cada contador
+              tope es lo que REALMENTE queda por devolver de esa línea. */}
+          {confirmando && !devuelta && (
             <div className="mt-4 rounded-xl border border-amber-500/30 bg-amber-500/5 p-4">
-              <p className="text-sm font-medium text-amber-200">
-                ¿Devolver {formatCOP(total)}?
-              </p>
-              <p className="mt-1 text-xs text-amber-300/70">
-                Las {unidades} unidad{unidades === 1 ? "" : "es"} de catálogo vuelven al inventario
-                de tu empresa y la venta queda marcada como reembolsada. Si el cobro fue en
-                efectivo, se registra el egreso en la caja de hoy.
-              </p>
+              <div className="flex items-start justify-between gap-3">
+                <p className="text-sm font-medium text-amber-200">
+                  {esAdministrador ? "Devolución" : "Solicitud de devolución"}
+                </p>
+                {hayDesglose && devolvibles.length > 0 && (
+                  <div className="flex shrink-0 gap-2 text-[11px] font-medium">
+                    <button
+                      type="button"
+                      onClick={seleccionarTodo}
+                      className="rounded-md border border-amber-500/30 px-2 py-1 text-amber-300 transition-colors hover:bg-amber-500/10"
+                    >
+                      Todo
+                    </button>
+                    <button
+                      type="button"
+                      onClick={limpiarSeleccion}
+                      className="rounded-md border border-zinc-700 px-2 py-1 text-zinc-400 transition-colors hover:bg-zinc-800"
+                    >
+                      Ninguno
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {!hayDesglose ? (
+                // Venta importada sin líneas: no hay nada que seleccionar.
+                esAdministrador ? (
+                  <p className="mt-1 text-xs text-amber-300/70">
+                    Esta venta no guarda desglose por producto, así que solo puede devolverse
+                    completa: {formatCOP(saldoReembolsable)}. No hay stock que reponer.
+                  </p>
+                ) : (
+                  <p className="mt-1 text-xs text-amber-300/70">
+                    Esta venta no guarda desglose por producto: solo el administrador puede
+                    devolverla completa.
+                  </p>
+                )
+              ) : devolvibles.length === 0 ? (
+                <p className="mt-1 text-xs text-amber-300/70">
+                  No queda nada por devolver de esta factura: todas sus unidades ya se devolvieron
+                  o están en una solicitud pendiente de aprobación.
+                </p>
+              ) : (
+                <>
+                  <p className="mt-1 text-xs text-amber-300/70">
+                    Marca cuántas unidades vuelven de cada producto. El tope es lo que queda
+                    devolvible (ya se descontó lo devuelto antes y lo pedido en solicitudes
+                    pendientes).
+                  </p>
+                  <ul className="mt-3 space-y-1.5">
+                    {disponible?.lineas.map((l) => {
+                      const q = cantidades[l.idx] ?? 0;
+                      const agotada = l.disponible === 0;
+                      return (
+                        <li
+                          key={l.idx}
+                          className={`flex items-center gap-2 rounded-lg border px-2.5 py-2 ${
+                            agotada
+                              ? "border-zinc-800 bg-zinc-950/40 opacity-60"
+                              : "border-zinc-800 bg-zinc-950/60"
+                          }`}
+                        >
+                          <input
+                            type="checkbox"
+                            id={`dev-chk-${l.idx}`}
+                            checked={q > 0}
+                            disabled={agotada || enviando}
+                            onChange={(e) =>
+                              setCantidad(l.idx, e.target.checked ? l.disponible : 0, l.disponible)
+                            }
+                            className="h-4 w-4 shrink-0 accent-amber-500 disabled:cursor-not-allowed"
+                          />
+                          <label
+                            htmlFor={`dev-chk-${l.idx}`}
+                            className="min-w-0 flex-1 cursor-pointer"
+                          >
+                            <span className="block truncate text-xs font-medium text-zinc-100">
+                              {l.nombre}
+                              {l.esComun && (
+                                <span className="ml-1.5 rounded bg-violet-500/20 px-1.5 py-0.5 text-[10px] font-medium text-violet-300">
+                                  común
+                                </span>
+                              )}
+                            </span>
+                            <span className="block text-[11px] tabular-nums text-zinc-500">
+                              {formatCOP(l.precio)} c/u · {l.disponible} de {l.qty} devolvible
+                              {l.disponible === 1 ? "" : "s"}
+                              {l.pendiente > 0 && ` · ${l.pendiente} en solicitud pendiente`}
+                            </span>
+                          </label>
+                          <div className="flex shrink-0 items-center gap-1">
+                            <button
+                              type="button"
+                              aria-label={`Quitar una unidad de ${l.nombre}`}
+                              disabled={agotada || q <= 0 || enviando}
+                              onClick={() => setCantidad(l.idx, q - 1, l.disponible)}
+                              className="h-7 w-7 rounded-md border border-zinc-700 text-sm font-semibold text-zinc-300 transition-colors hover:bg-zinc-800 disabled:opacity-30"
+                            >
+                              −
+                            </button>
+                            <input
+                              type="number"
+                              inputMode="numeric"
+                              min={0}
+                              max={l.disponible}
+                              step={1}
+                              value={q}
+                              disabled={agotada || enviando}
+                              aria-label={`Unidades a devolver de ${l.nombre}`}
+                              onChange={(e) =>
+                                setCantidad(l.idx, Number(e.target.value), l.disponible)
+                              }
+                              className="h-7 w-12 rounded-md border border-zinc-700 bg-zinc-950 text-center text-xs tabular-nums text-zinc-100 focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500 disabled:opacity-40"
+                            />
+                            <button
+                              type="button"
+                              aria-label={`Añadir una unidad de ${l.nombre}`}
+                              disabled={agotada || q >= l.disponible || enviando}
+                              onClick={() => setCantidad(l.idx, q + 1, l.disponible)}
+                              className="h-7 w-7 rounded-md border border-zinc-700 text-sm font-semibold text-zinc-300 transition-colors hover:bg-zinc-800 disabled:opacity-30"
+                            >
+                              +
+                            </button>
+                          </div>
+                        </li>
+                      );
+                    })}
+                  </ul>
+
+                  {/* Total a reembolsar: se recalcula con cada contador. */}
+                  <div className="mt-3 flex items-baseline justify-between rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2">
+                    <span className="text-xs text-amber-200">
+                      {unidadesSeleccionadas} unidad{unidadesSeleccionadas === 1 ? "" : "es"} a
+                      devolver
+                    </span>
+                    <span className="text-lg font-bold tabular-nums text-amber-200">
+                      {formatCOP(montoSeleccionado)}
+                    </span>
+                  </div>
+                </>
+              )}
+
               <label htmlFor="devolucion-motivo" className="mb-1.5 mt-3 block text-xs font-medium text-zinc-400">
-                Motivo (opcional)
+                Motivo {esAdministrador ? "(opcional)" : "(se lo verá el administrador)"}
               </label>
               <input
                 id="devolucion-motivo"
@@ -357,23 +682,47 @@ export default function VentaDetalleModal({
                 maxLength={140}
                 className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2.5 text-sm text-zinc-100 placeholder:text-zinc-600 focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500"
               />
+
+              <p className="mt-2 text-[11px] leading-relaxed text-zinc-500">
+                {esAdministrador
+                  ? "Al aprobar, las unidades vuelven al inventario de tu empresa y, si el cobro fue en efectivo, se registra el egreso en la caja de hoy y se abre el cajón de dinero."
+                  : "Queda registrada como solicitud pendiente: no se mueve el inventario, ni la caja, ni el cajón de dinero hasta que el administrador la apruebe."}
+              </p>
+
               <div className="mt-3 flex gap-2.5">
                 <button
                   type="button"
                   onClick={() => setConfirmando(false)}
-                  disabled={devolviendo}
+                  disabled={enviando}
                   className="h-10 flex-1 rounded-lg border border-zinc-700 text-sm font-medium text-zinc-300 transition-colors hover:bg-zinc-800 disabled:opacity-40"
                 >
                   Cancelar
                 </button>
-                <button
-                  type="button"
-                  onClick={() => void confirmarDevolucion()}
-                  disabled={devolviendo}
-                  className="h-10 flex-1 rounded-lg bg-gradient-to-r from-red-500 to-rose-600 text-sm font-semibold text-white shadow-lg shadow-red-500/20 transition-all active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  {devolviendo ? "Procesando…" : "Confirmar devolución"}
-                </button>
+                {hayDesglose ? (
+                  <button
+                    type="button"
+                    onClick={() => void enviarSeleccion()}
+                    disabled={enviando || unidadesSeleccionadas === 0}
+                    className="h-10 flex-1 rounded-lg bg-gradient-to-r from-red-500 to-rose-600 text-sm font-semibold text-white shadow-lg shadow-red-500/20 transition-all active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {enviando
+                      ? "Procesando…"
+                      : esAdministrador
+                        ? `Aprobar y devolver ${formatCOP(montoSeleccionado)}`
+                        : `Solicitar ${formatCOP(montoSeleccionado)}`}
+                  </button>
+                ) : (
+                  esAdministrador && (
+                    <button
+                      type="button"
+                      onClick={() => void devolverCompleta()}
+                      disabled={enviando || saldoReembolsable <= 0}
+                      className="h-10 flex-1 rounded-lg bg-gradient-to-r from-red-500 to-rose-600 text-sm font-semibold text-white shadow-lg shadow-red-500/20 transition-all active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {enviando ? "Procesando…" : "Devolver la factura completa"}
+                    </button>
+                  )
+                )}
               </div>
             </div>
           )}
@@ -394,21 +743,29 @@ export default function VentaDetalleModal({
             </svg>
             {imprimiendo ? "Imprimiendo…" : "Reimprimir tirilla"}
           </button>
-          {esAdministrador && (
-            <button
-              type="button"
-              onClick={() => setConfirmando(true)}
-              disabled={cargando || !detalle || devuelta || confirmando}
-              title={devuelta ? "Esta venta ya fue devuelta" : "Devolver la venta y reponer el stock"}
-              className="inline-flex flex-1 items-center justify-center gap-2 rounded-lg border border-red-500/40 bg-red-500/10 py-2.5 text-xs font-semibold text-red-300 transition-colors hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
-                <path d="M9 14 4 9l5-5" />
-                <path d="M4 9h11a5 5 0 0 1 0 10h-1" />
-              </svg>
-              {devuelta ? "Ya devuelta" : "Realizar devolución"}
-            </button>
-          )}
+          <button
+            type="button"
+            onClick={() => setConfirmando(true)}
+            disabled={cargando || !detalle || devuelta || confirmando}
+            title={
+              devuelta
+                ? "Esta venta ya fue devuelta"
+                : esAdministrador
+                  ? "Elegir qué ítems devolver y reponer su stock"
+                  : "Elegir qué ítems devolver y enviarlo a aprobación del administrador"
+            }
+            className="inline-flex flex-1 items-center justify-center gap-2 rounded-lg border border-red-500/40 bg-red-500/10 py-2.5 text-xs font-semibold text-red-300 transition-colors hover:bg-red-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+              <path d="M9 14 4 9l5-5" />
+              <path d="M4 9h11a5 5 0 0 1 0 10h-1" />
+            </svg>
+            {devuelta
+              ? "Ya devuelta"
+              : esAdministrador
+                ? "Devolver ítems"
+                : "Solicitar devolución"}
+          </button>
         </div>
       </div>
     </div>
