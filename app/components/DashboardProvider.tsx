@@ -129,6 +129,12 @@ type DashboardContextValue = {
   // Ventas (persistidas en `public.ventas`, con fecha/canal/estado del archivo)
   sales: Sale[];
   addSales: (rows: NewSale[]) => Promise<number>;
+  /**
+   * Relee del servidor lo que una DEVOLUCIÓN deja desactualizado: el historial
+   * de ventas (la fila pasa a 'Reembolsado'), el total, las métricas y el
+   * inventario (el stock vuelve al catálogo). No inventa nada en el cliente.
+   */
+  refreshSales: () => Promise<void>;
   monthlyRevenue: MonthPoint[];
   salesTotal: number;
   // Rentabilidad (margen real + rotación, calculados en el servidor)
@@ -461,6 +467,25 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
     return res.insertados + res.actualizados;
   }, []);
 
+  /**
+   * Resincroniza con Supabase todo lo que toca una devolución de venta, en
+   * paralelo y en una sola pasada: historial, total exacto (RPC), rentabilidad y
+   * catálogo (el stock devuelto). Se usa desde el panel de Transacciones tras
+   * procesar un reembolso; la verdad la sigue poniendo el servidor.
+   */
+  const refreshSales = useCallback(async (): Promise<void> => {
+    const [ventas, total, mets, productos] = await Promise.all([
+      fetchVentasEmpresa(),
+      fetchTotalVentasEmpresa(),
+      fetchMetricasRentabilidad(),
+      fetchProductosEmpresa(),
+    ]);
+    setSales(ventas);
+    setSalesTotal(total);
+    setMetricas(mets);
+    setInventory(productos);
+  }, []);
+
   // ── Compras ─────────────────────────────────────────────────────────────
   // Las órdenes se PERSISTEN en Supabase (`public.compras`, aislada por RLS y por
   // filtro explícito de `empresa_id`), no solo en memoria/localStorage: por eso
@@ -522,6 +547,7 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
       addCustomers,
       sales,
       addSales,
+      refreshSales,
       monthlyRevenue,
       // Total exacto del servidor (RPC), no una derivación local por dispositivo.
       salesTotal,
@@ -544,6 +570,7 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
     addCustomers,
     sales,
     addSales,
+    refreshSales,
     monthlyRevenue,
     salesTotal,
     metricas,

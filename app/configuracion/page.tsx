@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import PageShell from "../components/PageShell";
 import { useDashboard } from "../components/DashboardProvider";
+import AdminGate from "../components/config/AdminGate";
 import DevicesSection from "../components/config/DevicesSection";
 import PasswordSection from "../components/config/PasswordSection";
 import { generateDailySummary } from "../lib/notifications/whatsapp-service";
@@ -71,13 +72,17 @@ export default function ConfiguracionPage() {
   const phoneValid = phoneDigits.length >= 7 && phoneDigits.length <= 15;
 
   // Preview del reporte que se enviaría, con los datos vivos del dashboard.
+  // Solo se computa para el dueño: al empleado la tarjeta ni se le pinta (ver
+  // <AdminGate> abajo), así que recorrer ventas e inventario sería trabajo tirado.
   const preview = useMemo(
     () =>
-      generateDailySummary(sales, {
-        inventory,
-        businessName,
-      }),
-    [sales, inventory, businessName],
+      esAdministrador
+        ? generateDailySummary(sales, {
+            inventory,
+            businessName,
+          })
+        : "",
+    [esAdministrador, sales, inventory, businessName],
   );
 
   // Guarda el nombre de empresa en SUPABASE (`empresas.nombre` vía la RPC
@@ -210,10 +215,39 @@ export default function ConfiguracionPage() {
 
         {/* Dispositivos de la caja (POS) — incluye la sección nativa "Tirilla de
             venta" (Impresora de Tickets) con NIT, dirección, teléfono, mensaje y
-            LOGO, persistidos por tenant en Supabase. */}
-        <DevicesSection />
+            LOGO, persistidos por tenant en Supabase.
 
-        {/* Reporte diario por WhatsApp */}
+            RESERVADO AL DUEÑO: el hardware de la caja es configuración de la
+            operación, no una preferencia del cajero. Un empleado que apague la
+            auto-impresión o cambie el pin del cajón dejaría la caja inservible
+            para todos los turnos. */}
+        <AdminGate
+          titulo="Dispositivos"
+          motivo="La impresora de tickets, el lector de códigos, el cajón de dinero y la báscula los configura únicamente el administrador de la empresa."
+          icono={
+            <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+              <rect x="2" y="3" width="20" height="14" rx="2" />
+              <path d="M8 21h8" />
+              <path d="M12 17v4" />
+            </svg>
+          }
+        >
+          <DevicesSection />
+        </AdminGate>
+
+        {/* Reporte diario por WhatsApp + su vista previa.
+            RESERVADO AL DUEÑO: el resumen del día (ventas, método predominante,
+            alertas de inventario) es información del negocio y se envía a un
+            número del negocio. Un empleado no debe activarlo ni redirigirlo. */}
+        <AdminGate
+          titulo="Recibir reporte diario vía WhatsApp"
+          motivo="El resumen diario del negocio y el número al que se envía los gestiona únicamente el administrador de la empresa."
+          icono={
+            <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5Z" />
+            </svg>
+          }
+        >
         <section className="relative overflow-hidden rounded-xl border border-violet-500/15 bg-zinc-900/50 p-6">
           <div className="pointer-events-none absolute -right-20 -top-20 h-56 w-56 rounded-full bg-violet-600/10 blur-3xl" />
 
@@ -323,6 +357,7 @@ export default function ConfiguracionPage() {
             </p>
           )}
         </section>
+        </AdminGate>
       </div>
     </PageShell>
   );

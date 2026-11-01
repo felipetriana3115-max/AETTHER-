@@ -1,10 +1,13 @@
 "use client";
 
+import { useState } from "react";
 import PageShell from "../components/PageShell";
 import MetricCard from "../components/MetricCard";
 import EmptyState from "../components/EmptyState";
 import { useDashboard } from "../components/DashboardProvider";
-import { axisScale, formatCompactCOP, formatCOP, type SaleStatus } from "../lib/data-model";
+import VentaDetalleModal, { type AccionVenta } from "../components/VentaDetalleModal";
+import { axisScale, formatCompactCOP, formatCOP, type Sale, type SaleStatus } from "../lib/data-model";
+import { useRolSesion } from "../lib/useRol";
 
 const statusStyles: Record<SaleStatus, string> = {
   Pagado: "bg-emerald-500/10 text-emerald-400 ring-emerald-500/20",
@@ -12,9 +15,60 @@ const statusStyles: Record<SaleStatus, string> = {
   Pendiente: "bg-amber-500/10 text-amber-400 ring-amber-500/20",
 };
 
+/** Transacción abierta en el modal de factura, con la intención del clic. */
+type VentaAbierta = { venta: Sale; folio: string; accion: AccionVenta };
+
+/** Botón de acción por transacción (ícono + etiqueta accesible). */
+function AccionBoton({
+  label,
+  onClick,
+  tono = "neutro",
+  children,
+}: {
+  label: string;
+  onClick: () => void;
+  tono?: "neutro" | "peligro";
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={label}
+      aria-label={label}
+      className={`inline-flex h-8 w-8 items-center justify-center rounded-lg border transition-colors ${
+        tono === "peligro"
+          ? "border-red-500/30 text-red-400 hover:bg-red-500/10"
+          : "border-zinc-800 text-zinc-400 hover:border-violet-500/40 hover:bg-violet-500/10 hover:text-violet-300"
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
 export default function VentasPage() {
   // Estado global unificado: reacciona a la carga masiva de Excel.
-  const { sales: recentSales, monthlyRevenue, businessName, metricas } = useDashboard();
+  const {
+    sales: recentSales,
+    monthlyRevenue,
+    businessName,
+    metricas,
+    refreshSales,
+  } = useDashboard();
+
+  /**
+   * Devolver es cosa del dueño: mueve dinero (egreso de caja) e inventario
+   * sobre una venta ya cerrada. Fail-closed — el botón no aparece hasta
+   * confirmar el rol. El control REAL está en la RPC `registrar_devolucion`,
+   * que exige empresa_admin/super_admin; esto solo evita ofrecer un botón que
+   * fallaría. Ver y reimprimir siguen disponibles para cualquier empleado con
+   * permiso 'ventas'.
+   */
+  const { esAdministrador } = useRolSesion();
+
+  // Factura abierta (vista previa / reimpresión / devolución). Null = cerrada.
+  const [abierta, setAbierta] = useState<VentaAbierta | null>(null);
 
   const total = monthlyRevenue.reduce((s, m) => s + m.amount, 0);
   const paidSales = recentSales.filter((s) => s.status === "Pagado");
@@ -155,7 +209,7 @@ export default function VentasPage() {
           </div>
 
           <div className="overflow-x-auto">
-            <table className="w-full min-w-[760px] text-sm">
+            <table className="w-full min-w-[900px] text-sm">
               <thead>
                 <tr className="border-b border-zinc-800 text-left text-xs uppercase tracking-wide text-zinc-500">
                   <th className="px-5 py-3 font-medium">Referencia</th>
@@ -165,6 +219,7 @@ export default function VentasPage() {
                   <th className="px-5 py-3 font-medium">Fecha</th>
                   <th className="px-5 py-3 text-right font-medium">Monto</th>
                   <th className="px-5 py-3 text-right font-medium">Estado</th>
+                  <th className="px-5 py-3 text-right font-medium">Acciones</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-zinc-800/70">
@@ -193,6 +248,45 @@ export default function VentasPage() {
                         {s.status}
                       </span>
                     </td>
+                    {/* Acciones por transacción. Las tres abren la factura: la
+                        de impresión dispara la tirilla al cargarla y la de
+                        devolución salta directo a la confirmación, para que
+                        nadie reembolse sin ver antes qué está reembolsando. */}
+                    <td className="px-5 py-3.5">
+                      <div className="flex items-center justify-end gap-1.5">
+                        <AccionBoton
+                          label={`Ver factura ${folio}`}
+                          onClick={() => setAbierta({ venta: s, folio, accion: "ver" })}
+                        >
+                          <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z" />
+                            <circle cx="12" cy="12" r="3" />
+                          </svg>
+                        </AccionBoton>
+                        <AccionBoton
+                          label={`Reimprimir la tirilla de ${folio}`}
+                          onClick={() => setAbierta({ venta: s, folio, accion: "imprimir" })}
+                        >
+                          <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M6 9V2h12v7" />
+                            <path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2" />
+                            <path d="M6 14h12v8H6z" />
+                          </svg>
+                        </AccionBoton>
+                        {esAdministrador && s.status !== "Reembolsado" && (
+                          <AccionBoton
+                            label={`Realizar la devolución de ${folio}`}
+                            tono="peligro"
+                            onClick={() => setAbierta({ venta: s, folio, accion: "devolver" })}
+                          >
+                            <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M9 14 4 9l5-5" />
+                              <path d="M4 9h11a5 5 0 0 1 0 10h-1" />
+                            </svg>
+                          </AccionBoton>
+                        )}
+                      </div>
+                    </td>
                   </tr>
                   );
                 })}
@@ -201,6 +295,22 @@ export default function VentasPage() {
           </div>
         </section>
       </div>
+      )}
+
+      {/* Factura: vista previa del desglose + reimpresión + devolución. */}
+      {abierta && (
+        <VentaDetalleModal
+          // Remonta por transacción (y por intención): el modal carga su
+          // detalle una sola vez y dispara la acción del botón pulsado.
+          key={`${abierta.venta.id}:${abierta.accion}`}
+          venta={abierta.venta}
+          folio={abierta.folio}
+          accionInicial={abierta.accion}
+          onClose={() => setAbierta(null)}
+          // Tras devolver, la verdad la vuelve a poner el servidor: historial,
+          // total, métricas e inventario (el stock repuesto).
+          onDevuelta={() => void refreshSales()}
+        />
       )}
     </PageShell>
   );

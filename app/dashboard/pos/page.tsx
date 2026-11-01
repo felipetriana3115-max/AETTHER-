@@ -18,6 +18,16 @@ import { cacheCatalogo, descontarStockLocal, getFrecuentes } from "../../lib/off
 import { enqueueVenta } from "../../lib/offline/outbox";
 import { useOffline } from "../../lib/offline/useOffline";
 import { useRolSesion } from "../../lib/useRol";
+import {
+  MAX_EN_ESPERA,
+  etiquetaPorDefecto,
+  haceCuanto,
+  loadEstadoCaja,
+  saveEstadoCaja,
+  type CarritoEnEspera,
+  type LineaCarrito,
+  type Producto,
+} from "../../lib/pos-carrito";
 
 /**
  * Visor de cámara: se carga bajo demanda (`ssr: false`) porque toca
@@ -46,27 +56,9 @@ const CameraScanner = dynamic(() => import("../../components/CameraScanner"), { 
  */
 
 // ── Tipos ────────────────────────────────────────────────────────────────────
-
-type Producto = {
-  // Los productos reales usan UUID (string); los "artículos comunes" ids
-  // negativos temporales (number). Por eso la clave es `string | number`.
-  id: string | number;
-  nombre: string;
-  precio: number;
-  codigo_barras: string | null;
-  stock_actual: number;
-  /**
-   * Foto opcional del producto (URL pública del bucket `productos` de Storage).
-   * null/ausente → la tarjeta pinta el placeholder de iniciales. Los "artículos
-   * comunes" nunca la traen.
-   */
-  imagen_url?: string | null;
-};
-
-// Una línea puede ser un producto real del inventario o un "artículo común":
-// un ítem temporal (nombre + precio a mano) que NO existe en `productos` y por
-// tanto NO descuenta stock al cobrar. Se marca con `esComun`.
-type LineaCarrito = Producto & { qty: number; esComun?: boolean };
+//
+// `Producto`, `LineaCarrito` y `CarritoEnEspera` viven en `lib/pos-carrito.ts`
+// junto al espejo en `sessionStorage` que conserva la cuenta al navegar.
 
 // Métodos de caja (dinero recibido) + "Fiado" (venta a crédito). El fiado NO es
 // caja: se carga al saldo del cliente y se cobra al abonar (ver registrar_venta_fiado).
@@ -80,6 +72,13 @@ type Feedback = { tone: "error" | "ok"; msg: string } | null;
  * NO se envía a la cola ni a la RPC, la venta sigue registrándose igual.
  */
 type PagoEfectivo = { recibido: number; devuelto: number };
+
+/**
+ * Lo que el banner del cambio mantiene anclado en pantalla tras cobrar: el
+ * vuelto a entregar más el contexto para verificarlo (qué se cobró y con cuánto
+ * pagó el cliente) sin reabrir la calculadora.
+ */
+type CambioPendiente = PagoEfectivo & { total: number };
 
 // ── Config de UI ─────────────────────────────────────────────────────────────
 
@@ -201,9 +200,14 @@ export default function PosPage() {
   // Modal de cobro en efectivo: abierto + monto recibido (solo dígitos).
   const [efectivoAbierto, setEfectivoAbierto] = useState(false);
   const [recibido, setRecibido] = useState("");
-  // Banner del cambio de la última venta en efectivo. Objeto nuevo en cada cobro
-  // para que el temporizador se reinicie aunque el devuelto sea el mismo monto.
-  const [devuelto, setDevuelto] = useState<{ monto: number } | null>(null);
+  /**
+   * Banner del cambio de la última venta en efectivo. NO se autodestruye: el
+   * cajero cuenta el vuelto a su ritmo y lo tiene a la vista hasta que empieza
+   * la siguiente venta (primer producto en el carrito) o lo cierra a mano. Antes
+   * desaparecía solo a los 8 s y, si el cliente se demoraba, el monto exacto a
+   * devolver se perdía de pantalla.
+   */
+  const [devuelto, setDevuelto] = useState<CambioPendiente | null>(null);
   // Pulso del cajón en vuelo (el intento por WebUSB es asíncrono).
   const [abriendoCajon, setAbriendoCajon] = useState(false);
   // Línea seleccionada del carrito (para la tecla Delete). Guarda su `id`.
@@ -214,6 +218,16 @@ export default function PosPage() {
   const [comunPrecio, setComunPrecio] = useState("");
   // Visor de cámara (escaneo desde móvil/tablet, sin lector físico).
   const [camaraAbierta, setCamaraAbierta] = useState(false);
+  // ── Carritos en espera (hold) ────────────────────────────────────────────
+  // Cuentas aparcadas para atender a otro cliente sin perder la que se estaba
+  // armando. Viven solo en el cliente (nada viaja a Supabase hasta cobrar).
+  const [enEspera, setEnEspera] = useState<CarritoEnEspera[]>([]);
+  // Modal de pausa: abierto + etiqueta con la que se identificará la cuenta.
+  const [pausaAbierta, setPausaAbierta] = useState(false);
+  const [etiquetaPausa, setEtiquetaPausa] = useState("");
+  const etiquetaPausaRef = useRef<HTMLInputElement>(null);
+  // Panel desplegable con la lista de cuentas aparcadas.
+  const [esperaAbierta, setEsperaAbierta] = useState(false);
   const inputRef = useRef<BarcodeScannerHandle>(null);
   const comunNombreRef = useRef<HTMLInputElement>(null);
   // Contador de ids para los artículos comunes. Negativo y decreciente para no
@@ -246,6 +260,28 @@ export default function PosPage() {
   // true si el módulo de clientes/fiados aún no se ha migrado en Supabase.
   const [faltaFiado, setFaltaFiado] = useState(false);
 
+  // ── Persistencia de la caja al navegar ───────────────────────────────────
+  // `/dashboard/pos` es una ruta: salir a Inventario desmonta la página y el
+  // carrito se perdía. Espejamos carrito + cuentas en espera + cliente en
+  // `sessionStorage` (segmentado por empresa) y lo restauramos al volver, así
+  // que consultar otra sección ya no cuesta rearmar la cuenta.
+  // `hidratado` evita que el primer guardado (aún con el estado vacío del
+  // montaje) pise lo que había espejado.
+  const [hidratado, setHidratado] = useState(false);
+
+  useEffect(() => {
+    const guardado = loadEstadoCaja();
+    if (guardado.carrito.length > 0) setCarrito(guardado.carrito);
+    if (guardado.enEspera.length > 0) setEnEspera(guardado.enEspera);
+    if (guardado.cliente) setClienteSel(guardado.cliente);
+    setHidratado(true);
+  }, []);
+
+  useEffect(() => {
+    if (!hidratado) return;
+    saveEstadoCaja({ carrito, enEspera, cliente: clienteSel });
+  }, [hidratado, carrito, enEspera, clienteSel]);
+
   // Modo Sin Internet: estado de red + cola local de ventas. Al terminar una
   // sincronización con éxito, refrescamos el corte del servidor (fuente de verdad).
   const { online, pendientes, totalPend, sincronizando, sincronizar, refresh } = useOffline(() => {
@@ -268,13 +304,8 @@ export default function PosPage() {
     return () => clearTimeout(t);
   }, [feedback]);
 
-  // El banner del cambio dura más que el feedback: el cajero tiene que contar
-  // el devuelto con el carrito ya vacío.
-  useEffect(() => {
-    if (!devuelto) return;
-    const t = setTimeout(() => setDevuelto(null), 8000);
-    return () => clearTimeout(t);
-  }, [devuelto]);
+  // El banner del cambio NO lleva temporizador a propósito (ver `devuelto`):
+  // se cierra al iniciar la siguiente venta o con la ✕ del propio aviso.
 
   // Carga la identidad de la tirilla del tenant (una vez) para imprimirla en los
   // recibos. Best-effort: si falla, se imprime sin NIT/logo (degradación suave).
@@ -364,6 +395,8 @@ export default function PosPage() {
       setFeedback({ tone: "error", msg: `Sin stock: "${p.nombre}" no tiene existencias.` });
       return;
     }
+    // Empieza una venta nueva → el vuelto de la anterior ya se entregó.
+    setDevuelto(null);
     setCarrito((prev) => {
       const existente = prev.find((l) => l.id === p.id);
       if (existente) {
@@ -399,6 +432,129 @@ export default function PosPage() {
   const quitar = useCallback((id: string | number) => {
     setCarrito((prev) => prev.filter((l) => l.id !== id));
     setSeleccionado((sel) => (sel === id ? null : sel));
+  }, []);
+
+  // ── Carritos en espera (hold) ────────────────────────────────────────────
+  //
+  // Flujo de mostrador: hay una cuenta a medias y llega alguien con prisa (o el
+  // cliente se va a buscar otro producto). En vez de borrar el carrito, se
+  // aparca con una etiqueta, se atiende al otro cliente y luego se recupera
+  // intacto. Todo vive en el cliente: NADA viaja a Supabase hasta que se cobra,
+  // así que una cuenta en espera no toca inventario ni caja.
+
+  /** Abre el modal para etiquetar la cuenta que se va a aparcar. */
+  const abrirPausa = useCallback(() => {
+    if (carrito.length === 0) {
+      setFeedback({ tone: "error", msg: "No hay ninguna cuenta que poner en espera." });
+      return;
+    }
+    if (enEspera.length >= MAX_EN_ESPERA) {
+      setFeedback({
+        tone: "error",
+        msg: `Ya hay ${MAX_EN_ESPERA} cuentas en espera. Cobra o descarta alguna antes de pausar otra.`,
+      });
+      return;
+    }
+    setEtiquetaPausa(etiquetaPorDefecto(enEspera));
+    setPausaAbierta(true);
+  }, [carrito.length, enEspera]);
+
+  const cerrarPausa = useCallback(() => {
+    setPausaAbierta(false);
+    inputRef.current?.focus();
+  }, []);
+
+  // Autofoco (y preselección) de la etiqueta al abrir el modal: así el cajero
+  // puede escribir "Señora del sombrero" de un tirón sin borrar el texto.
+  useEffect(() => {
+    if (pausaAbierta) etiquetaPausaRef.current?.select();
+  }, [pausaAbierta]);
+
+  /**
+   * Aparca el carrito actual y deja la caja lista para el siguiente cliente.
+   * Devuelve el ticket creado para que `recuperarEspera` pueda intercambiar
+   * cuentas en una sola actualización de estado.
+   */
+  const pausarCarrito = useCallback(
+    (lineas: LineaCarrito[], cliente: Cliente | null, etiqueta: string): CarritoEnEspera => ({
+      // `crypto.randomUUID` está disponible en todo navegador con el POS (HTTPS);
+      // el sufijo aleatorio del respaldo evita colisiones al pausar en ráfaga.
+      id:
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `espera-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      etiqueta: etiqueta.trim() || "Cuenta en espera",
+      pausadoEn: new Date().toISOString(),
+      lineas,
+      cliente,
+    }),
+    [],
+  );
+
+  /** Confirma la pausa: el carrito pasa a la lista y la caja queda limpia. */
+  const confirmarPausa = useCallback(() => {
+    if (carrito.length === 0) return;
+    const ticket = pausarCarrito(carrito, clienteSel, etiquetaPausa);
+    setEnEspera((prev) => [...prev, ticket]);
+    setCarrito([]);
+    setClienteSel(null);
+    setSeleccionado(null);
+    setDevuelto(null);
+    setPausaAbierta(false);
+    setFeedback({
+      tone: "ok",
+      msg: `"${ticket.etiqueta}" quedó en espera (${formatCOP(
+        ticket.lineas.reduce((s, l) => s + l.precio * l.qty, 0),
+      )}). Recupérala cuando quieras.`,
+    });
+    inputRef.current?.focus();
+  }, [carrito, clienteSel, etiquetaPausa, pausarCarrito]);
+
+  /**
+   * Retoma una cuenta aparcada. Si en la caja hay otra cuenta a medias, se
+   * APARCA automáticamente en el mismo gesto (intercambio) en vez de perderla:
+   * es justo el caso de uso —atender a alguien urgente y volver— y descartar el
+   * carrito activo en silencio sería la peor forma de resolverlo.
+   */
+  const recuperarEspera = useCallback(
+    (id: string) => {
+      const ticket = enEspera.find((t) => t.id === id);
+      if (!ticket) return;
+
+      const hayCuentaActiva = carrito.length > 0;
+      const reemplazo = hayCuentaActiva
+        ? pausarCarrito(carrito, clienteSel, etiquetaPorDefecto(enEspera))
+        : null;
+
+      setEnEspera((prev) => {
+        const sinTicket = prev.filter((t) => t.id !== id);
+        return reemplazo ? [...sinTicket, reemplazo] : sinTicket;
+      });
+      setCarrito(ticket.lineas);
+      setClienteSel(ticket.cliente);
+      setSeleccionado(null);
+      setDevuelto(null);
+      setEsperaAbierta(false);
+      setFeedback({
+        tone: "ok",
+        msg: reemplazo
+          ? `Recuperada "${ticket.etiqueta}". La cuenta que tenías abierta quedó en espera como "${reemplazo.etiqueta}".`
+          : `Recuperada "${ticket.etiqueta}".`,
+      });
+      inputRef.current?.focus();
+    },
+    [enEspera, carrito, clienteSel, pausarCarrito],
+  );
+
+  /** Descarta una cuenta aparcada (nunca se cobró: no hay nada que revertir). */
+  const descartarEspera = useCallback((id: string) => {
+    setEnEspera((prev) => {
+      const ticket = prev.find((t) => t.id === id);
+      if (ticket) {
+        setFeedback({ tone: "ok", msg: `"${ticket.etiqueta}" se descartó.` });
+      }
+      return prev.filter((t) => t.id !== id);
+    });
   }, []);
 
   // ── Artículo común (ítem temporal sin inventario) ────────────────────────────
@@ -441,6 +597,8 @@ export default function PosPage() {
       return;
     }
     const id = comunIdRef.current--;
+    // Igual que en `agregar`: una línea nueva estrena venta y cierra el banner.
+    setDevuelto(null);
     setCarrito((prev) => [
       ...prev,
       {
@@ -487,6 +645,18 @@ export default function PosPage() {
   // Delete → borrar la línea seleccionada. Por defecto react-hotkeys-hook NO se
   // dispara mientras se escribe en un input, así que no interfiere con el escáner.
   useHotkeys("delete", () => borrarSeleccionado(), [borrarSeleccionado]);
+
+  // Ctrl+E → poner la cuenta en espera sin soltar el teclado. Igual que Ctrl+P,
+  // se habilita dentro del input del escáner (ahí vive el foco en caja).
+  useHotkeys(
+    "ctrl+e",
+    (e) => {
+      e.preventDefault();
+      abrirPausa();
+    },
+    { enableOnFormTags: true, preventDefault: true },
+    [abrirPausa],
+  );
 
   // El escaneo por `codigo_barras` lo maneja ahora <BarcodeScanner>, que emite el
   // producto hallado por `onScan` y lo pasamos a `agregar` mapeando sus columnas.
@@ -757,7 +927,8 @@ export default function PosPage() {
     const pago: PagoEfectivo = { recibido: montoRecibido, devuelto: montoRecibido - total };
     setEfectivoAbierto(false);
     setRecibido("");
-    setDevuelto({ monto: pago.devuelto });
+    // El banner queda anclado con el detalle del pago hasta la siguiente venta.
+    setDevuelto({ ...pago, total });
     void cobrar("Efectivo", pago);
   }, [cobrando, puedeCobrarEfectivo, montoRecibido, total, cobrar]);
 
@@ -869,21 +1040,44 @@ export default function PosPage() {
 
   return (
     <PageShell title="Punto de Venta" subtitle="Caja rápida · Escanea, cobra y descuenta inventario">
-      {/* ── Banner del cambio ──
-          Se pinta al confirmar el cobro y sobrevive al vaciado del carrito para
-          que el cajero cuente el devuelto con calma. */}
+      {/* ── Banner del cambio (anclado) ──
+          Se pinta al confirmar el cobro y SE QUEDA: sobrevive al vaciado del
+          carrito, no caduca por tiempo y viaja pegado bajo la barra superior
+          mientras el cajero desplaza la pantalla. Desaparece al añadir el primer
+          producto de la siguiente venta o al pulsar "Entregado". */}
       {devuelto && (
         <div
           role="status"
-          className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-emerald-500/40 bg-emerald-500/15 px-5 py-4"
+          aria-live="polite"
+          className="sticky top-16 z-20 mb-4 flex flex-wrap items-center justify-between gap-x-4 gap-y-3 rounded-xl border border-emerald-500/40 bg-emerald-950/90 px-5 py-4 shadow-lg shadow-emerald-900/40 backdrop-blur"
         >
-          <span className="flex items-center gap-2.5 text-sm font-semibold text-emerald-200">
+          <div className="flex min-w-0 items-center gap-2.5">
             <span className="text-xl" aria-hidden>💵</span>
-            Venta cobrada en efectivo · Cambio/Devuelto a entregar
-          </span>
-          <span className="text-3xl font-bold tabular-nums text-emerald-300">
-            {formatCOP(devuelto.monto)}
-          </span>
+            <div className="min-w-0">
+              <p className="text-sm font-semibold text-emerald-200">
+                Venta cobrada en efectivo · Cambio a entregar
+              </p>
+              <p className="text-xs text-emerald-300/70 tabular-nums">
+                Total {formatCOP(devuelto.total)} · Recibido {formatCOP(devuelto.recibido)}
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <span className="text-3xl font-bold tabular-nums text-emerald-300">
+              {formatCOP(devuelto.devuelto)}
+            </span>
+            <button
+              type="button"
+              onClick={() => {
+                setDevuelto(null);
+                inputRef.current?.focus();
+              }}
+              title="Ocultar el aviso del cambio"
+              className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-xs font-semibold text-emerald-100 transition-colors hover:bg-emerald-500/20"
+            >
+              Entregado
+            </button>
+          </div>
         </div>
       )}
 
@@ -1084,17 +1278,102 @@ export default function PosPage() {
           )}
 
           <div
-            className={`flex items-center justify-between border-b border-zinc-800 p-4 ${
-              esAdministrador ? "" : "rounded-t-xl"
-            }`}
+            className={`border-b border-zinc-800 p-4 ${esAdministrador ? "" : "rounded-t-xl"}`}
           >
-            <h3 className="text-sm font-semibold text-zinc-100">
-              Carrito {unidades > 0 && <span className="text-zinc-500">· {unidades} und</span>}
-            </h3>
-            {carrito.length > 0 && (
-              <span className="text-xs text-zinc-500">
-                Selecciona y pulsa <kbd className="rounded border border-zinc-700 bg-zinc-800 px-1 py-0.5 text-[10px]">Supr</kbd> para borrar
-              </span>
+            <div className="flex items-center justify-between gap-3">
+              <h3 className="text-sm font-semibold text-zinc-100">
+                Carrito {unidades > 0 && <span className="text-zinc-500">· {unidades} und</span>}
+              </h3>
+              {carrito.length > 0 && (
+                <span className="hidden text-xs text-zinc-500 sm:inline">
+                  Selecciona y pulsa <kbd className="rounded border border-zinc-700 bg-zinc-800 px-1 py-0.5 text-[10px]">Supr</kbd> para borrar
+                </span>
+              )}
+            </div>
+
+            {/* ── Cuentas en espera (hold) ──
+                Aparcar la cuenta en curso para atender a otro cliente y
+                recuperarla después, sin perder una sola línea. */}
+            <div className="mt-3 flex items-center gap-2">
+              <button
+                type="button"
+                onClick={abrirPausa}
+                disabled={carrito.length === 0 || cobrando}
+                title="Aparca esta cuenta y deja la caja libre para otro cliente (Ctrl+E)"
+                className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs font-semibold text-amber-200 transition-colors hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                  <rect x="6" y="4" width="4" height="16" rx="1" />
+                  <rect x="14" y="4" width="4" height="16" rx="1" />
+                </svg>
+                Poner en espera
+              </button>
+              <button
+                type="button"
+                onClick={() => setEsperaAbierta((v) => !v)}
+                disabled={enEspera.length === 0}
+                aria-expanded={esperaAbierta}
+                title="Ver las cuentas aparcadas"
+                className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-zinc-700 px-3 py-2 text-xs font-semibold text-zinc-300 transition-colors hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                En espera
+                <span
+                  className={`inline-flex min-w-5 items-center justify-center rounded-full px-1.5 py-0.5 text-[10px] font-bold ${
+                    enEspera.length > 0 ? "bg-amber-500/20 text-amber-300" : "bg-zinc-800 text-zinc-500"
+                  }`}
+                >
+                  {enEspera.length}
+                </span>
+                <svg
+                  className={`h-3.5 w-3.5 transition-transform ${esperaAbierta ? "rotate-180" : ""}`}
+                  viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round"
+                >
+                  <path d="m6 9 6 6 6-6" />
+                </svg>
+              </button>
+            </div>
+
+            {esperaAbierta && enEspera.length > 0 && (
+              <ul className="mt-2.5 max-h-56 space-y-1.5 overflow-y-auto rounded-lg border border-zinc-800 bg-zinc-950/70 p-2">
+                {enEspera.map((t) => {
+                  const totalTicket = t.lineas.reduce((s, l) => s + l.precio * l.qty, 0);
+                  const unidadesTicket = t.lineas.reduce((s, l) => s + l.qty, 0);
+                  return (
+                    <li
+                      key={t.id}
+                      className="flex items-center gap-2 rounded-lg px-2 py-1.5 transition-colors hover:bg-zinc-800/40"
+                    >
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-xs font-semibold text-zinc-100">
+                          {t.etiqueta}
+                          {t.cliente && (
+                            <span className="ml-1.5 font-normal text-violet-300">· {t.cliente.nombre}</span>
+                          )}
+                        </p>
+                        <p className="truncate text-[11px] text-zinc-500 tabular-nums">
+                          {unidadesTicket} und · {formatCOP(totalTicket)} · {haceCuanto(t.pausadoEn)}
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => recuperarEspera(t.id)}
+                        className="shrink-0 rounded-lg border border-violet-500/40 bg-violet-500/10 px-2.5 py-1.5 text-[11px] font-semibold text-violet-200 transition-colors hover:bg-violet-500/20"
+                      >
+                        Recuperar
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => descartarEspera(t.id)}
+                        aria-label={`Descartar ${t.etiqueta}`}
+                        title="Descartar esta cuenta en espera"
+                        className="shrink-0 rounded-lg px-1.5 py-1.5 text-xs text-zinc-600 transition-colors hover:bg-red-500/10 hover:text-red-400"
+                      >
+                        ✕
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
             )}
           </div>
 
@@ -1372,6 +1651,71 @@ export default function PosPage() {
               </div>
             </form>
           </div>
+        </div>
+      )}
+
+      {/* ── Modal: Poner la cuenta en espera ──
+          Solo pide una etiqueta para reconocerla después ("Mesa 3", "Señor de
+          la gorra"). El carrito no se cobra ni toca inventario: se aparca. */}
+      {pausaAbierta && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="pausa-titulo"
+          onClick={cerrarPausa}
+        >
+          <form
+            className="w-full max-w-sm rounded-2xl border border-amber-500/30 bg-zinc-900 p-6 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+            onSubmit={(e) => {
+              e.preventDefault();
+              confirmarPausa();
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") cerrarPausa();
+            }}
+          >
+            <h3 id="pausa-titulo" className="text-base font-semibold text-zinc-100">
+              Poner la cuenta en espera
+            </h3>
+            <p className="mt-1 text-xs text-zinc-500">
+              {unidades} und · {formatCOP(total)}
+              {clienteSel && ` · ${clienteSel.nombre}`}. La cuenta se guarda tal cual y no se cobra
+              hasta que la recuperes.
+            </p>
+
+            <div className="mt-4">
+              <label htmlFor="pausa-etiqueta" className="mb-1.5 block text-xs font-medium text-zinc-400">
+                ¿Cómo la reconoces?
+              </label>
+              <input
+                id="pausa-etiqueta"
+                ref={etiquetaPausaRef}
+                value={etiquetaPausa}
+                onChange={(e) => setEtiquetaPausa(e.target.value)}
+                placeholder="Ej. Mesa 3, señora del sombrero…"
+                maxLength={60}
+                className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-3 text-base text-zinc-100 placeholder:text-zinc-500 focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500"
+              />
+            </div>
+
+            <div className="mt-4 flex gap-2.5">
+              <button
+                type="button"
+                onClick={cerrarPausa}
+                className="h-12 flex-1 rounded-lg border border-zinc-700 text-sm font-medium text-zinc-300 transition-colors hover:bg-zinc-800"
+              >
+                Cancelar
+              </button>
+              <button
+                type="submit"
+                className="h-12 flex-1 rounded-lg bg-gradient-to-r from-amber-500 to-orange-600 text-sm font-semibold text-white shadow-lg shadow-amber-500/30 transition-all active:scale-[0.98]"
+              >
+                Poner en espera
+              </button>
+            </div>
+          </form>
         </div>
       )}
 
