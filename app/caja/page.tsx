@@ -2,7 +2,9 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import PageShell from "../components/PageShell";
+import DevolucionesPendientes from "../components/DevolucionesPendientes";
 import { formatCOP } from "../lib/data-model";
+import { getEmpresaIdActiva } from "../lib/auth";
 import {
   abrirCaja,
   cerrarCaja,
@@ -22,11 +24,38 @@ import type { CorteCaja } from "../lib/corte";
  *  2) Movimientos rápidos: entradas/salidas manuales (concepto + monto).
  *  3) Cierre ciego (Reporte Z): el cajero cuenta el efectivo en mano SIN ver el
  *     esperado; al procesar, el servidor calcula y revela sobrante/faltante.
+ *
+ * EGRESOS AUTOMÁTICOS POR DEVOLUCIÓN: cuando el administrador APRUEBA una
+ * devolución de una venta cobrada en efectivo, `resolver_devolucion` inserta el
+ * egreso en `movimientos_caja` dentro de la MISMA transacción que repone el
+ * stock (ver supabase/2026-10-devoluciones-parciales.sql). Nadie lo teclea y
+ * nadie lo puede editar desde aquí: entra por el servidor con el día de negocio
+ * de `hoy_negocio()`, así que `cerrar_caja` —que suma TODOS los movimientos del
+ * día— ya lo descuenta del esperado y el Reporte Z cuadra con el cajón.
+ * Por eso la bandeja de aprobación vive también en esta página: al aprobar se
+ * relee el arqueo y el egreso aparece al instante, sin recargar.
+ *
+ * AISLAMIENTO: cada escritura resuelve `empresa_id` de la SESIÓN VIVA (RPC o
+ * `getEmpresaIdActiva`), nunca de un caché ni del formulario; encima está RLS.
+ * Si la sesión no tiene empresa, los botones que escriben quedan bloqueados en
+ * vez de mandar una fila que acabaría huérfana o rechazada.
  */
 
 // Extrae un entero de pesos de un texto libre ("$5.000" → 5000).
 function parseMonto(s: string): number {
   return Math.round(Number(s.replace(/[^\d]/g, "")));
+}
+
+/**
+ * Prefijo con el que `resolver_devolucion` marca sus egresos. Sirve para
+ * SEPARAR en la UI lo que puso el servidor de lo que tecleó el cajero; el
+ * cálculo del cierre no cambia (el servidor los suma todos por igual).
+ */
+const CONCEPTO_DEVOLUCION = "Devolución venta ";
+
+/** true si el movimiento lo generó la aprobación de una devolución. */
+function esDevolucionAprobada(m: MovimientoCaja): boolean {
+  return m.tipo === "egreso" && m.concepto.startsWith(CONCEPTO_DEVOLUCION);
 }
 
 // Bases sugeridas para apertura rápida (un toque).
@@ -50,6 +79,16 @@ export default function CajaPage() {
 
   // Resultado del cierre recién procesado (desglose autoritativo del servidor).
   const [cierreVivo, setCierreVivo] = useState<CierreResultado | null>(null);
+
+  /**
+   * Empresa de la sesión viva. No se envía en ningún formulario (las escrituras
+   * la resuelven ellas mismas); se usa para BLOQUEAR los botones que escriben
+   * mientras no haya tenant resuelto. Fail-closed: `null` hasta confirmarlo, así
+   * que un usuario huérfano (sin `usuarios.empresa_id`) no puede disparar
+   * movimientos ni cierres que luego no vería por RLS.
+   */
+  const [empresaId, setEmpresaId] = useState<string | null>(null);
+  const [empresaResuelta, setEmpresaResuelta] = useState(false);
 
   // Autolimpia el feedback para no dejar alertas pegadas.
   useEffect(() => {
@@ -82,14 +121,56 @@ export default function CajaPage() {
     };
   }, []);
 
+  // Empresa de la sesión (una vez): gatea las escrituras, no filtra lecturas.
+  useEffect(() => {
+    let activo = true;
+    void getEmpresaIdActiva().then((id) => {
+      if (!activo) return;
+      setEmpresaId(id);
+      setEmpresaResuelta(true);
+    });
+    return () => {
+      activo = false;
+    };
+  }, []);
+
   const ingresosHoy = useMemo(
     () => movimientos.filter((m) => m.tipo === "ingreso").reduce((s, m) => s + m.monto, 0),
     [movimientos],
   );
+  /**
+   * TOTAL de egresos del día: manuales + automáticos por devolución. Es la
+   * misma suma que hace `cerrar_caja` en el servidor, así que lo que se ve aquí
+   * es exactamente lo que descontará el Reporte Z.
+   */
   const egresosHoy = useMemo(
     () => movimientos.filter((m) => m.tipo === "egreso").reduce((s, m) => s + m.monto, 0),
     [movimientos],
   );
+  /** Parte de `egresosHoy` que generaron las devoluciones aprobadas. */
+  const egresosDevolucion = useMemo(
+    () => movimientos.filter(esDevolucionAprobada).reduce((s, m) => s + m.monto, 0),
+    [movimientos],
+  );
+  const egresosManuales = egresosHoy - egresosDevolucion;
+
+  /**
+   * Movimientos que entraron DESPUÉS de procesar el cierre. Caso real: se cierra
+   * la caja y luego el admin aprueba una devolución en efectivo del día; el
+   * egreso es correcto y cuenta para el día de negocio, pero el Reporte Z ya
+   * impreso se queda corto. Se avisa para que se reabra y recuente en vez de
+   * dejar una diferencia inexplicable.
+   */
+  const movimientosTrasCierre = useMemo(() => {
+    const cierre = corte?.cerrado_at ? new Date(corte.cerrado_at).getTime() : null;
+    if (cierre === null || Number.isNaN(cierre)) return 0;
+    return movimientos.filter((m) => new Date(m.created_at).getTime() > cierre).length;
+  }, [corte, movimientos]);
+
+  // Sin empresa resuelta no se escribe nada (ni movimientos, ni apertura, ni
+  // cierre): la fila caería fuera de RLS o quedaría huérfana.
+  const sinEmpresa = empresaResuelta && !empresaId;
+  const bloqueado = procesando || !empresaId;
 
   // Fase actual: apertura / turno abierto / cerrado.
   const cerrada = corte?.estado === "cerrada";
@@ -209,11 +290,29 @@ export default function CajaPage() {
         </div>
       )}
 
+      {/* Sesión sin tenant: se avisa y se bloquean las escrituras (no se
+          "intenta y falla", que es como se cuelan filas huérfanas). */}
+      {sinEmpresa && (
+        <div
+          role="alert"
+          className="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm font-medium text-red-300"
+        >
+          ⚠️ Tu sesión no tiene una empresa asociada, así que no se puede operar la caja.
+          Cierra sesión y vuelve a entrar; si persiste, avisa al administrador.
+        </div>
+      )}
+
       {cargando ? (
         <p className="py-16 text-center text-sm text-zinc-500">Cargando estado de la caja…</p>
       ) : cerrada && resultado ? (
         // ── Fase 3b: caja cerrada → resultado del arqueo ──────────────────────
-        <ResultadoCierre resultado={resultado} onReabrir={() => onAbrir(resultado.base_inicial)} procesando={procesando} />
+        <ResultadoCierre
+          resultado={resultado}
+          egresosDevolucion={egresosDevolucion}
+          movimientosTrasCierre={movimientosTrasCierre}
+          onReabrir={() => onAbrir(resultado.base_inicial)}
+          procesando={bloqueado}
+        />
       ) : !abierta ? (
         // ── Fase 1: apertura de caja ──────────────────────────────────────────
         <section className="mx-auto max-w-md rounded-xl border border-violet-500/15 bg-zinc-900/50 p-6">
@@ -262,7 +361,7 @@ export default function CajaPage() {
 
             <button
               type="submit"
-              disabled={procesando}
+              disabled={bloqueado}
               className="h-12 w-full rounded-lg bg-gradient-to-r from-violet-500 to-fuchsia-600 text-sm font-semibold text-white shadow-lg shadow-violet-500/30 transition-all active:scale-[0.98] disabled:opacity-40"
             >
               {procesando ? "Abriendo…" : "Abrir caja"}
@@ -274,12 +373,19 @@ export default function CajaPage() {
         <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
           {/* Columna izquierda: base + movimientos */}
           <div className="space-y-6 lg:col-span-2">
-            {/* Resumen del turno (SIN revelar ventas ni esperado → cierre ciego) */}
+            {/* Resumen del turno (SIN revelar ventas ni esperado → cierre ciego).
+                Los egresos van partidos: lo que tecleó el cajero y lo que metió
+                el servidor al aprobar devoluciones. La SUMA de ambos es lo que
+                descuenta el Reporte Z. */}
             <section className="grid grid-cols-2 gap-4 sm:grid-cols-4">
               <ResumenCard label="Base inicial" value={formatCOP(corte!.base_inicial)} tone="violet" />
               <ResumenCard label="Ingresos manuales" value={formatCOP(ingresosHoy)} tone="emerald" />
-              <ResumenCard label="Egresos manuales" value={formatCOP(egresosHoy)} tone="amber" />
-              <ResumenCard label="Movimientos" value={String(movimientos.length)} tone="zinc" />
+              <ResumenCard label="Egresos manuales" value={formatCOP(egresosManuales)} tone="amber" />
+              <ResumenCard
+                label="Devoluciones aprobadas"
+                value={formatCOP(egresosDevolucion)}
+                tone="rose"
+              />
             </section>
 
             {/* Movimiento rápido */}
@@ -344,10 +450,18 @@ export default function CajaPage() {
                   </div>
                 </div>
 
+                {/* La empresa del movimiento la pone `registrarMovimiento` desde
+                    la sesión viva; aquí solo evitamos disparar la escritura sin
+                    tenant resuelto. */}
                 <button
                   type="submit"
-                  disabled={procesando}
-                  className="h-11 w-full rounded-lg border border-violet-500/40 bg-violet-500/10 text-sm font-semibold text-violet-200 transition-all hover:bg-violet-500/20 active:scale-[0.99] disabled:opacity-40"
+                  disabled={bloqueado}
+                  title={
+                    sinEmpresa
+                      ? "Tu sesión no tiene una empresa asociada"
+                      : "Registra el movimiento en la caja de hoy"
+                  }
+                  className="h-11 w-full rounded-lg border border-violet-500/40 bg-violet-500/10 text-sm font-semibold text-violet-200 transition-all hover:bg-violet-500/20 active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-40"
                 >
                   Registrar movimiento
                 </button>
@@ -363,18 +477,36 @@ export default function CajaPage() {
                   <ul className="divide-y divide-zinc-800/70">
                     {movimientos.map((m) => {
                       const esIngreso = m.tipo === "ingreso";
+                      // Egreso que escribió `resolver_devolucion`: se marca
+                      // como automático para que nadie lo confunda con un
+                      // retiro tecleado (ni intente "compensarlo" a mano).
+                      const automatico = esDevolucionAprobada(m);
                       return (
                         <li key={m.id} className="flex items-center justify-between gap-3 py-2.5">
                           <div className="flex min-w-0 items-center gap-2.5">
                             <span
                               className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-xs font-bold ${
-                                esIngreso ? "bg-emerald-500/15 text-emerald-300" : "bg-amber-500/15 text-amber-300"
+                                esIngreso
+                                  ? "bg-emerald-500/15 text-emerald-300"
+                                  : automatico
+                                    ? "bg-rose-500/15 text-rose-300"
+                                    : "bg-amber-500/15 text-amber-300"
                               }`}
                             >
-                              {esIngreso ? "↑" : "↓"}
+                              {esIngreso ? "↑" : automatico ? "↺" : "↓"}
                             </span>
                             <div className="min-w-0">
-                              <p className="truncate text-sm text-zinc-200">{m.concepto}</p>
+                              <p className="truncate text-sm text-zinc-200">
+                                {m.concepto}
+                                {automatico && (
+                                  <span
+                                    className="ml-1.5 rounded bg-rose-500/15 px-1.5 py-0.5 text-[10px] font-medium text-rose-300"
+                                    title="Lo registró el servidor al aprobar la devolución; no se puede editar desde la caja."
+                                  >
+                                    automático
+                                  </span>
+                                )}
+                              </p>
                               <p className="text-xs text-zinc-500">
                                 {new Date(m.created_at).toLocaleTimeString("es-CO", {
                                   hour: "2-digit",
@@ -385,7 +517,11 @@ export default function CajaPage() {
                           </div>
                           <span
                             className={`shrink-0 text-sm font-semibold tabular-nums ${
-                              esIngreso ? "text-emerald-300" : "text-amber-300"
+                              esIngreso
+                                ? "text-emerald-300"
+                                : automatico
+                                  ? "text-rose-300"
+                                  : "text-amber-300"
                             }`}
                           >
                             {esIngreso ? "+" : "−"}
@@ -434,8 +570,8 @@ export default function CajaPage() {
 
               <button
                 type="submit"
-                disabled={procesando}
-                className="h-12 w-full rounded-lg bg-gradient-to-r from-fuchsia-500 to-purple-600 text-sm font-semibold text-white shadow-lg shadow-fuchsia-500/30 transition-all active:scale-[0.98] disabled:opacity-40"
+                disabled={bloqueado}
+                className="h-12 w-full rounded-lg bg-gradient-to-r from-fuchsia-500 to-purple-600 text-sm font-semibold text-white shadow-lg shadow-fuchsia-500/30 transition-all active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40"
               >
                 {procesando ? "Procesando…" : "Procesar cierre"}
               </button>
@@ -443,9 +579,24 @@ export default function CajaPage() {
 
             <p className="mt-4 rounded-lg border border-zinc-800 bg-zinc-950/60 px-3 py-2.5 text-[11px] leading-relaxed text-zinc-500">
               El conteo es a ciegas: ni las ventas en efectivo ni el total esperado se muestran hasta
-              procesar el cierre.
+              procesar el cierre. Las devoluciones en efectivo ya aprobadas ya están descontadas del
+              esperado.
             </p>
           </section>
+        </div>
+      )}
+
+      {/* ── Bandeja de devoluciones, aquí y no solo en Ventas ──
+          Es el punto donde el dinero sale del cajón, así que su sitio natural
+          es el arqueo. Al APROBAR, `resolver_devolucion` inserta el egreso en
+          `movimientos_caja` en la misma transacción que repone el stock; con
+          `onResuelta` releemos el arqueo del día y el egreso aparece en la
+          lista al instante, ya descontado del esperado del Reporte Z.
+          El empleado la ve en solo lectura: los botones de aprobar los pinta el
+          propio componente solo para el admin, y la RPC lo vuelve a exigir. */}
+      {!cargando && (
+        <div className="mt-6">
+          <DevolucionesPendientes onResuelta={() => void recargar()} />
         </div>
       )}
     </PageShell>
@@ -461,12 +612,13 @@ function ResumenCard({
 }: {
   label: string;
   value: string;
-  tone: "violet" | "emerald" | "amber" | "zinc";
+  tone: "violet" | "emerald" | "amber" | "rose" | "zinc";
 }) {
   const tones: Record<string, string> = {
     violet: "border-violet-500/25 text-violet-300",
     emerald: "border-emerald-500/25 text-emerald-300",
     amber: "border-amber-500/25 text-amber-300",
+    rose: "border-rose-500/25 text-rose-300",
     zinc: "border-zinc-800 text-zinc-200",
   };
   return (
@@ -479,10 +631,16 @@ function ResumenCard({
 
 function ResultadoCierre({
   resultado,
+  egresosDevolucion,
+  movimientosTrasCierre,
   onReabrir,
   procesando,
 }: {
   resultado: CierreResultado;
+  /** Parte de `resultado.egresos` que vino de devoluciones aprobadas. */
+  egresosDevolucion: number;
+  /** Movimientos registrados después de procesar este cierre (0 = cuadra). */
+  movimientosTrasCierre: number;
   onReabrir: () => void;
   procesando: boolean;
 }) {
@@ -534,7 +692,15 @@ function ResultadoCierre({
           {fila("Base inicial", base_inicial, "+")}
           {fila("Ventas en efectivo (POS)", ventas_efectivo, "+")}
           {fila("Ingresos manuales", ingresos, "+")}
-          {fila("Egresos manuales", egresos, "−")}
+          {/* `egresos` es el total que usó el servidor para el esperado. Se
+              desglosa la parte automática para que el dueño vea de dónde salió
+              el dinero sin tener que cruzarlo con Transacciones. */}
+          {fila("Egresos de caja", egresos, "−")}
+          {egresosDevolucion > 0 && (
+            <p className="py-1.5 pl-3 text-xs text-rose-300/80">
+              ↳ incluye {formatCOP(egresosDevolucion)} de devoluciones aprobadas
+            </p>
+          )}
           <div className="flex items-center justify-between py-2.5 text-sm font-semibold">
             <span className="text-zinc-300">Efectivo esperado</span>
             <span className="tabular-nums text-zinc-100">{formatCOP(esperado)}</span>
@@ -552,6 +718,18 @@ function ResultadoCierre({
           </div>
         </div>
       </div>
+
+      {movimientosTrasCierre > 0 && (
+        <p
+          role="alert"
+          className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-xs leading-relaxed text-amber-200"
+        >
+          ⚠️ Se registraron {movimientosTrasCierre} movimiento(s) de efectivo después de procesar
+          este cierre (por ejemplo, una devolución aprobada). Ya están en la caja del día, pero el
+          desglose de arriba es el del momento del cierre: reabre y recuenta para que el Reporte Z
+          vuelva a cuadrar.
+        </p>
+      )}
 
       <button
         type="button"

@@ -18,6 +18,8 @@ import { cacheCatalogo, descontarStockLocal, getFrecuentes } from "../../lib/off
 import { enqueueVenta } from "../../lib/offline/outbox";
 import { useOffline } from "../../lib/offline/useOffline";
 import { useRolSesion } from "../../lib/useRol";
+import VentaDetalleModal from "../../components/VentaDetalleModal";
+import { buscarVentaPorFolio, type TicketEncontrado } from "../../lib/ventas";
 import {
   MAX_EN_ESPERA,
   etiquetaPorDefecto,
@@ -218,6 +220,13 @@ export default function PosPage() {
   const [comunPrecio, setComunPrecio] = useState("");
   // Visor de cámara (escaneo desde móvil/tablet, sin lector físico).
   const [camaraAbierta, setCamaraAbierta] = useState(false);
+  // ── Devolución desde el mostrador ────────────────────────────────────────
+  // Búsqueda de UN ticket por su folio ("#00291") para poder pedir su
+  // devolución sin pasar por el historial de Transacciones.
+  const [folioBusqueda, setFolioBusqueda] = useState("");
+  const [buscandoTicket, setBuscandoTicket] = useState(false);
+  // Ticket localizado: abre `VentaDetalleModal`. null = sin ticket a la vista.
+  const [ticket, setTicket] = useState<TicketEncontrado | null>(null);
   // ── Carritos en espera (hold) ────────────────────────────────────────────
   // Cuentas aparcadas para atender a otro cliente sin perder la que se estaba
   // armando. Viven solo en el cliente (nada viaja a Supabase hasta cobrar).
@@ -1013,8 +1022,22 @@ export default function PosPage() {
   /**
    * Abre el cajón sin cobrar (dar cambio, retirar efectivo…). Usa el pin
    * configurado en Dispositivos y no toca el carrito ni la venta.
+   *
+   * SOLO EL DUEÑO. Un pulso manual saca el cajón de dinero sin dejar rastro en
+   * `ventas` ni en `movimientos_caja`: es justo el agujero que descuadra el
+   * arqueo. El empleado cobra igual por cualquier método —ahí el pulso lo emite
+   * el propio cobro en efectivo— pero no puede abrirlo "porque sí". El botón ni
+   * se pinta (ver más abajo); este guard cubre el resto de caminos (hotkey
+   * futura, llamada desde la consola).
    */
   const abrirCajon = useCallback(async () => {
+    if (!esAdministrador) {
+      setFeedback({
+        tone: "error",
+        msg: "Solo el administrador puede abrir el cajón sin cobrar.",
+      });
+      return;
+    }
     setAbriendoCajon(true);
     try {
       const { drawer, printer } = loadDeviceSettings();
@@ -1034,6 +1057,38 @@ export default function PosPage() {
       setAbriendoCajon(false);
       inputRef.current?.focus();
     }
+  }, [esAdministrador]);
+
+  /**
+   * Busca el ticket que trae el cliente y abre su factura para devolver ítems.
+   *
+   * Es la ÚNICA puerta del empleado a una venta pasada, y a propósito es una
+   * cerradura, no una ventana: se pide un folio concreto y el servidor devuelve
+   * como mucho esa fila, acotada al `empresa_id` de la sesión (ver
+   * `buscarVentaPorFolio`). No hay listado, ni paginación, ni totales del día:
+   * sin el número impreso en la tirilla no se llega a ninguna venta.
+   */
+  const buscarTicket = useCallback(async () => {
+    if (buscandoTicket) return;
+    setBuscandoTicket(true);
+    setFeedback(null);
+    try {
+      const { data, error } = await buscarVentaPorFolio(folioBusqueda);
+      if (!data) {
+        setFeedback({ tone: "error", msg: error ?? "No se encontró esa factura." });
+        return;
+      }
+      setTicket(data);
+      setFolioBusqueda("");
+    } finally {
+      setBuscandoTicket(false);
+    }
+  }, [buscandoTicket, folioBusqueda]);
+
+  /** Cierra la factura y devuelve el foco al escáner (la caja sigue en marcha). */
+  const cerrarTicket = useCallback(() => {
+    setTicket(null);
+    inputRef.current?.focus();
   }, []);
 
   // ── Render ───────────────────────────────────────────────────────────────────
@@ -1207,6 +1262,53 @@ export default function PosPage() {
                 Ctrl+P
               </kbd>
             </button>
+          </div>
+
+          {/* ── Devolución: buscar el ticket del cliente ──
+              Entrada directa a UNA factura por su folio. El cajero teclea (o
+              escanea) el número impreso en la tirilla y se abre esa factura
+              para elegir ítems y cantidades; al enviarla queda como SOLICITUD
+              pendiente en la bandeja del administrador. Nada de historial: sin
+              el número no se llega a ninguna venta, y el folio de otro negocio
+              simplemente no existe desde aquí. */}
+          <div className="rounded-xl border border-amber-500/20 bg-zinc-900/50 p-4">
+            <label htmlFor="folio-ticket" className="mb-1.5 block text-xs font-medium text-zinc-400">
+              ¿Devolución? Busca la factura del cliente
+            </label>
+            <form
+              className="flex gap-2"
+              onSubmit={(e) => {
+                e.preventDefault();
+                void buscarTicket();
+              }}
+            >
+              <input
+                id="folio-ticket"
+                value={folioBusqueda}
+                onChange={(e) => setFolioBusqueda(e.target.value)}
+                inputMode="numeric"
+                autoComplete="off"
+                placeholder="Nº de factura, ej. #00291"
+                className="min-w-0 flex-1 rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-3 text-base text-zinc-100 placeholder:text-zinc-500 focus:border-amber-500 focus:outline-none focus:ring-1 focus:ring-amber-500"
+              />
+              <button
+                type="submit"
+                disabled={buscandoTicket || folioBusqueda.trim() === ""}
+                title="Abre esa factura para solicitar la devolución de sus ítems"
+                className="inline-flex shrink-0 items-center gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 text-sm font-semibold text-amber-200 transition-colors hover:bg-amber-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="11" cy="11" r="7" />
+                  <path d="m20 20-3.5-3.5" />
+                </svg>
+                {buscandoTicket ? "Buscando…" : "Buscar"}
+              </button>
+            </form>
+            <p className="mt-2 text-[11px] leading-relaxed text-zinc-500">
+              {esAdministrador
+                ? "Se abre el desglose para elegir ítems y cantidades; puedes aprobar la devolución en el acto."
+                : "Se abre el desglose para elegir ítems y cantidades. La devolución queda pendiente de aprobación del administrador: no se mueve stock, ni caja, ni el cajón."}
+            </p>
           </div>
 
           {/* Grid táctil de productos frecuentes */}
@@ -1553,22 +1655,31 @@ export default function PosPage() {
             )}
 
             {/* Apertura manual del cajón (dar cambio, retiros): emite el pulso
-                ESC/POS sin registrar ninguna venta. */}
-            <button
-              type="button"
-              onClick={abrirCajon}
-              disabled={abriendoCajon}
-              title="Envía el pulso ESC/POS al cajón monedero sin cobrar"
-              className="mt-2.5 inline-flex w-full items-center justify-center gap-2 rounded-lg border border-zinc-700 py-2.5 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
-                <rect x="2" y="7" width="20" height="12" rx="2" />
-                <path d="M2 11h20" />
-                <path d="M10 15h4" />
-                <path d="M7 7V5a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v2" />
-              </svg>
-              {abriendoCajon ? "Abriendo…" : "Abrir Cajón"}
-            </button>
+                ESC/POS sin registrar ninguna venta.
+
+                SOLO PARA EL DUEÑO (empresa_admin / super_admin). Al empleado no
+                se le pinta: un pulso manual saca el cajón sin dejar rastro en
+                caja, así que descuadraría el arqueo. Sigue cobrando con normalidad
+                por cualquier método —el cobro en efectivo abre el cajón solo— y
+                las devoluciones las abre el admin al aprobarlas. Fail-closed:
+                hasta que `useRolSesion` confirme el rol, el botón no existe. */}
+            {esAdministrador && (
+              <button
+                type="button"
+                onClick={abrirCajon}
+                disabled={abriendoCajon}
+                title="Envía el pulso ESC/POS al cajón monedero sin cobrar"
+                className="mt-2.5 inline-flex w-full items-center justify-center gap-2 rounded-lg border border-zinc-700 py-2.5 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                  <rect x="2" y="7" width="20" height="12" rx="2" />
+                  <path d="M2 11h20" />
+                  <path d="M10 15h4" />
+                  <path d="M7 7V5a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v2" />
+                </svg>
+                {abriendoCajon ? "Abriendo…" : "Abrir Cajón"}
+              </button>
+            )}
           </div>
         </section>
       </div>
@@ -1961,6 +2072,35 @@ export default function PosPage() {
           titulo="Escanear producto"
           onDetectado={onCodigoCamara}
           onCerrar={() => setCamaraAbierta(false)}
+        />
+      )}
+
+      {/* Factura del ticket buscado. Es el MISMO modal del panel de
+          Transacciones, así que el empleado obtiene exactamente el flujo ya
+          auditado: selector por ítem con los topes que calcula el servidor,
+          motivo y "Solicitar devolución". Quien decide qué puede hacer es el
+          rol (el modal lo resuelve por su cuenta con `useRolSesion`) y, en
+          última instancia, las RPC. */}
+      {ticket && (
+        <VentaDetalleModal
+          key={ticket.venta.id}
+          venta={ticket.venta}
+          folio={ticket.folio}
+          // Entra directo al selector por ítem: desde el POS se viene a devolver.
+          accionInicial="devolver"
+          onClose={cerrarTicket}
+          // Solo lo dispara el admin que aprueba en el acto: ahí SÍ se movió
+          // caja, así que el acumulado del día deja de ser válido.
+          onDevuelta={() => {
+            if (esAdministrador) void fetchVentasHoyPorMetodo().then(setVentasHoy);
+          }}
+          // Una solicitud pendiente no toca nada: solo se confirma al cajero.
+          onSolicitada={() =>
+            setFeedback({
+              tone: "ok",
+              msg: "Solicitud de devolución enviada al administrador.",
+            })
+          }
         />
       )}
     </PageShell>

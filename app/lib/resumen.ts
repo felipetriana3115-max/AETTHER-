@@ -36,7 +36,7 @@ import type {
 } from "../components/DashboardProvider";
 
 /** Fila cruda de `public.ventas` (solo las columnas que consumimos). */
-type VentaRow = {
+export type VentaRow = {
   id: string;
   total: number | string; // numeric puede llegar como string desde PostgREST
   metodo_pago: string;
@@ -50,6 +50,35 @@ type VentaRow = {
   /** Reembolsado por devoluciones parciales. Columna nueva, DEFAULT 0. */
   devuelto_total?: number | string | null;
 };
+
+/**
+ * Columnas de `ventas` que alimentan una fila del historial. Exportado porque
+ * la búsqueda de ticket del POS (`buscarVentaPorFolio`) tiene que leer EXACTAMENTE
+ * lo mismo para que la `Sale` que abre el modal sea indistinguible de la del
+ * listado de Transacciones.
+ */
+export const VENTAS_SELECT_COMPLETO =
+  "id, total, metodo_pago, created_at, cliente_nombre, canal, estado, devuelto_total";
+
+/**
+ * Normaliza una fila de `public.ventas` al `Sale` del dashboard.
+ *
+ * Las ventas del POS dejan `cliente_nombre`/`canal` nulos: ahí el valor por
+ * defecto describe el origen real; una venta importada trae los del archivo.
+ */
+export function mapVenta(row: VentaRow): Sale {
+  return {
+    id: row.id,
+    clientId: "", // el aislamiento lo impone RLS; el cliente no lo usa
+    customer: row.cliente_nombre ?? "Venta POS",
+    channel: row.canal ?? "POS",
+    method: row.metodo_pago,
+    amount: Number(row.total ?? 0),
+    status: row.estado ?? "Pagado",
+    date: row.created_at,
+    refunded: Number(row.devuelto_total ?? 0),
+  };
+}
 
 /** Fila cruda de `public.productos` (solo las columnas que consumimos). */
 type ProductoRow = {
@@ -81,11 +110,17 @@ export async function fetchVentasEmpresa(): Promise<Sale[]> {
   const empresaId = await getEmpresaIdActiva();
   if (!empresaId) return []; // sin empresa resuelta no se consulta (aislamiento)
 
+  // El `id` desempata a propósito: el folio visible ("Factura #00291") es la
+  // POSICIÓN en esta lista, así que el orden tiene que ser total y estable. Sin
+  // el desempate, dos ventas con el mismo `created_at` podrían intercambiarse
+  // entre consultas y el folio dejaría de apuntar siempre al mismo ticket (lo
+  // busca `buscarVentaPorFolio`, que recorre el mismo orden al revés).
   const completo = await supabase
     .from("ventas")
-    .select(`${VENTAS_SELECT_BASE}, cliente_nombre, canal, estado, devuelto_total`)
+    .select(VENTAS_SELECT_COMPLETO)
     .eq("empresa_id", empresaId)
-    .order("created_at", { ascending: false });
+    .order("created_at", { ascending: false })
+    .order("id", { ascending: false });
 
   const debeReintentar = completo.error?.code === "42703";
   if (debeReintentar) {
@@ -101,6 +136,7 @@ export async function fetchVentasEmpresa(): Promise<Sale[]> {
         .select(VENTAS_SELECT_BASE)
         .eq("empresa_id", empresaId)
         .order("created_at", { ascending: false })
+        .order("id", { ascending: false })
     : completo;
 
   if (error) {
@@ -108,19 +144,7 @@ export async function fetchVentasEmpresa(): Promise<Sale[]> {
     return [];
   }
 
-  return ((data ?? []) as VentaRow[]).map((row) => ({
-    id: row.id,
-    clientId: "", // el aislamiento lo impone RLS; el cliente no lo usa
-    // Las ventas del POS dejan estas columnas nulas: ahí el valor por defecto
-    // describe el origen real; una venta importada trae los datos del archivo.
-    customer: row.cliente_nombre ?? "Venta POS",
-    channel: row.canal ?? "POS",
-    method: row.metodo_pago,
-    amount: Number(row.total ?? 0),
-    status: row.estado ?? "Pagado",
-    date: row.created_at,
-    refunded: Number(row.devuelto_total ?? 0),
-  }));
+  return ((data ?? []) as VentaRow[]).map(mapVenta);
 }
 
 /**

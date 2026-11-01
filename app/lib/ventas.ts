@@ -15,7 +15,8 @@
  */
 
 import { supabase, getEmpresaIdActiva } from "./auth";
-import type { SaleStatus } from "./data-model";
+import type { Sale, SaleStatus } from "./data-model";
+import { mapVenta, VENTAS_SELECT_COMPLETO, type VentaRow } from "./resumen";
 
 /** Línea de la venta, tal como la guardó el POS en `ventas.items`. */
 export type LineaVenta = {
@@ -145,6 +146,154 @@ export async function fetchVentaDetalle(ventaId: string): Promise<VentaDetalle |
     devueltaMotivo: row.devuelta_motivo ?? null,
     lineas: parseLineas(row.items),
   };
+}
+
+// ── Búsqueda de un ticket suelto (POS) ──────────────────────────────────────
+
+/**
+ * Un ticket localizado por su folio, listo para abrir el modal de factura.
+ * Es la MISMA forma que una fila del historial, así que `VentaDetalleModal`
+ * no distingue si vino del panel de Transacciones o del POS.
+ */
+export type TicketEncontrado = { venta: Sale; folio: string };
+
+/** Folio visible de una venta a partir de su posición (1 = la más antigua). */
+export function folioDeVenta(posicion: number): string {
+  return `Factura #${String(posicion).padStart(5, "0")}`;
+}
+
+/**
+ * Extrae el número de folio de lo que teclea o escanea el cajero.
+ * Acepta `#00291`, `00291`, `291` y `Factura #291`; devuelve `null` si no hay
+ * un entero positivo que rescatar (p. ej. le pasaron un UUID).
+ */
+export function parsearFolio(entrada: string): number | null {
+  const digitos = entrada.replace(/\D/g, "");
+  if (!digitos) return null;
+  const n = Number(digitos);
+  return Number.isSafeInteger(n) && n > 0 ? n : null;
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Localiza UNA venta de la empresa activa por el folio impreso en la tirilla
+ * (o por su UUID, si se escanea el id completo).
+ *
+ * POR QUÉ EXISTE: el cajero necesita abrir el ticket exacto que le trae el
+ * cliente para pedir una devolución, pero NO debe ver el historial de ventas
+ * del negocio. Esta consulta devuelve como mucho UNA fila: ni lista, ni
+ * paginado, ni totales. Si el folio no existe en ESTE tenant, no hay resultado.
+ *
+ * AISLAMIENTO: `empresa_id` sale de la sesión viva (`getEmpresaIdActiva`), no
+ * de un caché; sin empresa resuelta la consulta NI SE LANZA. Encima, RLS acota
+ * `ventas` al tenant, así que el folio #291 de otra empresa simplemente no
+ * existe desde aquí (y el conteo que calcula el folio también va filtrado).
+ *
+ * EL FOLIO ES POSICIONAL: no hay columna que lo guarde — es el mismo número que
+ * pinta el panel de Transacciones, es decir, la posición de la venta ordenada
+ * de la más antigua a la más reciente (`created_at`, desempate por `id`). Por
+ * eso aquí se pide por `range(n-1, n-1)` sobre ese mismo orden ascendente: el
+ * servidor devuelve la fila n-ésima sin traer las n−1 anteriores.
+ */
+export async function buscarVentaPorFolio(
+  entrada: string,
+): Promise<{ data: TicketEncontrado | null; error: string | null }> {
+  const texto = entrada.trim();
+  if (!texto) return { data: null, error: "Escribe el número de la factura." };
+
+  const empresaId = await getEmpresaIdActiva();
+  if (!empresaId) {
+    return {
+      data: null,
+      error: "Tu sesión no tiene una empresa asociada. Cierra sesión y vuelve a entrar.",
+    };
+  }
+
+  return UUID_RE.test(texto)
+    ? buscarPorId(texto, empresaId)
+    : buscarPorPosicion(texto, empresaId);
+}
+
+/** Lee la venta n-ésima (1 = la más antigua) del tenant y la devuelve con su folio. */
+async function buscarPorPosicion(
+  texto: string,
+  empresaId: string,
+): Promise<{ data: TicketEncontrado | null; error: string | null }> {
+  const folio = parsearFolio(texto);
+  if (folio === null) {
+    return { data: null, error: `"${texto}" no parece un número de factura.` };
+  }
+
+  const { data, error } = await supabase
+    .from("ventas")
+    .select(VENTAS_SELECT_COMPLETO)
+    .eq("empresa_id", empresaId)
+    .order("created_at", { ascending: true })
+    .order("id", { ascending: true })
+    .range(folio - 1, folio - 1)
+    .maybeSingle();
+
+  if (error) {
+    // 42703: faltan las columnas nuevas. No degradamos la búsqueda a un select
+    // reducido porque el modal necesita estado y devuelto_total para calcular
+    // qué queda devolvible; es mejor decir qué migración falta.
+    if (error.code === "42703") {
+      return {
+        data: null,
+        error:
+          "Faltan columnas de `ventas` para buscar tickets. Ejecuta " +
+          "supabase/2026-10-import-masivo-crm-ventas.sql y " +
+          "supabase/2026-10-devoluciones-parciales.sql en Supabase.",
+      };
+    }
+    console.warn("[ventas] No se pudo buscar el ticket:", error.message);
+    return { data: null, error: `No se pudo buscar la factura: ${error.message}` };
+  }
+  if (!data) {
+    return { data: null, error: `No existe la ${folioDeVenta(folio)} en este negocio.` };
+  }
+
+  return { data: { venta: mapVenta(data as VentaRow), folio: folioDeVenta(folio) }, error: null };
+}
+
+/** Lee la venta por UUID y reconstruye su folio contando cuántas la preceden. */
+async function buscarPorId(
+  ventaId: string,
+  empresaId: string,
+): Promise<{ data: TicketEncontrado | null; error: string | null }> {
+  const { data, error } = await supabase
+    .from("ventas")
+    .select(VENTAS_SELECT_COMPLETO)
+    .eq("id", ventaId)
+    .eq("empresa_id", empresaId)
+    .maybeSingle();
+
+  if (error) {
+    console.warn("[ventas] No se pudo buscar el ticket por id:", error.message);
+    return { data: null, error: `No se pudo buscar la factura: ${error.message}` };
+  }
+  if (!data) return { data: null, error: "Esa factura no es de este negocio." };
+
+  const venta = mapVenta(data as VentaRow);
+
+  // Posición = ventas anteriores + las que empatan en `created_at` hasta este
+  // id (mismo criterio de desempate que `fetchVentasEmpresa`). Dos conteos con
+  // `head: true`: no bajan ni una fila, solo el número.
+  const anteriores = await supabase
+    .from("ventas")
+    .select("id", { count: "exact", head: true })
+    .eq("empresa_id", empresaId)
+    .lt("created_at", venta.date);
+  const empates = await supabase
+    .from("ventas")
+    .select("id", { count: "exact", head: true })
+    .eq("empresa_id", empresaId)
+    .eq("created_at", venta.date)
+    .lte("id", venta.id);
+
+  const posicion = (anteriores.count ?? 0) + (empates.count ?? 1);
+  return { data: { venta, folio: folioDeVenta(posicion) }, error: null };
 }
 
 /** Lo que reporta el servidor tras procesar (o reconocer) una devolución. */
