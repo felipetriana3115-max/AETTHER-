@@ -11,6 +11,7 @@
  */
 
 import { supabase, getEmpresaIdActiva } from "./auth";
+import { parsearPagos, repartirPorMetodo } from "./pagos";
 
 export type CorteCaja = {
   id: string;
@@ -123,27 +124,51 @@ export async function fetchVentasHoyPorMetodo(): Promise<VentasHoyPorMetodo> {
   if (!empresaId) return { ...VENTAS_HOY_VACIO };
 
   const { inicio, fin } = rangoDiaHoy();
-  const { data, error } = await supabase
-    .from("ventas")
-    .select("total, metodo_pago, created_at")
-    .eq("empresa_id", empresaId)
-    .gte("created_at", inicio)
-    .lte("created_at", fin);
+  const consulta = (columnas: string) =>
+    supabase
+      .from("ventas")
+      .select(columnas)
+      .eq("empresa_id", empresaId)
+      .gte("created_at", inicio)
+      .lte("created_at", fin);
+
+  // `pagos` es una columna nueva (2026-11-pagos-mixtos.sql). Mismo patrón
+  // defensivo del resto del módulo: si la migración aún no corrió, PostgREST
+  // devuelve 42703 y reintentamos sin ella — el desglose del día sigue saliendo,
+  // simplemente sin poder repartir los cobros fraccionados.
+  const completo = await consulta("total, metodo_pago, created_at, pagos");
+  const debeReintentar = completo.error?.code === "42703";
+  const { data, error } = debeReintentar
+    ? await consulta("total, metodo_pago, created_at")
+    : completo;
+
   if (error) {
     console.warn("[corte] No se pudieron leer las ventas de hoy:", error.message);
     return { ...VENTAS_HOY_VACIO };
   }
 
   const acc: VentasHoyPorMetodo = { ...VENTAS_HOY_VACIO };
-  for (const raw of (data ?? []) as { total: number | string | null; metodo_pago: string | null }[]) {
+  const filas = (data ?? []) as unknown as {
+    total: number | string | null;
+    metodo_pago: string | null;
+    pagos?: unknown;
+  }[];
+  for (const raw of filas) {
     const monto = Number(raw.total ?? 0);
     if (!Number.isFinite(monto)) continue;
     acc.total_general += monto;
     acc.num_ventas += 1;
-    const bucket = clasificarMetodo(raw.metodo_pago ?? "");
-    if (bucket === "efectivo") acc.total_efectivo += monto;
-    else if (bucket === "nequi") acc.total_nequi += monto;
-    else if (bucket === "bold") acc.total_bold += monto;
+    // Una venta mixta trae su desglose: cada tramo va a SU bucket. Sin desglose
+    // se atribuye todo el total al método suelto, como siempre.
+    const reparto = repartirPorMetodo(
+      parsearPagos(raw.pagos),
+      monto,
+      raw.metodo_pago ?? "",
+      clasificarMetodo,
+    );
+    acc.total_efectivo += reparto.efectivo;
+    acc.total_nequi += reparto.nequi;
+    acc.total_bold += reparto.bold;
   }
   return acc;
 }

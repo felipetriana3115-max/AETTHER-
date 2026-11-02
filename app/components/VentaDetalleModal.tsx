@@ -10,6 +10,7 @@ import {
   solicitarDevolucion,
   type DisponibleDevolucion,
 } from "../lib/devoluciones";
+import { etiquetaPagos } from "../lib/pagos";
 import { openCashDrawer, printReceipt, type ReceiptData } from "../lib/receipt";
 import { DEFAULT_TIRILLA, fetchTirilla, type TirillaConfig } from "../lib/tirilla";
 import { useRolSesion } from "../lib/useRol";
@@ -132,7 +133,12 @@ export default function VentaDetalleModal({
           fecha: `${fechaLegible(d.fecha)} · ${d.estado === "Reembolsado" ? "DEVUELTA" : "COPIA"}`,
           items: d.lineas.map((l) => ({ nombre: l.nombre, qty: l.qty, precio: l.precio })),
           total: d.total,
-          pagos: [{ metodo: d.metodo, monto: d.total }],
+          // Cobro fraccionado: la copia reproduce el desglose línea a línea,
+          // igual que la tirilla original. Sin desglose, el método suelto.
+          pagos:
+            d.pagos.length > 0
+              ? d.pagos.map((p) => ({ metodo: p.metodo, monto: p.monto }))
+              : [{ metodo: d.metodo, monto: d.total }],
         };
         const r = await printReceipt(recibo, { ...printer, ...cfg }, { drawerPin: null });
         if (r.ok) {
@@ -207,6 +213,8 @@ export default function VentaDetalleModal({
   const devuelta = (detalle?.estado ?? venta.status) === "Reembolsado";
   const total = detalle?.total ?? venta.amount;
   const metodo = detalle?.metodo ?? venta.method;
+  /** Tramos del cobro fraccionado; vacío en las ventas de un solo método. */
+  const pagos = detalle?.pagos ?? [];
   const lineas = detalle?.lineas ?? [];
   // Suma de las líneas: puede no cuadrar con `total` en ventas importadas, que
   // llegan sin desglose. Se muestra tal cual en vez de "corregir" el total.
@@ -481,8 +489,19 @@ export default function VentaDetalleModal({
             )}
             <div className="flex items-baseline justify-between">
               <dt className="text-zinc-500">Método de pago</dt>
-              <dd className="font-medium text-zinc-200">{metodo}</dd>
+              <dd className="font-medium text-zinc-200">{etiquetaPagos(pagos, metodo)}</dd>
             </div>
+            {/* Cobro fraccionado: cuánto entró por cada medio. Es el desglose
+                que guardó el servidor en `ventas.pagos`, no una estimación. */}
+            {pagos.length > 1 &&
+              pagos.map((p) => (
+                <div key={p.metodo} className="flex items-baseline justify-between pl-3">
+                  <dt className="text-xs text-zinc-500">↳ {p.metodo}</dt>
+                  <dd className="text-xs font-medium tabular-nums text-zinc-300">
+                    {formatCOP(p.monto)}
+                  </dd>
+                </div>
+              ))}
             {devueltoTotal > 0 && !devuelta && (
               <div className="flex items-baseline justify-between">
                 <dt className="text-zinc-500">Ya reembolsado</dt>

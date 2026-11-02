@@ -12,6 +12,14 @@ import { formatCOP } from "../../lib/data-model";
 import { fetchClientes, type Cliente } from "../../lib/clientes";
 import { fetchVentasHoyPorMetodo, type VentasHoyPorMetodo } from "../../lib/corte";
 import { loadDeviceSettings, type DrawerSettings, type PrinterSettings } from "../../lib/devices";
+import {
+  METODOS_CAJA,
+  METODO_MIXTO,
+  normalizarPagos,
+  sumaPagos,
+  type MetodoCaja,
+  type PagoDesglose,
+} from "../../lib/pagos";
 import { fetchTirilla, DEFAULT_TIRILLA, type TirillaConfig } from "../../lib/tirilla";
 import { openCashDrawer, printReceipt, type ReceiptData } from "../../lib/receipt";
 import { cacheCatalogo, descontarStockLocal, getFrecuentes } from "../../lib/offline/catalog";
@@ -62,9 +70,12 @@ const CameraScanner = dynamic(() => import("../../components/CameraScanner"), { 
 // `Producto`, `LineaCarrito` y `CarritoEnEspera` viven en `lib/pos-carrito.ts`
 // junto al espejo en `sessionStorage` que conserva la cuenta al navegar.
 
-// Métodos de caja (dinero recibido) + "Fiado" (venta a crédito). El fiado NO es
-// caja: se carga al saldo del cliente y se cobra al abonar (ver registrar_venta_fiado).
-type MetodoPago = "Efectivo" | "Nequi/Daviplata" | "Bold" | "Fiado";
+// Métodos de caja (dinero recibido) + "Fiado" (venta a crédito) + "Mixto"
+// (cobro FRACCIONADO entre varios medios de caja). El fiado NO es caja: se carga
+// al saldo del cliente y se cobra al abonar (ver registrar_venta_fiado). El
+// mixto sí es caja, pero su importe se reparte entre los medios que lo componen
+// (ver `pagosMixto` y la RPC registrar_venta_mixta).
+type MetodoPago = MetodoCaja | "Fiado" | typeof METODO_MIXTO;
 
 type Feedback = { tone: "error" | "ok"; msg: string } | null;
 
@@ -79,8 +90,13 @@ type PagoEfectivo = { recibido: number; devuelto: number };
  * Lo que el banner del cambio mantiene anclado en pantalla tras cobrar: el
  * vuelto a entregar más el contexto para verificarlo (qué se cobró y con cuánto
  * pagó el cliente) sin reabrir la calculadora.
+ *
+ * En un cobro FRACCIONADO, `total` es el tramo en EFECTIVO (no el importe de la
+ * venta): es contra esa porción contra la que se cuenta el vuelto, y `mixto`
+ * hace que el banner lo diga con todas las letras en vez de dar a entender que
+ * el cliente pagó toda la factura en billetes.
  */
-type CambioPendiente = PagoEfectivo & { total: number };
+type CambioPendiente = PagoEfectivo & { total: number; mixto?: boolean };
 
 // ── Config de UI ─────────────────────────────────────────────────────────────
 
@@ -94,7 +110,14 @@ const MONTOS_RAPIDOS = [10000, 20000, 50000, 100000];
  */
 const SIN_SUSCRIPCION = () => () => {};
 
-const METODOS: { id: MetodoPago; label: string; sub: string; classes: string }[] = [
+/** Casilla vacía del desglose mixto (un importe por medio de caja). */
+const MONTOS_MIXTO_VACIO: Record<MetodoCaja, string> = {
+  Efectivo: "",
+  "Nequi/Daviplata": "",
+  Bold: "",
+};
+
+const METODOS: { id: MetodoCaja; label: string; sub: string; classes: string }[] = [
   {
     id: "Efectivo",
     label: "Efectivo",
@@ -136,12 +159,22 @@ type ImpresionFallida = {
  * depender de los interruptores de Dispositivos. En un equipo sin cajón
  * conectado el pulso es inocuo (la impresora simplemente lo ignora).
  *
+ * Un cobro FRACCIONADO cuenta como efectivo en cuanto UNO de sus tramos lo sea:
+ * aunque solo entren $5.000 en billetes, esos billetes hay que guardarlos (y a
+ * menudo dar cambio). Por eso `pagos` manda sobre la etiqueta "Mixto".
+ *
  * Para el resto de métodos manda la configuración; "Fiado" queda fuera aunque
  * esté activo "cualquier método": no entra dinero a la caja, así que no hay
  * motivo para destrabar el cajón.
  */
-function pinCajonPara(metodo: MetodoPago, drawer: DrawerSettings): 0 | 1 | null {
-  if (metodo === "Efectivo") return drawer.pin;
+function pinCajonPara(
+  metodo: MetodoPago,
+  drawer: DrawerSettings,
+  pagos?: readonly PagoDesglose[],
+): 0 | 1 | null {
+  const entraEfectivo =
+    metodo === "Efectivo" || (pagos ?? []).some((p) => p.metodo === "Efectivo" && p.monto > 0);
+  if (entraEfectivo) return drawer.pin;
   if (!drawer.enabled || drawer.trigger !== "printer" || metodo === "Fiado") return null;
   return drawer.autoOpenAllMethods ? drawer.pin : null;
 }
@@ -202,6 +235,14 @@ export default function PosPage() {
   // Modal de cobro en efectivo: abierto + monto recibido (solo dígitos).
   const [efectivoAbierto, setEfectivoAbierto] = useState(false);
   const [recibido, setRecibido] = useState("");
+  // ── Pago fraccionado / mixto ─────────────────────────────────────────────
+  // Modal de desglose: un importe por medio de caja, hasta completar el total
+  // EXACTO del carrito. `recibidoMixto` es lo que entrega el cliente en billetes
+  // cuando el tramo en efectivo existe (para calcular el vuelto); vacío = paga
+  // justo esa porción.
+  const [mixtoAbierto, setMixtoAbierto] = useState(false);
+  const [montosMixto, setMontosMixto] = useState<Record<MetodoCaja, string>>(MONTOS_MIXTO_VACIO);
+  const [recibidoMixto, setRecibidoMixto] = useState("");
   /**
    * Banner del cambio de la última venta en efectivo. NO se autodestruye: el
    * cajero cuenta el vuelto a su ritmo y lo tiene a la vista hasta que empieza
@@ -383,6 +424,47 @@ export default function PosPage() {
   const montoRecibido = useMemo(() => Number(recibido.replace(/\D/g, "")) || 0, [recibido]);
   const cambio = montoRecibido - total;
   const puedeCobrarEfectivo = carrito.length > 0 && total > 0 && montoRecibido >= total;
+
+  // ── Desglose del pago fraccionado ────────────────────────────────────────
+  // `normalizarPagos` descarta los medios en cero y deja el orden del catálogo,
+  // así que esto es EXACTAMENTE el arreglo que se persistirá en `ventas.pagos`.
+  const pagosMixto = useMemo(
+    () =>
+      normalizarPagos(
+        METODOS_CAJA.map((m) => ({
+          metodo: m,
+          monto: Number(montosMixto[m].replace(/\D/g, "")) || 0,
+        })),
+      ),
+    [montosMixto],
+  );
+  const asignadoMixto = useMemo(() => sumaPagos(pagosMixto), [pagosMixto]);
+  /** Lo que falta por repartir (negativo = se asignó de más). */
+  const restanteMixto = total - asignadoMixto;
+  /** Tramo en billetes del desglose (0 si el cobro no lleva efectivo). */
+  const efectivoMixto = useMemo(
+    () => pagosMixto.find((p) => p.metodo === "Efectivo")?.monto ?? 0,
+    [pagosMixto],
+  );
+  /**
+   * Billetes que entrega el cliente para cubrir su tramo en efectivo. Si no se
+   * teclea nada se asume que paga esa porción justa (el caso habitual), así que
+   * el campo es opcional y no estorba cuando no hay vuelto.
+   */
+  const recibidoEfectivoMixto = useMemo(() => {
+    const tecleado = Number(recibidoMixto.replace(/\D/g, "")) || 0;
+    return recibidoMixto.trim() === "" ? efectivoMixto : tecleado;
+  }, [recibidoMixto, efectivoMixto]);
+  const cambioMixto = recibidoEfectivoMixto - efectivoMixto;
+  // Se cobra solo con el desglose CUADRADO al peso y sin billetes de menos: la
+  // RPC vuelve a exigir la suma exacta, así que un redondeo aquí sería un
+  // rechazo del servidor con la venta ya encolada.
+  const puedeCobrarMixto =
+    carrito.length > 0 &&
+    total > 0 &&
+    restanteMixto === 0 &&
+    pagosMixto.length > 0 &&
+    cambioMixto >= 0;
 
   // Clientes que casan con la búsqueda del selector (nombre / teléfono).
   const clientesFiltrados = useMemo(() => {
@@ -746,9 +828,18 @@ export default function PosPage() {
    *    única transacción atómica; el `clientUuid` evita duplicados en reintentos.
    */
   const cobrar = useCallback(
-    async (metodo: MetodoPago, efectivo?: PagoEfectivo) => {
+    async (metodo: MetodoPago, efectivo?: PagoEfectivo, pagos?: PagoDesglose[]) => {
       if (carrito.length === 0) {
         setFeedback({ tone: "error", msg: "El carrito está vacío." });
+        return;
+      }
+      // Un cobro fraccionado SIN desglose no se puede registrar: la RPC no
+      // sabría a qué bucket de caja mandar el importe. No debería ocurrir (el
+      // modal valida antes), pero fallar aquí es mejor que subir una venta
+      // que acabaría descuadrando el arqueo.
+      const esMixto = metodo === METODO_MIXTO;
+      if (esMixto && (!pagos || pagos.length === 0)) {
+        setFeedback({ tone: "error", msg: "Falta el desglose del pago fraccionado." });
         return;
       }
       // Fiar exige un cliente al que cargar la deuda. Si no hay, abrimos el
@@ -794,6 +885,9 @@ export default function PosPage() {
           items,
           clienteId: esFiado ? clienteSel?.id ?? null : null,
           clienteNombre: esFiado ? clienteSel?.nombre ?? null : null,
+          // Con desglose, la cola lo envía por `registrar_venta_mixta`, que lo
+          // guarda en `ventas.pagos` y reparte cada monto en su bucket del corte.
+          pagos: pagos ?? null,
         });
 
         // 2) Efectos optimistas: descuento local + grid + tirilla + impresión.
@@ -812,10 +906,14 @@ export default function PosPage() {
           fecha: new Date().toLocaleString("es-CO", { dateStyle: "short", timeStyle: "short" }),
           items: carrito.map((l) => ({ nombre: l.nombre, qty: l.qty, precio: l.precio })),
           total,
-          // `pagos` es un desglose libre de líneas: aprovechamos las dos extra
-          // para imprimir recibido/cambio sin tocar el formato de la tirilla.
+          // `pagos` es un desglose libre de líneas: con cobro fraccionado se
+          // imprime UNA LÍNEA POR MEDIO con su importe real (que es justo lo que
+          // el cliente necesita ver en la factura), y las dos extra siguen
+          // sirviendo para recibido/cambio sin tocar el formato de la tirilla.
           pagos: [
-            { metodo: nombreFiado ? `Fiado · ${nombreFiado}` : metodo, monto: total },
+            ...(pagos && pagos.length > 0
+              ? pagos.map((p) => ({ metodo: p.metodo, monto: p.monto }))
+              : [{ metodo: nombreFiado ? `Fiado · ${nombreFiado}` : metodo, monto: total }]),
             ...(efectivo
               ? [
                   { metodo: "Recibido", monto: efectivo.recibido },
@@ -830,7 +928,7 @@ export default function PosPage() {
         // El cajón se abre con el mismo trabajo de impresión de la tirilla: el
         // pulso ESC/POS viaja en su cabecera. Si no hay impresión automática, lo
         // emitimos por separado para que el cajero no se quede sin cajón.
-        const drawerPin = pinCajonPara(metodo, devices.drawer);
+        const drawerPin = pinCajonPara(metodo, devices.drawer, pagos);
         if (devices.printer.enabled && devices.printer.autoPrint) {
           // Sin `await`: la venta no se bloquea por la impresora. Un fallo del
           // canal directo cae en `avisoImpresion`, no en el diálogo del navegador.
@@ -839,11 +937,20 @@ export default function PosPage() {
           void openCashDrawer(drawerPin, devices.printer);
         }
 
+        const detallePagos = (pagos ?? [])
+          .map((p) => `${p.metodo} ${formatCOP(p.monto)}`)
+          .join(" + ");
         const okMsg = esFiado
           ? `Fiado a ${nombreFiado}: ${formatCOP(total)} cargado a su cuenta.`
-          : efectivo
-            ? `Venta cobrada con Efectivo: ${formatCOP(total)} · Devuelto ${formatCOP(efectivo.devuelto)}.`
-            : `Venta cobrada con ${metodo}: ${formatCOP(total)}.`;
+          : esMixto
+            ? `Venta cobrada en ${formatCOP(total)} fraccionado: ${detallePagos}.${
+                efectivo && efectivo.devuelto > 0
+                  ? ` Devuelto ${formatCOP(efectivo.devuelto)}.`
+                  : ""
+              }`
+            : efectivo
+              ? `Venta cobrada con Efectivo: ${formatCOP(total)} · Devuelto ${formatCOP(efectivo.devuelto)}.`
+              : `Venta cobrada con ${metodo}: ${formatCOP(total)}.`;
 
         setCarrito([]);
         // Soltamos el cliente tras fiar para no cargarle sin querer la próxima venta.
@@ -940,6 +1047,103 @@ export default function PosPage() {
     setDevuelto({ ...pago, total });
     void cobrar("Efectivo", pago);
   }, [cobrando, puedeCobrarEfectivo, montoRecibido, total, cobrar]);
+
+  // ── Cobro fraccionado / mixto (desglose por medio de pago) ──────────────────
+
+  /** Abre el desglose con las casillas limpias y todo el total por repartir. */
+  const abrirMixto = useCallback(() => {
+    if (carrito.length === 0) {
+      setFeedback({ tone: "error", msg: "El carrito está vacío." });
+      return;
+    }
+    setMontosMixto(MONTOS_MIXTO_VACIO);
+    setRecibidoMixto("");
+    setMixtoAbierto(true);
+  }, [carrito.length]);
+
+  const cerrarMixto = useCallback(() => {
+    setMixtoAbierto(false);
+    setMontosMixto(MONTOS_MIXTO_VACIO);
+    setRecibidoMixto("");
+    inputRef.current?.focus();
+  }, []);
+
+  /** Escribe el importe de un medio (solo dígitos, tope de 9 cifras). */
+  const setMontoMixto = useCallback((metodo: MetodoCaja, valor: string) => {
+    setMontosMixto((prev) => ({
+      ...prev,
+      [metodo]: valor.replace(/\D/g, "").replace(/^0+(?=\d)/, "").slice(0, 9),
+    }));
+  }, []);
+
+  /**
+   * Vuelca en un medio TODO lo que queda por repartir (botón "Resto"). Es el
+   * gesto natural del mostrador: se teclea lo que el cliente da en efectivo y el
+   * resto se cobra de un toque por el datáfono.
+   */
+  const asignarRestoMixto = useCallback(
+    (metodo: MetodoCaja) => {
+      setMontosMixto((prev) => {
+        const actual = Number(prev[metodo].replace(/\D/g, "")) || 0;
+        const otros = METODOS_CAJA.reduce(
+          (s, m) => (m === metodo ? s : s + (Number(prev[m].replace(/\D/g, "")) || 0)),
+          0,
+        );
+        const resto = Math.max(0, total - otros);
+        // Segundo toque sobre el mismo botón: limpia la casilla (deshacer). Sin
+        // nada que repartir también se limpia, para no dejar un "$ 0" tecleado.
+        const yaCuadrada = resto === 0 || actual === resto;
+        return { ...prev, [metodo]: yaCuadrada ? "" : String(resto) };
+      });
+    },
+    [total],
+  );
+
+  /**
+   * Confirma el cobro fraccionado. Si al final todo el importe quedó en UN solo
+   * medio, se cobra por la ruta normal de ese método (no hace falta la RPC
+   * mixta); con dos o más tramos se envía el desglose completo, que es lo que
+   * se persiste en `ventas.pagos` y se imprime en la factura.
+   */
+  const confirmarMixto = useCallback(() => {
+    if (cobrando || !puedeCobrarMixto) return;
+
+    const efectivo: PagoEfectivo | undefined =
+      efectivoMixto > 0
+        ? { recibido: recibidoEfectivoMixto, devuelto: cambioMixto }
+        : undefined;
+    const desglose = pagosMixto;
+    const fraccionado = desglose.length > 1;
+
+    setMixtoAbierto(false);
+    setMontosMixto(MONTOS_MIXTO_VACIO);
+    setRecibidoMixto("");
+    // El banner del vuelto solo tiene sentido si de verdad hay que devolver algo.
+    // En un cobro fraccionado el contexto es el tramo en efectivo, no la factura.
+    if (efectivo && efectivo.devuelto > 0) {
+      setDevuelto({
+        ...efectivo,
+        total: fraccionado ? efectivoMixto : total,
+        mixto: fraccionado,
+      });
+    }
+
+    if (!fraccionado) {
+      const unico = desglose[0];
+      void cobrar(unico.metodo, unico.metodo === "Efectivo" ? efectivo : undefined);
+      return;
+    }
+    void cobrar(METODO_MIXTO, efectivo, desglose);
+  }, [
+    cobrando,
+    puedeCobrarMixto,
+    efectivoMixto,
+    recibidoEfectivoMixto,
+    cambioMixto,
+    pagosMixto,
+    total,
+    cobrar,
+  ]);
 
   /**
    * Sincronización MANUAL (botón de la barra de estado). A diferencia del auto-sync
@@ -1110,10 +1314,13 @@ export default function PosPage() {
             <span className="text-xl" aria-hidden>💵</span>
             <div className="min-w-0">
               <p className="text-sm font-semibold text-emerald-200">
-                Venta cobrada en efectivo · Cambio a entregar
+                {devuelto.mixto
+                  ? "Venta cobrada (pago fraccionado) · Cambio a entregar"
+                  : "Venta cobrada en efectivo · Cambio a entregar"}
               </p>
               <p className="text-xs text-emerald-300/70 tabular-nums">
-                Total {formatCOP(devuelto.total)} · Recibido {formatCOP(devuelto.recibido)}
+                {devuelto.mixto ? "Parte en efectivo" : "Total"} {formatCOP(devuelto.total)} ·
+                Recibido {formatCOP(devuelto.recibido)}
               </p>
             </div>
           </div>
@@ -1621,6 +1828,25 @@ export default function PosPage() {
                 </button>
               ))}
 
+              {/* Pago fraccionado: reparte el total entre varios medios de caja
+                  (p. ej. parte en efectivo y el resto por el datáfono). Abre el
+                  desglose; nada se cobra hasta que los importes cuadran al peso. */}
+              <button
+                type="button"
+                disabled={cobrando || carrito.length === 0}
+                onClick={abrirMixto}
+                title="Cobrar esta venta con varios medios de pago a la vez"
+                className="flex h-16 w-full items-center justify-between rounded-xl border-2 border-dashed border-violet-500/50 bg-violet-500/10 px-4 text-left text-violet-200 transition-all active:scale-[0.98] hover:bg-violet-500/15 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <span>
+                  <span className="block text-base font-semibold">Pago fraccionado</span>
+                  <span className="block text-xs text-violet-300/80">
+                    Efectivo + Nequi + Bold en una sola venta
+                  </span>
+                </span>
+                <span className="text-xl">{cobrando ? "…" : "⇄"}</span>
+              </button>
+
               {/* Fiado (venta a crédito): carga el total al saldo del cliente. */}
               <button
                 type="button"
@@ -1964,6 +2190,186 @@ export default function PosPage() {
                 {cobrando ? "Cobrando…" : "Cobrar"}
               </button>
             </div>
+          </form>
+        </div>
+      )}
+
+      {/* ── Modal: Pago fraccionado / mixto ──
+          Un importe por medio de caja hasta completar el total EXACTO. Mientras
+          falte (o sobre) un peso, el botón de cobrar sigue bloqueado: la RPC
+          `registrar_venta_mixta` exige la misma suma exacta, así que dejar pasar
+          un redondeo aquí sería un rechazo del servidor con la venta ya encolada.
+          El desglose que se confirma es LITERALMENTE el que se guarda en
+          `ventas.pagos` y el que se imprime en la tirilla. */}
+      {mixtoAbierto && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="mixto-titulo"
+          onClick={cerrarMixto}
+        >
+          <form
+            className="max-h-[92vh] w-full max-w-md overflow-y-auto rounded-2xl border border-violet-500/30 bg-zinc-900 p-5 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+            onSubmit={(e) => {
+              e.preventDefault();
+              confirmarMixto();
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") cerrarMixto();
+            }}
+          >
+            <div className="flex items-baseline justify-between gap-3">
+              <h3 id="mixto-titulo" className="text-base font-semibold text-zinc-100">
+                Pago fraccionado
+              </h3>
+              <span className="text-xs text-zinc-500">
+                {unidades} und · {carrito.length} ítem{carrito.length === 1 ? "" : "s"}
+              </span>
+            </div>
+            <p className="mt-1 text-xs text-zinc-500">
+              Reparte el total entre los medios que use el cliente. Se cobra cuando la suma cuadra
+              exactamente.
+            </p>
+
+            {/* Total a cobrar */}
+            <div className="mt-3 flex items-baseline justify-between rounded-xl border border-zinc-800 bg-zinc-950 px-4 py-3">
+              <span className="text-sm text-zinc-400">Total de la venta</span>
+              <span className="text-2xl font-bold tabular-nums text-zinc-50">{formatCOP(total)}</span>
+            </div>
+
+            {/* Un importe por medio de caja */}
+            <div className="mt-4 space-y-2.5">
+              {METODOS.map((m) => {
+                const valor = montosMixto[m.id];
+                const monto = Number(valor.replace(/\D/g, "")) || 0;
+                return (
+                  <div
+                    key={m.id}
+                    className={`rounded-xl border px-3 py-2.5 transition-colors ${
+                      monto > 0 ? "border-violet-500/40 bg-violet-500/5" : "border-zinc-800 bg-zinc-950"
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <label
+                        htmlFor={`mixto-${m.id}`}
+                        className="text-xs font-semibold text-zinc-300"
+                      >
+                        {m.label}
+                      </label>
+                      <button
+                        type="button"
+                        onClick={() => asignarRestoMixto(m.id)}
+                        title={`Asignar a ${m.label} todo lo que falta por repartir`}
+                        className="rounded-md border border-violet-500/30 px-2 py-0.5 text-[11px] font-semibold text-violet-300 transition-colors hover:bg-violet-500/10"
+                      >
+                        Resto
+                      </button>
+                    </div>
+                    <input
+                      id={`mixto-${m.id}`}
+                      inputMode="numeric"
+                      autoComplete="off"
+                      value={valor ? formatCOP(monto) : ""}
+                      onChange={(e) => setMontoMixto(m.id, e.target.value)}
+                      placeholder="$ 0"
+                      className="mt-1.5 w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-right text-xl font-bold tabular-nums text-zinc-100 placeholder:text-zinc-600 focus:border-violet-500 focus:outline-none focus:ring-1 focus:ring-violet-500"
+                    />
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Cuadre en vivo: cuánto falta o cuánto sobra */}
+            <div
+              className={`mt-3 flex items-baseline justify-between rounded-xl border px-4 py-3 ${
+                restanteMixto === 0
+                  ? "border-emerald-500/40 bg-emerald-500/10"
+                  : "border-amber-500/30 bg-amber-500/10"
+              }`}
+            >
+              <span
+                className={`text-sm font-medium ${
+                  restanteMixto === 0 ? "text-emerald-300" : "text-amber-300"
+                }`}
+              >
+                {restanteMixto === 0
+                  ? "Desglose cuadrado"
+                  : restanteMixto > 0
+                    ? "Falta por repartir"
+                    : "Asignado de más"}
+              </span>
+              <span
+                className={`text-2xl font-bold tabular-nums ${
+                  restanteMixto === 0 ? "text-emerald-300" : "text-amber-300"
+                }`}
+              >
+                {formatCOP(Math.abs(restanteMixto))}
+              </span>
+            </div>
+
+            {/* Vuelto del tramo en efectivo: solo aparece si hay billetes de por
+                medio. Vacío = el cliente paga esa porción justa. */}
+            {efectivoMixto > 0 && (
+              <div className="mt-3 rounded-xl border border-emerald-500/25 bg-emerald-500/5 px-3 py-2.5">
+                <label
+                  htmlFor="mixto-recibido"
+                  className="block text-xs font-medium text-emerald-300/90"
+                >
+                  Billetes recibidos para los {formatCOP(efectivoMixto)} en efectivo
+                </label>
+                <input
+                  id="mixto-recibido"
+                  inputMode="numeric"
+                  autoComplete="off"
+                  value={recibidoMixto ? formatCOP(Number(recibidoMixto.replace(/\D/g, "")) || 0) : ""}
+                  onChange={(e) =>
+                    setRecibidoMixto(e.target.value.replace(/\D/g, "").slice(0, 9))
+                  }
+                  placeholder={`$ ${efectivoMixto.toLocaleString("es-CO")} (pago justo)`}
+                  className="mt-1.5 w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-right text-lg font-bold tabular-nums text-emerald-300 placeholder:text-xs placeholder:font-normal placeholder:text-zinc-600 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                />
+                <div className="mt-2 flex items-baseline justify-between text-sm">
+                  <span className={cambioMixto < 0 ? "text-amber-300" : "text-emerald-300"}>
+                    {cambioMixto < 0 ? "Faltan billetes" : "Cambio a entregar"}
+                  </span>
+                  <span
+                    className={`font-bold tabular-nums ${
+                      cambioMixto < 0 ? "text-amber-300" : "text-emerald-300"
+                    }`}
+                  >
+                    {formatCOP(Math.abs(cambioMixto))}
+                  </span>
+                </div>
+              </div>
+            )}
+
+            <div className="mt-4 flex gap-2.5">
+              <button
+                type="button"
+                onClick={cerrarMixto}
+                className="h-14 flex-1 rounded-xl border border-zinc-700 text-sm font-medium text-zinc-300 transition-colors hover:bg-zinc-800"
+              >
+                Cancelar
+              </button>
+              <button
+                type="submit"
+                disabled={!puedeCobrarMixto || cobrando}
+                className="h-14 flex-[1.4] rounded-xl bg-gradient-to-r from-violet-500 to-fuchsia-600 text-base font-semibold text-white shadow-lg shadow-violet-500/30 transition-all active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                {cobrando
+                  ? "Cobrando…"
+                  : pagosMixto.length > 1
+                    ? `Cobrar en ${pagosMixto.length} medios`
+                    : "Cobrar"}
+              </button>
+            </div>
+
+            <p className="mt-3 text-[11px] leading-relaxed text-zinc-500">
+              El desglose se guarda con la venta y sale impreso en la factura, y cada importe suma al
+              medio que le corresponde en el arqueo del día.
+            </p>
           </form>
         </div>
       )}

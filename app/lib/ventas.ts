@@ -15,7 +15,9 @@
  */
 
 import { supabase, getEmpresaIdActiva } from "./auth";
+import { rangoDiaHoy } from "./corte";
 import type { Sale, SaleStatus } from "./data-model";
+import { parsearPagos, type PagoDesglose } from "./pagos";
 import { mapVenta, VENTAS_SELECT_COMPLETO, type VentaRow } from "./resumen";
 
 /** Línea de la venta, tal como la guardó el POS en `ventas.items`. */
@@ -32,6 +34,12 @@ export type VentaDetalle = {
   id: string;
   total: number;
   metodo: string;
+  /**
+   * Desglose real del cobro cuando se fraccionó entre varios medios de pago
+   * (`metodo === "Mixto"`). Vacío en las ventas de un solo método, donde manda
+   * `metodo`. Ver supabase/2026-11-pagos-mixtos.sql.
+   */
+  pagos: PagoDesglose[];
   /** ISO timestamptz tal como viene de Postgres. */
   fecha: string;
   cliente: string | null;
@@ -58,6 +66,7 @@ type VentaDetalleRow = {
   referencia?: string | null;
   devuelta_at?: string | null;
   devuelta_motivo?: string | null;
+  pagos?: unknown;
 };
 
 /** Columnas que existen desde la primera migración de `ventas`. */
@@ -71,6 +80,14 @@ const DETALLE_SELECT_BASE = "id, total, metodo_pago, created_at, items";
  */
 const DETALLE_SELECT_EXTRA =
   "cliente_nombre, canal, estado, referencia, devuelta_at, devuelta_motivo";
+
+/**
+ * Desglose de pagos mixtos (`2026-11-pagos-mixtos.sql`). Va en su PROPIO escalón
+ * de reintento: es la migración más reciente, así que lo normal es que falte
+ * ella sola — degradar de golpe hasta el select base dejaría la factura sin
+ * estado ni historial de devolución por culpa de una columna cosmética.
+ */
+const DETALLE_SELECT_PAGOS = "pagos";
 
 /** Normaliza el JSONB `items` a líneas utilizables, descartando basura. */
 function parseLineas(items: unknown): LineaVenta[] {
@@ -102,29 +119,34 @@ export async function fetchVentaDetalle(ventaId: string): Promise<VentaDetalle |
   const empresaId = await getEmpresaIdActiva();
   if (!empresaId) return null; // sin empresa resuelta no se consulta (aislamiento)
 
-  const completo = await supabase
-    .from("ventas")
-    .select(`${DETALLE_SELECT_BASE}, ${DETALLE_SELECT_EXTRA}`)
-    .eq("id", ventaId)
-    .eq("empresa_id", empresaId)
-    .maybeSingle();
+  const leer = (columnas: string) =>
+    supabase
+      .from("ventas")
+      .select(columnas)
+      .eq("id", ventaId)
+      .eq("empresa_id", empresaId)
+      .maybeSingle();
 
-  const debeReintentar = completo.error?.code === "42703";
-  if (debeReintentar) {
+  // Degradación en tres escalones, del más completo al mínimo garantizado.
+  let respuesta = await leer(
+    `${DETALLE_SELECT_BASE}, ${DETALLE_SELECT_EXTRA}, ${DETALLE_SELECT_PAGOS}`,
+  );
+  if (respuesta.error?.code === "42703") {
+    console.warn(
+      "[ventas] `ventas.pagos` no existe todavía; corre " +
+        "supabase/2026-11-pagos-mixtos.sql para ver el desglose de los cobros fraccionados.",
+    );
+    respuesta = await leer(`${DETALLE_SELECT_BASE}, ${DETALLE_SELECT_EXTRA}`);
+  }
+  if (respuesta.error?.code === "42703") {
     console.warn(
       "[ventas] Faltan columnas nuevas en `ventas`; corre " +
         "supabase/2026-10-devoluciones-ventas.sql para el historial de devoluciones.",
     );
+    respuesta = await leer(DETALLE_SELECT_BASE);
   }
 
-  const { data, error } = debeReintentar
-    ? await supabase
-        .from("ventas")
-        .select(DETALLE_SELECT_BASE)
-        .eq("id", ventaId)
-        .eq("empresa_id", empresaId)
-        .maybeSingle()
-    : completo;
+  const { data, error } = respuesta;
 
   if (error) {
     console.warn("[ventas] No se pudo leer el detalle de la venta:", error.message);
@@ -132,11 +154,12 @@ export async function fetchVentaDetalle(ventaId: string): Promise<VentaDetalle |
   }
   if (!data) return null;
 
-  const row = data as VentaDetalleRow;
+  const row = data as unknown as VentaDetalleRow;
   return {
     id: row.id,
     total: Number(row.total ?? 0),
     metodo: row.metodo_pago ?? "No especificado",
+    pagos: parsearPagos(row.pagos),
     fecha: row.created_at,
     cliente: row.cliente_nombre ?? null,
     canal: row.canal ?? null,
@@ -213,6 +236,83 @@ export async function buscarVentaPorFolio(
   return UUID_RE.test(texto)
     ? buscarPorId(texto, empresaId)
     : buscarPorPosicion(texto, empresaId);
+}
+
+// ── Transacciones del turno (módulo de Arqueo / Caja) ───────────────────────
+
+/**
+ * Facturas cobradas en el DÍA DE NEGOCIO en curso, de la más reciente a la más
+ * antigua y cada una con su folio visible.
+ *
+ * POR QUÉ EXISTE: el cajero (empleado) necesita localizar el ticket que le trae
+ * un cliente —para reimprimirlo o pedir su devolución— y hasta ahora solo podía
+ * llegar a él tecleando el folio exacto. Esto acota la lista a SU turno: no es
+ * el historial del negocio, es lo cobrado hoy.
+ *
+ * AISLAMIENTO: idéntico al resto del módulo. `empresa_id` sale de la sesión
+ * viva (`getEmpresaIdActiva`), sin empresa resuelta no se consulta, y encima
+ * RLS acota `ventas` al tenant. Solo LECTURA: no habilita ninguna escritura, y
+ * las devoluciones siguen pasando por `solicitar_devolucion` (empleado) /
+ * `resolver_devolucion` (admin), que revalidan el rol en el servidor.
+ *
+ * EL FOLIO ES POSICIONAL (misma regla que `buscarVentaPorFolio`): la posición
+ * de la venta en el orden ascendente por `created_at` con desempate por `id`.
+ * Como todas las ventas de hoy son posteriores al inicio de la jornada, basta
+ * contar cuántas la preceden y numerar correlativamente desde ahí.
+ */
+export async function fetchVentasDelTurno(): Promise<{
+  ventas: TicketEncontrado[];
+  error: string | null;
+}> {
+  const empresaId = await getEmpresaIdActiva();
+  if (!empresaId) return { ventas: [], error: null };
+
+  const { inicio, fin } = rangoDiaHoy();
+
+  // Ventas anteriores al inicio del día: el offset del folio. `head: true` no
+  // baja ni una fila, solo el número.
+  const previas = await supabase
+    .from("ventas")
+    .select("id", { count: "exact", head: true })
+    .eq("empresa_id", empresaId)
+    .lt("created_at", inicio);
+
+  const leer = (columnas: string) =>
+    supabase
+      .from("ventas")
+      .select(columnas)
+      .eq("empresa_id", empresaId)
+      .gte("created_at", inicio)
+      .lte("created_at", fin)
+      .order("created_at", { ascending: true })
+      .order("id", { ascending: true });
+
+  let respuesta = await leer(VENTAS_SELECT_COMPLETO);
+  if (respuesta.error?.code === "42703") {
+    // Sin las columnas nuevas el modal no puede calcular lo devolvible, pero el
+    // listado para LOCALIZAR y REIMPRIMIR un ticket sí funciona: degradamos.
+    console.warn(
+      "[ventas] Faltan columnas nuevas en `ventas`; el turno se lista sin estado " +
+        "ni devoluciones. Corre supabase/2026-10-devoluciones-parciales.sql.",
+    );
+    respuesta = await leer("id, total, metodo_pago, created_at");
+  }
+
+  if (respuesta.error) {
+    console.warn("[ventas] No se pudieron leer las ventas del turno:", respuesta.error.message);
+    return { ventas: [], error: `No se pudieron cargar las transacciones: ${respuesta.error.message}` };
+  }
+
+  const offset = previas.count ?? 0;
+  const filas = (respuesta.data ?? []) as unknown as VentaRow[];
+  const ventas = filas.map((row, i) => ({
+    venta: mapVenta(row),
+    folio: folioDeVenta(offset + i + 1),
+  }));
+
+  // Se listan de la más reciente a la más antigua: en caja se busca lo que se
+  // acaba de cobrar, no lo de primera hora.
+  return { ventas: ventas.reverse(), error: null };
 }
 
 /** Lee la venta n-ésima (1 = la más antigua) del tenant y la devuelve con su folio. */

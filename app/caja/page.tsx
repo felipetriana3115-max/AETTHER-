@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import PageShell from "../components/PageShell";
 import DevolucionesPendientes from "../components/DevolucionesPendientes";
+import TransaccionesTurno from "../components/TransaccionesTurno";
 import { formatCOP } from "../lib/data-model";
 import { getEmpresaIdActiva } from "../lib/auth";
 import {
@@ -594,6 +595,19 @@ export default function CajaPage() {
           lista al instante, ya descontado del esperado del Reporte Z.
           El empleado la ve en solo lectura: los botones de aprobar los pinta el
           propio componente solo para el admin, y la RPC lo vuelve a exigir. */}
+      {/* ── Transacciones del turno (consulta + reimpresión) ──
+          Vive aquí porque es donde el cajero está cuando un cliente vuelve con
+          una tirilla: lista lo cobrado HOY para poder localizar la factura,
+          verla y reimprimirla. Es SOLO LECTURA; abrirla no habilita ninguna
+          devolución directa — el modal sigue dejando una solicitud pendiente
+          para el empleado y reserva la aprobación al administrador. Accesible a
+          ambos roles a propósito (el empleado es quien atiende el mostrador). */}
+      {!cargando && (
+        <div className="mt-6">
+          <TransaccionesTurno onDevuelta={() => void recargar()} />
+        </div>
+      )}
+
       {!cargando && (
         <div className="mt-6">
           <DevolucionesPendientes onResuelta={() => void recargar()} />

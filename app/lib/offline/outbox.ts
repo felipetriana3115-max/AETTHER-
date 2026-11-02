@@ -13,6 +13,7 @@
  */
 
 import { supabase } from "../auth";
+import { METODO_MIXTO, type PagoDesglose } from "../pagos";
 import { getDB, type ItemVenta, type VentaOutbox } from "./db";
 import { isOnline } from "./catalog";
 
@@ -39,6 +40,11 @@ export type NuevaVenta = {
   /** Solo para ventas fiadas: cliente al que se carga el crédito. */
   clienteId?: string | null;
   clienteNombre?: string | null;
+  /**
+   * Desglose por medio de pago en los cobros FRACCIONADOS (`metodo: 'Mixto'`).
+   * Se persiste tal cual en la cola y viaja íntegro a `registrar_venta_mixta`.
+   */
+  pagos?: PagoDesglose[] | null;
 };
 
 /**
@@ -54,6 +60,7 @@ export async function enqueueVenta(v: NuevaVenta): Promise<VentaOutbox> {
     items: v.items,
     clienteId: v.clienteId ?? null,
     clienteNombre: v.clienteNombre ?? null,
+    pagos: v.pagos && v.pagos.length > 0 ? v.pagos : null,
     createdAt: new Date().toISOString(),
     estado: "pendiente",
     intentos: 0,
@@ -244,6 +251,11 @@ async function enviarUna(v: VentaOutbox): Promise<EnvioResultado> {
   if (v.metodo === "Fiado") {
     return enviarFiado(v);
   }
+  // Cobro fraccionado: su propia RPC atómica, que reparte cada monto en el
+  // bucket de caja que le toca. Tampoco tiene repliegue (ver `enviarMixta`).
+  if (v.metodo === METODO_MIXTO) {
+    return enviarMixta(v);
+  }
   try {
     const { data, error } = await supabase.rpc("registrar_venta_offline", {
       p_client_uuid: v.clientUuid,
@@ -304,6 +316,83 @@ async function enviarUna(v: VentaOutbox): Promise<EnvioResultado> {
     return { ok: false, mensaje: error.message };
   } catch (e) {
     // Excepción de red (fetch abortado) → transitorio.
+    return { ok: false, mensaje: e instanceof Error ? e.message : "Fallo de red." };
+  }
+}
+
+/**
+ * Envía una venta con PAGO FRACCIONADO vía la RPC atómica
+ * `registrar_venta_mixta`: descuenta stock, guarda la venta con su desglose en
+ * `ventas.pagos` y suma cada monto a su bucket del corte, todo en una
+ * transacción (ver supabase/2026-11-pagos-mixtos.sql).
+ *
+ * SIN REPLIEGUE, igual que el fiado: caer a `registrar_venta_offline` obligaría
+ * a elegir UN método y el importe de los demás acabaría contado en el bucket
+ * equivocado, descuadrando el arqueo justo en la venta que más detalle tiene.
+ * Si la migración no está aplicada se marca como error de negocio con la guía,
+ * y la venta sigue visible en la cola (no se pierde).
+ */
+async function enviarMixta(v: VentaOutbox): Promise<EnvioResultado> {
+  const pagos = v.pagos ?? [];
+  if (pagos.length === 0) {
+    return {
+      ok: false,
+      negocio: true,
+      mensaje: "Venta mixta sin desglose de pagos; no se puede sincronizar.",
+    };
+  }
+  try {
+    const { data, error } = await supabase.rpc("registrar_venta_mixta", {
+      p_client_uuid: v.clientUuid,
+      p_pagos: pagos,
+      p_total: v.total,
+      p_items: v.items,
+      p_created_at: v.createdAt,
+    });
+
+    if (!error) {
+      const payload = (data ?? {}) as {
+        corte?: CorteRpc;
+        duplicada?: boolean;
+        venta_id?: string;
+      };
+      // MISMA guarda anti-falso-éxito que `enviarUna`: en el primer envío de un
+      // `clientUuid` recién generado la fila TIENE que crearse. Un `duplicada`
+      // aquí significa que no se insertó nada y la cola no debe borrarla.
+      if (v.intentos === 0 && (payload.duplicada === true || !payload.venta_id)) {
+        return {
+          ok: false,
+          negocio: true,
+          mensaje:
+            "El servidor marcó la venta mixta como ya registrada en su primer envío (no se insertó ninguna fila). " +
+            "Re-aplica supabase/2026-11-pagos-mixtos.sql.",
+        };
+      }
+      return { ok: true, corte: payload.corte ?? null };
+    }
+
+    if (error.code === "PGRST202" || error.code === "42883") {
+      return {
+        ok: false,
+        negocio: true,
+        mensaje:
+          "Falta aplicar la migración de pagos mixtos (supabase/2026-11-pagos-mixtos.sql) " +
+          "en Supabase; hasta entonces no se pueden subir los cobros fraccionados.",
+      };
+    }
+    if (error.code === "42501") {
+      return {
+        ok: false,
+        sinEmpresa: true,
+        mensaje: "Tu sesión no tiene una empresa asociada, por eso no se pueden subir las ventas.",
+      };
+    }
+    // Stock insuficiente o desglose que no cuadra → conflicto de negocio.
+    if (error.code === "P0001" || error.code === "22023") {
+      return { ok: false, negocio: true, mensaje: error.message };
+    }
+    return { ok: false, mensaje: error.message };
+  } catch (e) {
     return { ok: false, mensaje: e instanceof Error ? e.message : "Fallo de red." };
   }
 }

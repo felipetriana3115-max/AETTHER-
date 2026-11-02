@@ -21,6 +21,7 @@
  */
 
 import Dexie, { type Table } from "dexie";
+import type { PagoDesglose } from "../pagos";
 
 /**
  * Producto cacheado localmente. Espejo de las columnas reales de
@@ -74,10 +75,20 @@ export type VentaOutbox = {
    * Método de pago. Además de los de caja ('Efectivo'/'Nequi/Daviplata'/'Bold'),
    * puede ser 'Fiado': venta a crédito que se carga al saldo de un cliente y NO
    * entra al corte de caja como efectivo (ver registrar_venta_fiado).
+   *
+   * 'Mixto' marca un cobro FRACCIONADO: el desglose real vive en `pagos` y la
+   * sincronización lo envía por `registrar_venta_mixta` en vez de la RPC de un
+   * solo método (ver supabase/2026-11-pagos-mixtos.sql).
    */
   metodo: string;
   total: number;
   items: ItemVenta[];
+  /**
+   * Desglose por medio de pago cuando el cobro se fraccionó. Ausente/vacío en
+   * las ventas de un solo método. No está indexado, así que añadirlo no exige
+   * subir la versión del esquema de Dexie (igual que `imagen_url`).
+   */
+  pagos?: PagoDesglose[] | null;
   /**
    * Cliente al que se carga el fiado. Solo aplica cuando `metodo === 'Fiado'`;
    * en las ventas de caja es null. `clienteNombre` se guarda para la tirilla sin
