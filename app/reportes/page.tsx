@@ -8,10 +8,11 @@ import { useDashboard } from "../components/DashboardProvider";
 import { axisScale, formatCOP } from "../lib/data-model";
 import { getMonthlyProjections } from "../lib/analytics/projections";
 import {
-  fetchCortes,
-  fetchVentasHoyPorMetodo,
+  diasTranscurridosDelMes,
+  fetchVentasMesPorDia,
   hoyISO,
-  type CorteCaja,
+  rangoMesActual,
+  type VentasDiaPorMetodo,
   type VentasHoyPorMetodo,
 } from "../lib/corte";
 
@@ -27,15 +28,13 @@ const PAD = 8;
 
 type ProjectionPoint = { month: string; value: number; projected: boolean };
 
-/** Fila de la tabla de cierre de turno (subconjunto de CorteCaja que se pinta). */
-type CorteFila = {
-  id: string;
-  fecha: string;
-  total_efectivo: number;
-  total_nequi: number;
-  total_bold: number;
-  num_ventas: number;
-  total_general: number;
+/** Día sin una sola venta: la fila del histórico existe igual, en cero. */
+const DIA_VACIO: VentasHoyPorMetodo = {
+  total_general: 0,
+  total_efectivo: 0,
+  total_nequi: 0,
+  total_bold: 0,
+  num_ventas: 0,
 };
 
 // Formatea una fecha `YYYY-MM-DD` a un texto legible en español (sin desfase de
@@ -51,24 +50,40 @@ function fechaLegible(iso: string): string {
   });
 }
 
+/** Variante corta ("lun, 2 nov") para las filas del histórico del mes. */
+function fechaCorta(iso: string): string {
+  const [y, m, d] = iso.split("-").map(Number);
+  if (!y || !m || !d) return iso;
+  return new Date(y, m - 1, d).toLocaleDateString("es-CO", {
+    weekday: "short",
+    day: "numeric",
+    month: "short",
+  });
+}
+
+/** Nombre del mes de un `YYYY-MM` ("noviembre de 2026"). */
+function mesLegible(mes: string): string {
+  const [y, m] = mes.split("-").map(Number);
+  if (!y || !m) return mes;
+  return new Date(y, m - 1, 1).toLocaleDateString("es-CO", { month: "long", year: "numeric" });
+}
+
 export default function ReportesPage() {
   // Estado global unificado: reacciona a la carga masiva de Excel.
   const { monthlyRevenue, inventory, sales, purchases, businessName } = useDashboard();
   const hasData = monthlyRevenue.length > 0 || inventory.length > 0 || sales.length > 0;
 
-  // Cortes de caja (arqueo) desde Supabase — independientes de los datos de Excel.
-  const [cortes, setCortes] = useState<CorteCaja[]>([]);
+  // Histórico diario del MES EN CURSO leído directamente de `ventas` (no de
+  // `cortes_caja`): así el desglose por método sale aunque el corte de un día no
+  // se haya materializado, y es la misma fuente que ya usa el POS para "hoy".
+  const [ventasMes, setVentasMes] = useState<VentasDiaPorMetodo[]>([]);
   const [cortesCargando, setCortesCargando] = useState(true);
-  // Ventas de HOY leídas directamente de `ventas` (no dependen de que exista un
-  // corte para hoy): fuente del "Cierre de turno" del día.
-  const [ventasHoy, setVentasHoy] = useState<VentasHoyPorMetodo | null>(null);
   useEffect(() => {
     let activo = true;
     (async () => {
-      const [data, hoy] = await Promise.all([fetchCortes(30), fetchVentasHoyPorMetodo()]);
+      const dias = await fetchVentasMesPorDia();
       if (!activo) return;
-      setCortes(data);
-      setVentasHoy(hoy);
+      setVentasMes(dias);
       setCortesCargando(false);
     })();
     return () => {
@@ -76,26 +91,45 @@ export default function ReportesPage() {
     };
   }, []);
 
-  // Fila del histórico correspondiente a hoy: se construye desde `ventas` (no
-  // desde `cortes_caja`), para que el cierre del día cuadre aunque el corte no se
-  // haya materializado. Las demás filas (días anteriores) sí vienen del corte.
-  const filasCorte = useMemo(() => {
-    const hoy = hoyISO();
-    const anteriores = cortes.filter((c) => c.fecha !== hoy);
-    const hayVentasHoy = (ventasHoy?.num_ventas ?? 0) > 0;
-    const corteHoyExiste = cortes.some((c) => c.fecha === hoy);
-    if (!hayVentasHoy && !corteHoyExiste) return anteriores;
-    const filaHoy: CorteFila = {
-      id: "hoy",
-      fecha: hoy,
-      total_efectivo: ventasHoy?.total_efectivo ?? 0,
-      total_nequi: ventasHoy?.total_nequi ?? 0,
-      total_bold: ventasHoy?.total_bold ?? 0,
-      num_ventas: ventasHoy?.num_ventas ?? 0,
-      total_general: ventasHoy?.total_general ?? 0,
-    };
-    return [filaHoy, ...anteriores];
-  }, [cortes, ventasHoy]);
+  // Esqueleto del mes: TODOS los días transcurridos, del más reciente al más
+  // antiguo, rellenando con ceros los que no tuvieron movimiento. El rango lo
+  // calcula `lib/corte` a partir del día de negocio de Bogotá, así que el ciclo
+  // se reinicia solo al cambiar de mes.
+  const filasMes = useMemo(() => {
+    const porFecha = new Map(ventasMes.map((d) => [d.fecha, d]));
+    return diasTranscurridosDelMes().map((fecha) => {
+      const dia = porFecha.get(fecha) ?? { ...DIA_VACIO, fecha };
+      // Lo que no cae en ningún bucket de caja (fiado, métodos importados sin
+      // clasificar). Se muestra para que las columnas cuadren con el total.
+      const otros = dia.total_general - dia.total_efectivo - dia.total_nequi - dia.total_bold;
+      return { ...dia, otros };
+    });
+  }, [ventasMes]);
+
+  // Acumulado del mes: pie de la tabla (suma de las filas que ya se pintan).
+  const totalesMes = useMemo(
+    () =>
+      filasMes.reduce(
+        (acc, d) => ({
+          total_efectivo: acc.total_efectivo + d.total_efectivo,
+          total_nequi: acc.total_nequi + d.total_nequi,
+          total_bold: acc.total_bold + d.total_bold,
+          otros: acc.otros + d.otros,
+          num_ventas: acc.num_ventas + d.num_ventas,
+          total_general: acc.total_general + d.total_general,
+        }),
+        { ...DIA_VACIO, otros: 0 },
+      ),
+    [filasMes],
+  );
+
+  // Resumen del día: la fila de hoy del mismo agregado (una sola consulta).
+  const hoy = hoyISO();
+  const mesActual = rangoMesActual().mes; // YYYY-MM del ciclo vigente
+  const ventasHoy = useMemo(
+    () => ventasMes.find((d) => d.fecha === hoy) ?? { ...DIA_VACIO, fecha: hoy },
+    [ventasMes, hoy],
+  );
 
   // Proyección del próximo mes (media móvil simple de 3 meses) de ingresos y
   // egresos, con la alerta de caja resultante.
@@ -225,77 +259,129 @@ export default function ReportesPage() {
               <div className="rounded-lg border border-emerald-500/25 bg-gradient-to-br from-emerald-500/10 to-transparent p-4">
                 <p className="text-[11px] font-medium uppercase tracking-wide text-emerald-400/80">Total vendido hoy</p>
                 <p className="mt-1 text-2xl font-bold tracking-tight text-emerald-300 tabular-nums">
-                  {formatCOP(ventasHoy?.total_general ?? 0)}
+                  {formatCOP(ventasHoy.total_general)}
                 </p>
                 <p className="mt-0.5 text-xs text-zinc-500">
-                  {ventasHoy?.num_ventas ?? 0} venta{(ventasHoy?.num_ventas ?? 0) === 1 ? "" : "s"}
+                  {ventasHoy.num_ventas} venta{ventasHoy.num_ventas === 1 ? "" : "s"}
                 </p>
               </div>
               <div className="rounded-lg border border-zinc-800 bg-zinc-950 p-4">
                 <p className="text-[11px] font-medium uppercase tracking-wide text-zinc-500">Efectivo</p>
                 <p className="mt-1 text-xl font-semibold tracking-tight text-zinc-100 tabular-nums">
-                  {formatCOP(ventasHoy?.total_efectivo ?? 0)}
+                  {formatCOP(ventasHoy.total_efectivo)}
                 </p>
               </div>
               <div className="rounded-lg border border-zinc-800 bg-zinc-950 p-4">
                 <p className="text-[11px] font-medium uppercase tracking-wide text-zinc-500">Nequi / Daviplata</p>
                 <p className="mt-1 text-xl font-semibold tracking-tight text-zinc-100 tabular-nums">
-                  {formatCOP(ventasHoy?.total_nequi ?? 0)}
+                  {formatCOP(ventasHoy.total_nequi)}
                 </p>
               </div>
               <div className="rounded-lg border border-zinc-800 bg-zinc-950 p-4">
                 <p className="text-[11px] font-medium uppercase tracking-wide text-zinc-500">Bold (tarjeta)</p>
                 <p className="mt-1 text-xl font-semibold tracking-tight text-zinc-100 tabular-nums">
-                  {formatCOP(ventasHoy?.total_bold ?? 0)}
+                  {formatCOP(ventasHoy.total_bold)}
                 </p>
               </div>
             </div>
 
-            {/* Historial de cortes por día */}
-            {filasCorte.length === 0 ? (
-              <p className="mt-6 rounded-lg border border-dashed border-zinc-800 py-8 text-center text-sm text-zinc-500">
-                Aún no hay ventas registradas en el POS.
+            {/* ── Histórico DIARIO del mes en curso, por método de pago ──
+                Una fila por día transcurrido (los días sin movimiento salen en
+                cero, no desaparecen). El ciclo lo define el día de negocio de
+                Bogotá, así que el 1 de cada mes la tabla arranca de nuevo. */}
+            <div className="mt-6 mb-3 flex flex-wrap items-baseline justify-between gap-2">
+              <h3 className="text-sm font-semibold text-zinc-100">
+                Historial diario · <span className="capitalize">{mesLegible(mesActual)}</span>
+              </h3>
+              <p className="text-xs text-zinc-500">
+                {filasMes.length} día{filasMes.length === 1 ? "" : "s"} transcurrido
+                {filasMes.length === 1 ? "" : "s"} · se reinicia cada mes
               </p>
-            ) : (
-              <div className="mt-6 overflow-x-auto">
-                <table className="w-full min-w-[560px] text-sm">
-                  <thead>
-                    <tr className="border-b border-zinc-800 text-left text-xs text-zinc-500">
-                      <th className="pb-2 pr-3 font-medium">Fecha</th>
-                      <th className="pb-2 px-3 text-right font-medium">Efectivo</th>
-                      <th className="pb-2 px-3 text-right font-medium">Nequi/Davi</th>
-                      <th className="pb-2 px-3 text-right font-medium">Bold</th>
-                      <th className="pb-2 px-3 text-right font-medium">Ventas</th>
-                      <th className="pb-2 pl-3 text-right font-medium">Total</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-zinc-800/70">
-                    {filasCorte.map((c) => {
-                      const esHoy = c.fecha === hoyISO();
-                      return (
-                        <tr key={c.id} className={esHoy ? "bg-emerald-500/5" : "hover:bg-zinc-800/30"}>
-                          <td className="py-2.5 pr-3 text-zinc-300">
-                            <span className="capitalize">{fechaLegible(c.fecha)}</span>
-                            {esHoy && (
-                              <span className="ml-2 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-300">
-                                HOY
-                              </span>
-                            )}
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[640px] text-sm">
+                <thead>
+                  <tr className="border-b border-zinc-800 text-left text-xs text-zinc-500">
+                    <th className="pb-2 pr-3 font-medium">Fecha</th>
+                    <th className="pb-2 px-3 text-right font-medium">Efectivo</th>
+                    <th className="pb-2 px-3 text-right font-medium">Nequi/Davi</th>
+                    <th className="pb-2 px-3 text-right font-medium">Bold</th>
+                    <th className="pb-2 px-3 text-right font-medium">Otros</th>
+                    <th className="pb-2 px-3 text-right font-medium">Ventas</th>
+                    <th className="pb-2 pl-3 text-right font-medium">Total</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-zinc-800/70">
+                  {filasMes.map((d) => {
+                    const esHoy = d.fecha === hoy;
+                    const sinMovimiento = d.num_ventas === 0;
+                    return (
+                      <tr
+                        key={d.fecha}
+                        className={
+                          esHoy
+                            ? "bg-emerald-500/5"
+                            : sinMovimiento
+                              ? "text-zinc-600"
+                              : "hover:bg-zinc-800/30"
+                        }
+                      >
+                        <td className="py-2.5 pr-3 text-zinc-300">
+                          <span className="capitalize">{fechaCorta(d.fecha)}</span>
+                          {esHoy && (
+                            <span className="ml-2 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-300">
+                              HOY
+                            </span>
+                          )}
+                        </td>
+                        {sinMovimiento ? (
+                          <td colSpan={6} className="px-3 text-right text-xs text-zinc-600">
+                            Sin ventas
                           </td>
-                          <td className="px-3 text-right tabular-nums text-zinc-400">{formatCOP(c.total_efectivo)}</td>
-                          <td className="px-3 text-right tabular-nums text-zinc-400">{formatCOP(c.total_nequi)}</td>
-                          <td className="px-3 text-right tabular-nums text-zinc-400">{formatCOP(c.total_bold)}</td>
-                          <td className="px-3 text-right tabular-nums text-zinc-400">{c.num_ventas}</td>
-                          <td className="pl-3 text-right font-semibold tabular-nums text-zinc-100">
-                            {formatCOP(c.total_general)}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            )}
+                        ) : (
+                          <>
+                            <td className="px-3 text-right tabular-nums text-zinc-400">{formatCOP(d.total_efectivo)}</td>
+                            <td className="px-3 text-right tabular-nums text-zinc-400">{formatCOP(d.total_nequi)}</td>
+                            <td className="px-3 text-right tabular-nums text-zinc-400">{formatCOP(d.total_bold)}</td>
+                            <td className="px-3 text-right tabular-nums text-zinc-500">
+                              {d.otros === 0 ? "—" : formatCOP(d.otros)}
+                            </td>
+                            <td className="px-3 text-right tabular-nums text-zinc-400">{d.num_ventas}</td>
+                            <td className="pl-3 text-right font-semibold tabular-nums text-zinc-100">
+                              {formatCOP(d.total_general)}
+                            </td>
+                          </>
+                        )}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+                <tfoot>
+                  <tr className="border-t border-zinc-700 text-xs">
+                    <th className="pt-2.5 pr-3 text-left font-semibold text-zinc-300">Total del mes</th>
+                    <td className="px-3 pt-2.5 text-right font-semibold tabular-nums text-zinc-200">
+                      {formatCOP(totalesMes.total_efectivo)}
+                    </td>
+                    <td className="px-3 pt-2.5 text-right font-semibold tabular-nums text-zinc-200">
+                      {formatCOP(totalesMes.total_nequi)}
+                    </td>
+                    <td className="px-3 pt-2.5 text-right font-semibold tabular-nums text-zinc-200">
+                      {formatCOP(totalesMes.total_bold)}
+                    </td>
+                    <td className="px-3 pt-2.5 text-right font-semibold tabular-nums text-zinc-400">
+                      {totalesMes.otros === 0 ? "—" : formatCOP(totalesMes.otros)}
+                    </td>
+                    <td className="px-3 pt-2.5 text-right font-semibold tabular-nums text-zinc-200">
+                      {totalesMes.num_ventas}
+                    </td>
+                    <td className="pl-3 pt-2.5 text-right text-sm font-bold tabular-nums text-emerald-300">
+                      {formatCOP(totalesMes.total_general)}
+                    </td>
+                  </tr>
+                </tfoot>
+              </table>
+            </div>
           </>
         )}
       </section>

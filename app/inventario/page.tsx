@@ -1,9 +1,11 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import dynamic from "next/dynamic";
 import PageShell from "../components/PageShell";
 import ProductForm, { type Producto } from "../components/ProductForm";
 import { supabase, getEmpresaIdActiva } from "../lib/auth";
+import { soportaCamara } from "../lib/barcode-camera";
 import { formatCOP } from "../lib/data-model";
 
 /**
@@ -14,6 +16,17 @@ import { formatCOP } from "../lib/data-model";
  * - Alta/edición vía <ProductForm> en un modal (mismo patrón que el POS).
  * - "Stock bajo" se calcula con la columna real `stock_minimo`.
  */
+
+/**
+ * Visor de cámara para buscar por código de barras, el MISMO que usan el POS y
+ * el alta de productos. Se carga con `ssr: false` porque toca
+ * `navigator.mediaDevices` nada más montar, y de forma diferida para que el
+ * decodificador no entre en el bundle inicial de esta página.
+ */
+const CameraScanner = dynamic(() => import("../components/CameraScanner"), { ssr: false });
+
+/** `useSyncExternalStore` sin suscripción: la capacidad no cambia en caliente. */
+const SIN_SUSCRIPCION = () => () => {};
 
 /** Fila de la tabla: producto + nombre del departamento embebido por PostgREST. */
 type ProductoRow = Producto & { departamentos: { nombre: string } | null };
@@ -28,6 +41,16 @@ export default function InventarioPage() {
   const [error, setError] = useState<string | null>(null);
   // Modal: null = cerrado; "nuevo" = alta; objeto = edición de esa fila.
   const [modal, setModal] = useState<"nuevo" | ProductoRow | null>(null);
+  // Visor de cámara del buscador (escaneo desde móvil/tablet, sin lector físico).
+  const [camaraAbierta, setCamaraAbierta] = useState(false);
+
+  /**
+   * ¿Pintamos el botón de cámara junto al buscador? Es una capacidad del
+   * NAVEGADOR (HTTPS + `getUserMedia`), que el servidor no puede conocer.
+   * `useSyncExternalStore` la lee sin romper la hidratación: el servidor
+   * renderiza `false` (sin botón) y el cliente lo recalcula al montar.
+   */
+  const camaraDisponible = useSyncExternalStore(SIN_SUSCRIPCION, soportaCamara, () => false);
 
   // Carga (o recarga) el catálogo completo. RLS ya lo aísla por empresa.
   const cargar = useCallback(async () => {
@@ -98,6 +121,16 @@ export default function InventarioPage() {
     cargar();
   }, [cargar]);
 
+  /**
+   * Código leído por la cámara: va al MISMO buscador que se teclea, así que la
+   * tabla se filtra sola y deja a la vista la referencia exacta. No consulta
+   * nada: el catálogo ya está en memoria y acotado a la empresa por RLS.
+   */
+  const onCodigoCamara = useCallback((codigo: string) => {
+    setCamaraAbierta(false);
+    setBusqueda(codigo.trim());
+  }, []);
+
   return (
     <PageShell
       title="Inventario"
@@ -140,15 +173,42 @@ export default function InventarioPage() {
         ))}
       </section>
 
-      {/* Buscador en tiempo real */}
-      <div className="relative mb-4">
-        <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-lg">🔍</span>
-        <input
-          value={busqueda}
-          onChange={(e) => setBusqueda(e.target.value)}
-          placeholder="Buscar por código de barras o descripción…"
-          className="w-full rounded-lg border border-zinc-800 bg-zinc-950 py-3 pl-11 pr-3 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-violet-500 focus:outline-none focus:ring-1 focus:ring-violet-500"
-        />
+      {/* Buscador en tiempo real. Dos vías al mismo filtro: tecleado (o lector
+          USB, que teclea) y cámara (botón 📷, solo si el navegador puede abrirla). */}
+      <div className="mb-4 flex gap-2">
+        <div className="relative min-w-0 flex-1">
+          <span className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-lg">🔍</span>
+          <input
+            value={busqueda}
+            onChange={(e) => setBusqueda(e.target.value)}
+            placeholder="Buscar por código de barras o descripción…"
+            className="w-full rounded-lg border border-zinc-800 bg-zinc-950 py-3 pl-11 pr-10 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-violet-500 focus:outline-none focus:ring-1 focus:ring-violet-500"
+          />
+          {busqueda && (
+            <button
+              type="button"
+              onClick={() => setBusqueda("")}
+              aria-label="Limpiar la búsqueda"
+              className="absolute right-2 top-1/2 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-md text-zinc-500 transition-colors hover:bg-zinc-800 hover:text-zinc-200"
+            >
+              ✕
+            </button>
+          )}
+        </div>
+        {camaraDisponible && (
+          <button
+            type="button"
+            onClick={() => setCamaraAbierta(true)}
+            title="Escanear con la cámara del dispositivo"
+            aria-label="Buscar escaneando el código de barras con la cámara"
+            className="flex w-14 shrink-0 items-center justify-center rounded-lg border border-violet-500/40 bg-violet-500/10 text-violet-300 transition-colors hover:bg-violet-500/20 active:scale-[0.97]"
+          >
+            <svg className="h-6 w-6" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+              <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" />
+              <circle cx="12" cy="13" r="4" />
+            </svg>
+          </button>
+        )}
       </div>
 
       {/* Tabla de productos */}
@@ -225,6 +285,17 @@ export default function InventarioPage() {
           </tbody>
         </table>
       </div>
+
+      {/* Visor de cámara a pantalla completa. Se monta solo al pulsar el botón
+          (ahí se descarga el decodificador) y se cierra tras la primera lectura,
+          dejando el código en el buscador. */}
+      {camaraAbierta && (
+        <CameraScanner
+          titulo="Buscar por código de barras"
+          onDetectado={onCodigoCamara}
+          onCerrar={() => setCamaraAbierta(false)}
+        />
+      )}
 
       {/* Modal de alta/edición */}
       {modal && (

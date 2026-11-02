@@ -35,19 +35,36 @@ export type CorteCaja = {
 };
 
 /**
- * Fecha del "día de negocio" en `America/Bogota` como `YYYY-MM-DD`. Fijamos la
- * zona horaria explícitamente (no la del dispositivo ni UTC) para que coincida
- * EXACTAMENTE con `public.hoy_negocio()` en la BD: así el arqueo filtra y
- * reinicia por el mismo día en ambos lados y no arrastra valores de la jornada
- * anterior cerca de la medianoche. El locale `en-CA` produce `YYYY-MM-DD`.
+ * Formateador del "día de negocio" en `America/Bogota`. Fijamos la zona horaria
+ * explícitamente (no la del dispositivo ni UTC) para que coincida EXACTAMENTE
+ * con `public.hoy_negocio()` en la BD: así el arqueo filtra y reinicia por el
+ * mismo día en ambos lados y no arrastra valores de la jornada anterior cerca de
+ * la medianoche. El locale `en-CA` produce `YYYY-MM-DD`.
+ *
+ * Se construye UNA sola vez a propósito: el agregado mensual lo invoca una vez
+ * por venta y crear un `Intl.DateTimeFormat` dentro del bucle es caro.
  */
+const FMT_DIA_BOGOTA = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "America/Bogota",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+});
+
+/** Fecha del día de negocio de HOY en `America/Bogota` como `YYYY-MM-DD`. */
 export function hoyISO(): string {
-  return new Intl.DateTimeFormat("en-CA", {
-    timeZone: "America/Bogota",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(new Date());
+  return FMT_DIA_BOGOTA.format(new Date());
+}
+
+/**
+ * Día de negocio (`YYYY-MM-DD` en `America/Bogota`) al que pertenece un
+ * `timestamptz`. Devuelve `null` si el valor no es una fecha utilizable, para
+ * que quien agrupa descarte la fila en vez de inventarle un día.
+ */
+function diaNegocioDe(ts: unknown): string | null {
+  if (typeof ts !== "string" || !ts) return null;
+  const d = new Date(ts);
+  return Number.isNaN(d.getTime()) ? null : FMT_DIA_BOGOTA.format(d);
 }
 
 /**
@@ -66,6 +83,45 @@ export function rangoDiaHoy(): { inicio: string; fin: string } {
     inicio: `${hoy}T00:00:00.000-05:00`,
     fin: `${hoy}T23:59:59.999-05:00`,
   };
+}
+
+/**
+ * Rango [inicio, fin] del MES de negocio en curso en `America/Bogota`, con el
+ * mismo anclaje `-05:00` que `rangoDiaHoy()`.
+ *
+ * El "ciclo" del histórico mensual de Reportes sale de aquí: como el mes se
+ * deriva de `hoyISO()` en cada llamada, al cambiar de mes el rango se mueve solo
+ * y la tabla arranca de cero sin ninguna intervención.
+ */
+export function rangoMesActual(): { inicio: string; fin: string; mes: string } {
+  const hoy = hoyISO(); // YYYY-MM-DD
+  const mes = hoy.slice(0, 7); // YYYY-MM
+  const [y, m] = hoy.split("-").map(Number);
+  // Día 0 del mes SIGUIENTE = último día de este mes. En UTC para que el número
+  // de días no dependa de la zona del dispositivo.
+  const ultimoDia = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  return {
+    inicio: `${mes}-01T00:00:00.000-05:00`,
+    fin: `${mes}-${String(ultimoDia).padStart(2, "0")}T23:59:59.999-05:00`,
+    mes,
+  };
+}
+
+/**
+ * Días de negocio ya transcurridos del mes en curso (`YYYY-MM-DD`), del más
+ * reciente al más antiguo. Es el esqueleto de la tabla del histórico: así los
+ * días sin una sola venta también aparecen (en cero) en vez de desaparecer del
+ * listado, y el mes se ve completo hasta hoy.
+ */
+export function diasTranscurridosDelMes(): string[] {
+  const hoy = hoyISO();
+  const mes = hoy.slice(0, 7);
+  const diaDeHoy = Number(hoy.slice(8, 10));
+  const dias: string[] = [];
+  for (let d = diaDeHoy; d >= 1; d--) {
+    dias.push(`${mes}-${String(d).padStart(2, "0")}`);
+  }
+  return dias;
 }
 
 /** Subtotales del día por método de pago, con la misma forma que un corte. */
@@ -109,6 +165,106 @@ function clasificarMetodo(metodoPago: string): "efectivo" | "nequi" | "bold" | n
   return null;
 }
 
+/** Subtotales de UN día concreto: misma forma, con su fecha de negocio. */
+export type VentasDiaPorMetodo = VentasHoyPorMetodo & { fecha: string };
+
+/** Tope de filas por respuesta de PostgREST: hay que paginar por encima de él. */
+const PAGINA_VENTAS = 1000;
+
+/** Columnas mínimas para repartir una venta entre los buckets del corte. */
+const COLS_CON_PAGOS = "total, metodo_pago, created_at, pagos";
+const COLS_SIN_PAGOS = "total, metodo_pago, created_at";
+
+/**
+ * Agrega las ventas de un rango por DÍA DE NEGOCIO y método de pago, leyendo
+ * directamente de `ventas` (no de `cortes_caja`): así el cuadre no depende de
+ * que exista una fila de corte materializada.
+ *
+ * DEFENSA EN PROFUNDIDAD: `empresaId` sale siempre de la sesión viva y, además
+ * de RLS, se filtra explícitamente — ninguna venta de otra empresa puede
+ * colarse en el agregado.
+ *
+ * PAGINA a propósito: un mes de mostrador supera de sobra las 1000 filas que
+ * PostgREST devuelve como máximo por respuesta, y una página truncada en
+ * silencio daría un total mensual MENOR que el real — justo lo que no puede
+ * pasar en un cierre.
+ *
+ * Devuelve `null` si la consulta falla, para que quien llama distinga "no hubo
+ * ventas" de "no se pudo leer".
+ */
+async function agregarVentasPorDia(
+  empresaId: string,
+  inicio: string,
+  fin: string,
+): Promise<Map<string, VentasDiaPorMetodo> | null> {
+  const porDia = new Map<string, VentasDiaPorMetodo>();
+  // `pagos` es una columna nueva (2026-11-pagos-mixtos.sql). Mismo patrón
+  // defensivo del resto del módulo: si la migración aún no corrió, PostgREST
+  // devuelve 42703 y reintentamos sin ella — el desglose sigue saliendo,
+  // simplemente sin poder repartir los cobros fraccionados.
+  let hayColumnaPagos = true;
+
+  for (let desde = 0; ; desde += PAGINA_VENTAS) {
+    const consulta = (columnas: string) =>
+      supabase
+        .from("ventas")
+        .select(columnas)
+        .eq("empresa_id", empresaId)
+        .gte("created_at", inicio)
+        .lte("created_at", fin)
+        // Orden estable: sin él la paginación podría repetir u omitir filas.
+        .order("created_at", { ascending: true })
+        .range(desde, desde + PAGINA_VENTAS - 1);
+
+    const primera = await consulta(hayColumnaPagos ? COLS_CON_PAGOS : COLS_SIN_PAGOS);
+    const debeReintentar = hayColumnaPagos && primera.error?.code === "42703";
+    if (debeReintentar) hayColumnaPagos = false;
+    const { data, error } = debeReintentar ? await consulta(COLS_SIN_PAGOS) : primera;
+
+    if (error) {
+      console.warn("[corte] No se pudieron leer las ventas del rango:", error.message);
+      return null;
+    }
+
+    const filas = (data ?? []) as unknown as {
+      total: number | string | null;
+      metodo_pago: string | null;
+      created_at: string | null;
+      pagos?: unknown;
+    }[];
+
+    for (const raw of filas) {
+      const monto = Number(raw.total ?? 0);
+      if (!Number.isFinite(monto)) continue;
+      const fecha = diaNegocioDe(raw.created_at);
+      if (!fecha) continue;
+
+      let acc = porDia.get(fecha);
+      if (!acc) {
+        acc = { ...VENTAS_HOY_VACIO, fecha };
+        porDia.set(fecha, acc);
+      }
+      acc.total_general += monto;
+      acc.num_ventas += 1;
+      // Una venta mixta trae su desglose: cada tramo va a SU bucket. Sin
+      // desglose se atribuye todo el total al método suelto, como siempre.
+      const reparto = repartirPorMetodo(
+        parsearPagos(raw.pagos),
+        monto,
+        raw.metodo_pago ?? "",
+        clasificarMetodo,
+      );
+      acc.total_efectivo += reparto.efectivo;
+      acc.total_nequi += reparto.nequi;
+      acc.total_bold += reparto.bold;
+    }
+
+    if (filas.length < PAGINA_VENTAS) break;
+  }
+
+  return porDia;
+}
+
 /**
  * Ventas de HOY agrupadas por método de pago, leídas DIRECTAMENTE de la tabla
  * `ventas` (no de `cortes_caja`). Esto hace que el desglose del dashboard y el
@@ -124,53 +280,42 @@ export async function fetchVentasHoyPorMetodo(): Promise<VentasHoyPorMetodo> {
   if (!empresaId) return { ...VENTAS_HOY_VACIO };
 
   const { inicio, fin } = rangoDiaHoy();
-  const consulta = (columnas: string) =>
-    supabase
-      .from("ventas")
-      .select(columnas)
-      .eq("empresa_id", empresaId)
-      .gte("created_at", inicio)
-      .lte("created_at", fin);
+  const porDia = await agregarVentasPorDia(empresaId, inicio, fin);
+  if (!porDia) return { ...VENTAS_HOY_VACIO };
 
-  // `pagos` es una columna nueva (2026-11-pagos-mixtos.sql). Mismo patrón
-  // defensivo del resto del módulo: si la migración aún no corrió, PostgREST
-  // devuelve 42703 y reintentamos sin ella — el desglose del día sigue saliendo,
-  // simplemente sin poder repartir los cobros fraccionados.
-  const completo = await consulta("total, metodo_pago, created_at, pagos");
-  const debeReintentar = completo.error?.code === "42703";
-  const { data, error } = debeReintentar
-    ? await consulta("total, metodo_pago, created_at")
-    : completo;
-
-  if (error) {
-    console.warn("[corte] No se pudieron leer las ventas de hoy:", error.message);
-    return { ...VENTAS_HOY_VACIO };
-  }
-
+  // El rango cubre un solo día, pero sumamos el mapa entero en vez de buscar la
+  // clave de hoy: así el total no se pierde si una venta cayera en el día
+  // contiguo por un milisegundo de borde.
   const acc: VentasHoyPorMetodo = { ...VENTAS_HOY_VACIO };
-  const filas = (data ?? []) as unknown as {
-    total: number | string | null;
-    metodo_pago: string | null;
-    pagos?: unknown;
-  }[];
-  for (const raw of filas) {
-    const monto = Number(raw.total ?? 0);
-    if (!Number.isFinite(monto)) continue;
-    acc.total_general += monto;
-    acc.num_ventas += 1;
-    // Una venta mixta trae su desglose: cada tramo va a SU bucket. Sin desglose
-    // se atribuye todo el total al método suelto, como siempre.
-    const reparto = repartirPorMetodo(
-      parsearPagos(raw.pagos),
-      monto,
-      raw.metodo_pago ?? "",
-      clasificarMetodo,
-    );
-    acc.total_efectivo += reparto.efectivo;
-    acc.total_nequi += reparto.nequi;
-    acc.total_bold += reparto.bold;
+  for (const dia of porDia.values()) {
+    acc.total_general += dia.total_general;
+    acc.total_efectivo += dia.total_efectivo;
+    acc.total_nequi += dia.total_nequi;
+    acc.total_bold += dia.total_bold;
+    acc.num_ventas += dia.num_ventas;
   }
   return acc;
+}
+
+/**
+ * Histórico DIARIO del mes en curso: una entrada por día de negocio CON ventas,
+ * de la más reciente a la más antigua. Alimenta la tabla de cierres de Reportes.
+ *
+ * El mes se recalcula en cada llamada desde `hoyISO()`, así que el ciclo se
+ * reinicia solo: el día 1 la tabla vuelve a empezar y nunca arrastra los días
+ * del mes anterior.
+ *
+ * Igual que el resto del módulo: sin empresa resuelta NO consulta → vacío.
+ */
+export async function fetchVentasMesPorDia(): Promise<VentasDiaPorMetodo[]> {
+  const empresaId = await getEmpresaIdActiva();
+  if (!empresaId) return [];
+
+  const { inicio, fin } = rangoMesActual();
+  const porDia = await agregarVentasPorDia(empresaId, inicio, fin);
+  if (!porDia) return [];
+
+  return [...porDia.values()].sort((a, b) => b.fecha.localeCompare(a.fecha));
 }
 
 /**
