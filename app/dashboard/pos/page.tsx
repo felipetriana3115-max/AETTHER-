@@ -1,6 +1,14 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import dynamic from "next/dynamic";
 import { useHotkeys } from "react-hotkeys-hook";
 import PageShell from "../../components/PageShell";
@@ -198,7 +206,13 @@ function Placeholder({ nombre }: { nombre: string }) {
  * URL falla al cargar) exactamente el mismo placeholder de iniciales de antes.
  * Así la imagen es 100% opcional y un enlace roto nunca deja un hueco en el grid.
  */
-function Miniatura({ nombre, imagenUrl }: { nombre: string; imagenUrl?: string | null }) {
+const Miniatura = memo(function Miniatura({
+  nombre,
+  imagenUrl,
+}: {
+  nombre: string;
+  imagenUrl?: string | null;
+}) {
   const [fallo, setFallo] = useState(false);
   const url = imagenUrl?.trim();
 
@@ -216,7 +230,338 @@ function Miniatura({ nombre, imagenUrl }: { nombre: string; imagenUrl?: string |
       className="h-14 w-full rounded-lg bg-zinc-900 object-cover"
     />
   );
-}
+});
+
+/**
+ * Tarjeta del grid táctil. MEMOIZADA a propósito: la página del POS vuelve a
+ * renderizar con cada tecla del teclado numérico, cada feedback y cada línea
+ * del carrito. Sin `memo`, las 12 tarjetas (con su <img>) se reconcilian en
+ * todas esas pasadas, y eso es justo el lag que se siente en una tablet con
+ * cola de gente. Solo recibe su producto y un `onAgregar` de identidad estable.
+ */
+const TarjetaProducto = memo(function TarjetaProducto({
+  producto,
+  onAgregar,
+}: {
+  producto: Producto;
+  onAgregar: (p: Producto) => void;
+}) {
+  const agotado = producto.stock_actual <= 0;
+  return (
+    <button
+      type="button"
+      onClick={() => onAgregar(producto)}
+      disabled={agotado}
+      className={`group flex flex-col gap-2 rounded-xl border p-3 text-left transition-all ${
+        agotado
+          ? "cursor-not-allowed border-red-500/30 bg-red-500/5 opacity-60"
+          : "border-zinc-800 bg-zinc-950 hover:border-violet-500/50 hover:bg-zinc-900 active:scale-95"
+      }`}
+    >
+      <Miniatura nombre={producto.nombre} imagenUrl={producto.imagen_url} />
+      <span className="line-clamp-2 min-h-[2.5rem] text-sm font-medium text-zinc-100">
+        {producto.nombre}
+      </span>
+      <span className="text-sm font-semibold text-violet-300">{formatCOP(producto.precio)}</span>
+      <span className={`text-xs ${agotado ? "font-semibold text-red-400" : "text-zinc-500"}`}>
+        {agotado ? "AGOTADO" : `Stock: ${producto.stock_actual}`}
+      </span>
+    </button>
+  );
+});
+
+/**
+ * Línea del carrito. Memoizada: al teclear en el modal de cobro (o al sumar
+ * una unidad en OTRA línea) el resto del carrito ya no se vuelve a pintar.
+ *
+ * La cantidad es un INPUT táctil, no solo +/−: tocarla selecciona el número y
+ * se teclea el total de golpe ("12") en vez de pulsar + doce veces. El valor
+ * vive en un buffer local mientras se edita —el campo puede quedar vacío a
+ * medio teclear— y se confirma al salir del campo o con Enter; 0 quita la línea.
+ */
+const FilaCarrito = memo(function FilaCarrito({
+  linea,
+  seleccionada,
+  onSeleccionar,
+  onCambiarQty,
+  onFijarQty,
+  onQuitar,
+}: {
+  linea: LineaCarrito;
+  seleccionada: boolean;
+  onSeleccionar: (id: string | number) => void;
+  onCambiarQty: (id: string | number, delta: number) => void;
+  onFijarQty: (id: string | number, qty: number) => void;
+  onQuitar: (id: string | number) => void;
+}) {
+  const [edicion, setEdicion] = useState<string | null>(null);
+
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      onClick={() => onSeleccionar(linea.id)}
+      className={`flex cursor-pointer items-center gap-3 p-3 transition-colors ${
+        seleccionada
+          ? "bg-violet-500/15 ring-1 ring-inset ring-violet-500/50"
+          : "hover:bg-zinc-800/30"
+      }`}
+    >
+      <div className="min-w-0 flex-1">
+        <p className="truncate text-sm font-medium text-zinc-100">
+          {linea.nombre}
+          {linea.esComun && (
+            <span className="ml-1.5 rounded bg-violet-500/20 px-1.5 py-0.5 text-[10px] font-medium text-violet-300">
+              común
+            </span>
+          )}
+        </p>
+        <p className="text-xs text-zinc-500">
+          {formatCOP(linea.precio)} · {formatCOP(linea.precio * linea.qty)}
+        </p>
+      </div>
+      <div className="flex items-center gap-1.5">
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onCambiarQty(linea.id, -1);
+          }}
+          className="flex h-10 w-10 items-center justify-center rounded-lg border border-zinc-800 text-lg text-zinc-300 hover:bg-zinc-800 active:scale-95"
+          aria-label="Quitar una unidad"
+        >
+          −
+        </button>
+        <input
+          value={edicion ?? String(linea.qty)}
+          inputMode="numeric"
+          aria-label={`Cantidad de ${linea.nombre}`}
+          title="Toca y escribe la cantidad exacta"
+          onClick={(e) => e.stopPropagation()}
+          onFocus={(e) => e.currentTarget.select()}
+          onChange={(e) => setEdicion(e.target.value.replace(/\D/g, "").slice(0, 3))}
+          onBlur={() => {
+            if (edicion === null) return;
+            onFijarQty(linea.id, Number(edicion) || 0);
+            setEdicion(null);
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              e.currentTarget.blur();
+            }
+          }}
+          className="h-10 w-12 rounded-lg border border-zinc-800 bg-zinc-950 text-center text-base font-semibold tabular-nums text-zinc-100 focus:border-violet-500 focus:outline-none focus:ring-1 focus:ring-violet-500"
+        />
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onCambiarQty(linea.id, 1);
+          }}
+          className="flex h-10 w-10 items-center justify-center rounded-lg border border-zinc-800 text-lg text-zinc-300 hover:bg-zinc-800 active:scale-95"
+          aria-label="Agregar una unidad"
+        >
+          +
+        </button>
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onQuitar(linea.id);
+          }}
+          className="ml-1 flex h-10 w-10 items-center justify-center rounded-lg text-zinc-500 hover:bg-red-500/10 hover:text-red-400"
+          aria-label="Eliminar del carrito"
+        >
+          🗑
+        </button>
+      </div>
+    </div>
+  );
+});
+
+/** Cantidades de un toque para el multiplicador (las típicas de mostrador). */
+const MULTIPLICADORES = [2, 3, 6, 12] as const;
+
+/**
+ * Multiplicador "N×": cantidad que se aplicará al PRÓXIMO producto —escaneado
+ * o pulsado en el grid— y que vuelve sola a 1 después.
+ *
+ * Es el atajo que evita el martilleo: con 12 gaseosas iguales se pone "12×" y
+ * se escanea UNA vez, en lugar de doce lecturas o doce toques en la tarjeta.
+ */
+const ControlCantidad = memo(function ControlCantidad({
+  valor,
+  onCambiar,
+}: {
+  valor: number;
+  onCambiar: (n: number) => void;
+}) {
+  const [edicion, setEdicion] = useState<string | null>(null);
+  const activo = valor > 1;
+
+  return (
+    <div
+      className={`mt-3 rounded-lg border p-2.5 transition-colors ${
+        activo ? "border-violet-500/50 bg-violet-500/10" : "border-zinc-800 bg-zinc-950/60"
+      }`}
+    >
+      <div className="flex items-center gap-2">
+        <span className="shrink-0 text-xs font-medium text-zinc-400">Cantidad</span>
+        <button
+          type="button"
+          onClick={() => onCambiar(valor - 1)}
+          aria-label="Bajar la cantidad del próximo producto"
+          className="flex h-12 w-11 shrink-0 items-center justify-center rounded-lg border border-zinc-800 text-xl text-zinc-300 transition-colors hover:bg-zinc-800 active:scale-95"
+        >
+          −
+        </button>
+        <input
+          value={edicion ?? String(valor)}
+          inputMode="numeric"
+          aria-label="Cantidad para el próximo producto"
+          onFocus={(e) => e.currentTarget.select()}
+          onChange={(e) => setEdicion(e.target.value.replace(/\D/g, "").slice(0, 2))}
+          onBlur={() => {
+            if (edicion === null) return;
+            onCambiar(Number(edicion) || 1);
+            setEdicion(null);
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              e.currentTarget.blur();
+            }
+          }}
+          className={`h-12 w-14 shrink-0 rounded-lg border bg-zinc-950 text-center text-2xl font-bold tabular-nums focus:outline-none focus:ring-1 focus:ring-violet-500 ${
+            activo ? "border-violet-500/60 text-violet-200" : "border-zinc-800 text-zinc-100"
+          }`}
+        />
+        <button
+          type="button"
+          onClick={() => onCambiar(valor + 1)}
+          aria-label="Subir la cantidad del próximo producto"
+          className="flex h-12 w-11 shrink-0 items-center justify-center rounded-lg border border-zinc-800 text-xl text-zinc-300 transition-colors hover:bg-zinc-800 active:scale-95"
+        >
+          +
+        </button>
+        <div className="ml-auto flex gap-1.5">
+          {MULTIPLICADORES.map((n) => (
+            <button
+              key={n}
+              type="button"
+              onClick={() => onCambiar(valor === n ? 1 : n)}
+              className={`h-12 w-12 rounded-lg border text-sm font-bold transition-colors active:scale-95 ${
+                valor === n
+                  ? "border-violet-500 bg-violet-500/25 text-violet-100"
+                  : "border-zinc-800 text-zinc-300 hover:bg-zinc-800"
+              }`}
+            >
+              {n}×
+            </button>
+          ))}
+        </div>
+      </div>
+      <p className="mt-1.5 text-[11px] leading-relaxed text-zinc-500">
+        {activo
+          ? `El próximo producto entrará ${valor} veces y la cantidad volverá sola a 1.`
+          : "Pon una cantidad y el siguiente escaneo (o toque) sumará esas unidades de golpe."}
+      </p>
+    </div>
+  );
+});
+
+/**
+ * Barra de cobro flotante — ERGONOMÍA TÁCTIL.
+ *
+ * Los botones de cobro vivían al fondo de la columna derecha: en hora pico
+ * había que desplazar la pantalla hasta abajo para cerrar cada venta. Aquí
+ * quedan FIJOS sobre el borde inferior, a la altura del pulgar y junto a la
+ * zona de escaneo, con el total siempre a la vista.
+ *
+ * Memoizada: solo se repinta cuando cambian el importe, las unidades, el
+ * cliente o el estado de cobro — no con cada tecla del resto de la página.
+ */
+const DockCobro = memo(function DockCobro({
+  total,
+  unidades,
+  cobrando,
+  clienteNombre,
+  onEfectivo,
+  onMetodo,
+  onMixto,
+  onFiado,
+}: {
+  total: number;
+  unidades: number;
+  cobrando: boolean;
+  clienteNombre: string | null;
+  onEfectivo: () => void;
+  onMetodo: (m: MetodoCaja) => void;
+  onMixto: () => void;
+  onFiado: () => void;
+}) {
+  return (
+    // `md:left-64` deja libre el ancho del <Sidebar>, que en escritorio ocupa
+    // su propia columna. z-30: por debajo de los modales (z-50) y del menú móvil.
+    <div className="fixed inset-x-0 bottom-0 z-30 md:left-64">
+      <div className="pb-safe border-t border-violet-500/25 bg-zinc-950/95 px-3 py-2.5 shadow-[0_-12px_32px_rgba(0,0,0,0.65)] backdrop-blur">
+        <div className="mx-auto max-w-5xl">
+          <div className="mb-2 flex items-baseline justify-between gap-3">
+            <span className="truncate text-xs text-zinc-400">
+              {unidades} und · {clienteNombre ?? "Venta general"}
+            </span>
+            <span className="text-2xl font-bold tabular-nums text-zinc-50 sm:text-3xl">
+              {formatCOP(total)}
+            </span>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2 lg:grid-cols-5">
+            {METODOS.map((m) => (
+              <button
+                key={m.id}
+                type="button"
+                disabled={cobrando}
+                onClick={() => (m.id === "Efectivo" ? onEfectivo() : onMetodo(m.id))}
+                title={m.sub}
+                className={`flex h-16 items-center justify-center rounded-xl bg-gradient-to-r px-3 text-center text-sm font-semibold text-white shadow-lg transition-all active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-40 ${
+                  m.id === "Efectivo" ? "col-span-2 lg:col-span-1" : ""
+                } ${m.classes}`}
+              >
+                {cobrando ? "…" : m.label}
+              </button>
+            ))}
+
+            {/* Pago fraccionado: reparte el total entre varios medios de caja. */}
+            <button
+              type="button"
+              disabled={cobrando}
+              onClick={onMixto}
+              title="Cobrar esta venta con varios medios de pago a la vez"
+              className="flex h-16 items-center justify-center gap-1.5 rounded-xl border-2 border-dashed border-violet-500/50 bg-violet-500/10 px-3 text-center text-sm font-semibold text-violet-200 transition-all hover:bg-violet-500/15 active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <span aria-hidden>⇄</span> Fraccionado
+            </button>
+
+            {/* Fiado (venta a crédito): carga el total al saldo del cliente. */}
+            <button
+              type="button"
+              disabled={cobrando}
+              onClick={onFiado}
+              title={clienteNombre ? `Fiar a ${clienteNombre}` : "Selecciona un cliente para fiar"}
+              className="flex h-16 flex-col items-center justify-center rounded-xl border-2 border-dashed border-amber-500/50 bg-amber-500/10 px-3 text-center text-sm font-semibold text-amber-200 transition-all hover:bg-amber-500/15 active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Fiado
+              <span className="truncate text-[10px] font-normal text-amber-300/80">
+                {clienteNombre ?? "Elige cliente"}
+              </span>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+});
 
 export default function PosPage() {
   const { businessName } = useDashboard();
@@ -230,6 +575,17 @@ export default function PosPage() {
   const { esAdministrador } = useRolSesion();
   const [frecuentes, setFrecuentes] = useState<Producto[]>([]);
   const [carrito, setCarrito] = useState<LineaCarrito[]>([]);
+  /**
+   * Multiplicador "N×" de un solo uso: unidades que sumará el PRÓXIMO producto
+   * (escaneado o pulsado en el grid). Se consume al agregar y vuelve a 1.
+   */
+  const [multiplicador, setMultiplicador] = useState(1);
+  /**
+   * Espejo del multiplicador en un ref. `agregar` lo lee de aquí para NO
+   * depender del estado: si cambiara de identidad en cada ajuste de cantidad,
+   * se caería la memoización de las 12 tarjetas del grid en cada toque.
+   */
+  const multiplicadorRef = useRef(1);
   const [feedback, setFeedback] = useState<Feedback>(null);
   const [cobrando, setCobrando] = useState(false);
   // Modal de cobro en efectivo: abierto + monto recibido (solo dígitos).
@@ -477,32 +833,62 @@ export default function PosPage() {
 
   // ── Carrito ────────────────────────────────────────────────────────────────
 
+  /** Fija el multiplicador (acotado a 1..99) en el estado y en su ref espejo. */
+  const fijarMultiplicador = useCallback((n: number) => {
+    const v = Math.min(99, Math.max(1, Math.trunc(n) || 1));
+    multiplicadorRef.current = v;
+    setMultiplicador(v);
+  }, []);
+
   /**
-   * Agrega un producto al carrito (cantidad +1). UX proactiva: si el stock es 0
-   * (o la línea ya alcanzó el stock disponible), no agrega y avisa en rojo.
+   * Agrega un producto al carrito. La cantidad sale del multiplicador "N×"
+   * (1 por defecto), así que escanear con "12×" puesto mete las doce unidades
+   * en UNA lectura en vez de obligar a repetir el gesto doce veces.
+   *
+   * El multiplicador se consume SIEMPRE, incluso si el producto está agotado:
+   * es un modificador de un solo uso y dejarlo armado tras un intento fallido
+   * haría que el siguiente producto entrara multiplicado sin que nadie lo pida.
+   *
+   * UX proactiva de stock: nunca se pasa del disponible; si se pidieron más de
+   * los que quedan, agrega los que caben y lo dice en rojo.
    */
-  const agregar = useCallback((p: Producto) => {
-    if (p.stock_actual <= 0) {
-      setFeedback({ tone: "error", msg: `Sin stock: "${p.nombre}" no tiene existencias.` });
-      return;
-    }
-    // Empieza una venta nueva → el vuelto de la anterior ya se entregó.
-    setDevuelto(null);
-    setCarrito((prev) => {
-      const existente = prev.find((l) => l.id === p.id);
-      if (existente) {
-        if (existente.qty >= p.stock_actual) {
+  const agregar = useCallback(
+    (p: Producto, cantidad?: number) => {
+      const pedidas = Math.max(1, Math.trunc(cantidad ?? multiplicadorRef.current) || 1);
+      fijarMultiplicador(1);
+
+      if (p.stock_actual <= 0) {
+        setFeedback({ tone: "error", msg: `Sin stock: "${p.nombre}" no tiene existencias.` });
+        return;
+      }
+      // Empieza una venta nueva → el vuelto de la anterior ya se entregó.
+      setDevuelto(null);
+      setCarrito((prev) => {
+        const existente = prev.find((l) => l.id === p.id);
+        // Hueco que queda hasta el stock disponible (los artículos comunes
+        // llegan con stock Infinity, así que para ellos nunca acota).
+        const cabe = p.stock_actual - (existente?.qty ?? 0);
+        if (cabe <= 0) {
           setFeedback({
             tone: "error",
             msg: `Solo hay ${p.stock_actual} unidad(es) de "${p.nombre}".`,
           });
           return prev;
         }
-        return prev.map((l) => (l.id === p.id ? { ...l, qty: l.qty + 1 } : l));
-      }
-      return [...prev, { ...p, qty: 1 }];
-    });
-  }, []);
+        const suma = Math.min(pedidas, cabe);
+        if (suma < pedidas) {
+          setFeedback({
+            tone: "error",
+            msg: `Solo quedaban ${cabe} de "${p.nombre}": se agregaron ${suma} de las ${pedidas} pedidas.`,
+          });
+        }
+        return existente
+          ? prev.map((l) => (l.id === p.id ? { ...l, qty: l.qty + suma } : l))
+          : [...prev, { ...p, qty: suma }];
+      });
+    },
+    [fijarMultiplicador],
+  );
 
   const cambiarQty = useCallback((id: string | number, delta: number) => {
     setCarrito((prev) =>
@@ -523,6 +909,49 @@ export default function PosPage() {
   const quitar = useCallback((id: string | number) => {
     setCarrito((prev) => prev.filter((l) => l.id !== id));
     setSeleccionado((sel) => (sel === id ? null : sel));
+  }, []);
+
+  /**
+   * Fija la cantidad EXACTA de una línea (input táctil del carrito): se teclea
+   * "12" en vez de pulsar + doce veces. Se acota al stock disponible y 0 quita
+   * la línea, que es lo que el cajero espera al borrar el número.
+   */
+  const fijarQty = useCallback(
+    (id: string | number, qty: number) => {
+      const n = Math.max(0, Math.trunc(qty) || 0);
+      if (n === 0) {
+        quitar(id);
+        return;
+      }
+      setCarrito((prev) =>
+        prev.map((l) => {
+          if (l.id !== id) return l;
+          if (n > l.stock_actual) {
+            setFeedback({
+              tone: "error",
+              msg: `Solo hay ${l.stock_actual} unidad(es) de "${l.nombre}".`,
+            });
+            return { ...l, qty: l.stock_actual };
+          }
+          return { ...l, qty: n };
+        }),
+      );
+    },
+    [quitar],
+  );
+
+  /** Alterna la línea seleccionada (para la tecla Supr). Identidad estable. */
+  const seleccionar = useCallback((id: string | number) => {
+    setSeleccionado((sel) => (sel === id ? null : id));
+  }, []);
+
+  // Handlers del escáner con identidad estable: si se recrearan en cada render,
+  // <BarcodeScanner> rehría su `buscar` y su handle imperativo en cada tecla.
+  const onCodigoNoEncontrado = useCallback((codigo: string) => {
+    setFeedback({ tone: "error", msg: `Código ${codigo} no encontrado.` });
+  }, []);
+  const onErrorEscaner = useCallback((msg: string) => {
+    setFeedback({ tone: "error", msg });
   }, []);
 
   // ── Carritos en espera (hold) ────────────────────────────────────────────
@@ -953,6 +1382,8 @@ export default function PosPage() {
               : `Venta cobrada con ${metodo}: ${formatCOP(total)}.`;
 
         setCarrito([]);
+        // Venta cerrada: la siguiente empieza con el multiplicador en 1.
+        fijarMultiplicador(1);
         // Soltamos el cliente tras fiar para no cargarle sin querer la próxima venta.
         if (esFiado) setClienteSel(null);
         inputRef.current?.focus();
@@ -1004,8 +1435,30 @@ export default function PosPage() {
         setCobrando(false);
       }
     },
-    [carrito, total, businessName, online, sincronizar, refresh, clienteSel, imprimirTirilla],
+    [
+      carrito,
+      total,
+      businessName,
+      online,
+      sincronizar,
+      refresh,
+      clienteSel,
+      imprimirTirilla,
+      fijarMultiplicador,
+    ],
   );
+
+  // Disparadores del dock de cobro: envuelven `cobrar` para que el dock reciba
+  // handlers sin argumentos y no tenga que conocer el tipo del método.
+  const cobrarMetodo = useCallback(
+    (m: MetodoCaja) => {
+      void cobrar(m);
+    },
+    [cobrar],
+  );
+  const cobrarFiado = useCallback(() => {
+    void cobrar("Fiado");
+  }, [cobrar]);
 
   // ── Cobro en efectivo (modal con cálculo de cambio) ──────────────────────────
 
@@ -1436,9 +1889,9 @@ export default function PosPage() {
               <div className="min-w-0 flex-1">
                 <BarcodeScanner
                   ref={inputRef}
-                  onScan={(p) => agregar(p)}
-                  onNotFound={(codigo) => setFeedback({ tone: "error", msg: `Código ${codigo} no encontrado.` })}
-                  onError={(msg) => setFeedback({ tone: "error", msg })}
+                  onScan={agregar}
+                  onNotFound={onCodigoNoEncontrado}
+                  onError={onErrorEscaner}
                 />
               </div>
               {camaraDisponible && (
@@ -1456,6 +1909,9 @@ export default function PosPage() {
                 </button>
               )}
             </div>
+
+            {/* Multiplicador de cantidad: se aplica al próximo escaneo o toque. */}
+            <ControlCantidad valor={multiplicador} onCambiar={fijarMultiplicador} />
 
             {/* Artículo común: ítem suelto sin inventario (botón grande táctil). */}
             <button
@@ -1520,40 +1976,23 @@ export default function PosPage() {
 
           {/* Grid táctil de productos frecuentes */}
           <div className="rounded-xl border border-violet-500/15 bg-zinc-900/50 p-4">
-            <h3 className="mb-3 text-sm font-semibold text-zinc-100">Productos frecuentes</h3>
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <h3 className="text-sm font-semibold text-zinc-100">Productos frecuentes</h3>
+              {multiplicador > 1 && (
+                <span className="rounded-full bg-violet-500/20 px-2.5 py-0.5 text-xs font-bold text-violet-200">
+                  {multiplicador}× por toque
+                </span>
+              )}
+            </div>
             {frecuentes.length === 0 ? (
               <p className="py-8 text-center text-sm text-zinc-500">
                 No hay productos cargados en el inventario.
               </p>
             ) : (
               <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
-                {frecuentes.map((p) => {
-                  const agotado = p.stock_actual <= 0;
-                  return (
-                    <button
-                      key={p.id}
-                      type="button"
-                      onClick={() => agregar(p)}
-                      disabled={agotado}
-                      className={`group flex flex-col gap-2 rounded-xl border p-3 text-left transition-all ${
-                        agotado
-                          ? "cursor-not-allowed border-red-500/30 bg-red-500/5 opacity-60"
-                          : "border-zinc-800 bg-zinc-950 hover:border-violet-500/50 hover:bg-zinc-900 active:scale-95"
-                      }`}
-                    >
-                      <Miniatura nombre={p.nombre} imagenUrl={p.imagen_url} />
-                      <span className="line-clamp-2 min-h-[2.5rem] text-sm font-medium text-zinc-100">
-                        {p.nombre}
-                      </span>
-                      <span className="text-sm font-semibold text-violet-300">{formatCOP(p.precio)}</span>
-                      <span
-                        className={`text-xs ${agotado ? "font-semibold text-red-400" : "text-zinc-500"}`}
-                      >
-                        {agotado ? "AGOTADO" : `Stock: ${p.stock_actual}`}
-                      </span>
-                    </button>
-                  );
-                })}
+                {frecuentes.map((p) => (
+                  <TarjetaProducto key={p.id} producto={p} onAgregar={agregar} />
+                ))}
               </div>
             )}
           </div>
@@ -1692,67 +2131,15 @@ export default function PosPage() {
               <p className="p-8 text-center text-sm text-zinc-500">Agrega productos para iniciar la venta.</p>
             ) : (
               carrito.map((l) => (
-                <div
+                <FilaCarrito
                   key={l.id}
-                  role="button"
-                  tabIndex={0}
-                  onClick={() => setSeleccionado((sel) => (sel === l.id ? null : l.id))}
-                  className={`flex cursor-pointer items-center gap-3 p-3 transition-colors ${
-                    seleccionado === l.id ? "bg-violet-500/15 ring-1 ring-inset ring-violet-500/50" : "hover:bg-zinc-800/30"
-                  }`}
-                >
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-sm font-medium text-zinc-100">
-                      {l.nombre}
-                      {l.esComun && (
-                        <span className="ml-1.5 rounded bg-violet-500/20 px-1.5 py-0.5 text-[10px] font-medium text-violet-300">
-                          común
-                        </span>
-                      )}
-                    </p>
-                    <p className="text-xs text-zinc-500">
-                      {formatCOP(l.precio)} · {formatCOP(l.precio * l.qty)}
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-1.5">
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        cambiarQty(l.id, -1);
-                      }}
-                      className="flex h-8 w-8 items-center justify-center rounded-lg border border-zinc-800 text-lg text-zinc-300 hover:bg-zinc-800"
-                      aria-label="Quitar una unidad"
-                    >
-                      −
-                    </button>
-                    <span className="w-6 text-center text-sm font-semibold tabular-nums text-zinc-100">
-                      {l.qty}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        cambiarQty(l.id, 1);
-                      }}
-                      className="flex h-8 w-8 items-center justify-center rounded-lg border border-zinc-800 text-lg text-zinc-300 hover:bg-zinc-800"
-                      aria-label="Agregar una unidad"
-                    >
-                      +
-                    </button>
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        quitar(l.id);
-                      }}
-                      className="ml-1 flex h-8 w-8 items-center justify-center rounded-lg text-zinc-500 hover:bg-red-500/10 hover:text-red-400"
-                      aria-label="Eliminar del carrito"
-                    >
-                      🗑
-                    </button>
-                  </div>
-                </div>
+                  linea={l}
+                  seleccionada={seleccionado === l.id}
+                  onSeleccionar={seleccionar}
+                  onCambiarQty={cambiarQty}
+                  onFijarQty={fijarQty}
+                  onQuitar={quitar}
+                />
               ))
             )}
           </div>
@@ -1804,66 +2191,19 @@ export default function PosPage() {
             </div>
           </div>
 
-          {/* Total + botones de pago rápido */}
+          {/* Total + utilidades de caja.
+              Los BOTONES DE COBRO ya no viven aquí: se movieron al dock fijo
+              del borde inferior (<DockCobro>), en la zona del pulgar, para que
+              en hora pico no haya que desplazar la pantalla hasta el fondo de
+              esta columna para cerrar cada venta. */}
           <div className="border-t-0 p-4">
-            <div className="mb-4 flex items-baseline justify-between">
+            <div className="mb-2 flex items-baseline justify-between">
               <span className="text-sm text-zinc-400">Total</span>
               <span className="text-3xl font-bold tracking-tight text-zinc-50">{formatCOP(total)}</span>
             </div>
-
-            <div className="grid grid-cols-1 gap-2.5">
-              {METODOS.map((m) => (
-                <button
-                  key={m.id}
-                  type="button"
-                  disabled={cobrando || carrito.length === 0}
-                  onClick={() => (m.id === "Efectivo" ? abrirEfectivo() : cobrar(m.id))}
-                  className={`flex h-16 w-full items-center justify-between rounded-xl bg-gradient-to-r px-4 text-left text-white shadow-lg transition-all active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-40 ${m.classes}`}
-                >
-                  <span>
-                    <span className="block text-base font-semibold">{m.label}</span>
-                    <span className="block text-xs text-white/80">{m.sub}</span>
-                  </span>
-                  <span className="text-xl">{cobrando ? "…" : "→"}</span>
-                </button>
-              ))}
-
-              {/* Pago fraccionado: reparte el total entre varios medios de caja
-                  (p. ej. parte en efectivo y el resto por el datáfono). Abre el
-                  desglose; nada se cobra hasta que los importes cuadran al peso. */}
-              <button
-                type="button"
-                disabled={cobrando || carrito.length === 0}
-                onClick={abrirMixto}
-                title="Cobrar esta venta con varios medios de pago a la vez"
-                className="flex h-16 w-full items-center justify-between rounded-xl border-2 border-dashed border-violet-500/50 bg-violet-500/10 px-4 text-left text-violet-200 transition-all active:scale-[0.98] hover:bg-violet-500/15 disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                <span>
-                  <span className="block text-base font-semibold">Pago fraccionado</span>
-                  <span className="block text-xs text-violet-300/80">
-                    Efectivo + Nequi + Bold en una sola venta
-                  </span>
-                </span>
-                <span className="text-xl">{cobrando ? "…" : "⇄"}</span>
-              </button>
-
-              {/* Fiado (venta a crédito): carga el total al saldo del cliente. */}
-              <button
-                type="button"
-                disabled={cobrando || carrito.length === 0}
-                onClick={() => cobrar("Fiado")}
-                title={clienteSel ? `Fiar a ${clienteSel.nombre}` : "Selecciona un cliente para fiar"}
-                className="flex h-16 w-full items-center justify-between rounded-xl border-2 border-dashed border-amber-500/50 bg-amber-500/10 px-4 text-left text-amber-200 transition-all active:scale-[0.98] hover:bg-amber-500/15 disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                <span>
-                  <span className="block text-base font-semibold">Fiado (crédito)</span>
-                  <span className="block text-xs text-amber-300/80">
-                    {clienteSel ? `A cuenta de ${clienteSel.nombre}` : "Requiere elegir cliente"}
-                  </span>
-                </span>
-                <span className="text-xl">{cobrando ? "…" : "→"}</span>
-              </button>
-            </div>
+            <p className="mb-3 text-[11px] leading-relaxed text-zinc-500">
+              Cobra desde la barra fija de la parte inferior de la pantalla.
+            </p>
 
             {ultimaVenta && (
               <button
@@ -1909,6 +2249,26 @@ export default function PosPage() {
           </div>
         </section>
       </div>
+
+      {/* Espaciador: deja aire bajo el contenido para que el dock fijo no tape
+          la última fila (botón del cajón, últimas líneas del carrito). */}
+      {carrito.length > 0 && <div aria-hidden className="h-40" />}
+
+      {/* ── Dock de cobro (zona del pulgar) ──
+          Solo existe cuando hay algo que cobrar, así que no roba pantalla con
+          la caja vacía. */}
+      {carrito.length > 0 && (
+        <DockCobro
+          total={total}
+          unidades={unidades}
+          cobrando={cobrando}
+          clienteNombre={clienteSel?.nombre ?? null}
+          onEfectivo={abrirEfectivo}
+          onMetodo={cobrarMetodo}
+          onMixto={abrirMixto}
+          onFiado={cobrarFiado}
+        />
+      )}
 
       {/* ── Modal: Artículo común ── */}
       {comunAbierto && (
