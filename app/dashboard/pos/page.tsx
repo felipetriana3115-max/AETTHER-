@@ -274,10 +274,11 @@ const TarjetaProducto = memo(function TarjetaProducto({
  * Línea del carrito. Memoizada: al teclear en el modal de cobro (o al sumar
  * una unidad en OTRA línea) el resto del carrito ya no se vuelve a pintar.
  *
- * La cantidad es un INPUT táctil, no solo +/−: tocarla selecciona el número y
- * se teclea el total de golpe ("12") en vez de pulsar + doce veces. El valor
- * vive en un buffer local mientras se edita —el campo puede quedar vacío a
- * medio teclear— y se confirma al salir del campo o con Enter; 0 quita la línea.
+ * La cantidad se ajusta AQUÍ y solo aquí: es un INPUT táctil, no solo +/−.
+ * Tocarlo selecciona el número y se teclea el total de golpe ("12") en vez de
+ * pulsar + doce veces. El valor vive en un buffer local mientras se edita —el
+ * campo puede quedar vacío a medio teclear— y se confirma al salir del campo o
+ * con Enter; 0 quita la línea y Escape cancela y restaura la cantidad previa.
  */
 const FilaCarrito = memo(function FilaCarrito({
   linea,
@@ -295,6 +296,13 @@ const FilaCarrito = memo(function FilaCarrito({
   onQuitar: (id: string | number) => void;
 }) {
   const [edicion, setEdicion] = useState<string | null>(null);
+  /**
+   * Marca "esta salida del campo es un Escape". `blur()` dispara `onBlur` en el
+   * mismo tick, antes de que el `setEdicion(null)` del Escape se aplique: sin
+   * esta bandera síncrona el handler de salida leería el buffer viejo y
+   * confirmaría justo la cantidad que el cajero quiso descartar.
+   */
+  const cancelandoRef = useRef(false);
 
   return (
     <div
@@ -339,8 +347,17 @@ const FilaCarrito = memo(function FilaCarrito({
           title="Toca y escribe la cantidad exacta"
           onClick={(e) => e.stopPropagation()}
           onFocus={(e) => e.currentTarget.select()}
+          // Con ratón, el mouseup posterior al focus colapsa la selección y
+          // dejaría el cursor en medio del número: lo cancelamos para que
+          // teclear SIEMPRE reemplace la cantidad entera, no la concatene.
+          onMouseUp={(e) => e.preventDefault()}
           onChange={(e) => setEdicion(e.target.value.replace(/\D/g, "").slice(0, 3))}
           onBlur={() => {
+            if (cancelandoRef.current) {
+              cancelandoRef.current = false;
+              setEdicion(null);
+              return;
+            }
             if (edicion === null) return;
             onFijarQty(linea.id, Number(edicion) || 0);
             setEdicion(null);
@@ -348,6 +365,13 @@ const FilaCarrito = memo(function FilaCarrito({
           onKeyDown={(e) => {
             if (e.key === "Enter") {
               e.preventDefault();
+              e.currentTarget.blur();
+              return;
+            }
+            // Escape: descarta lo tecleado y sale sin tocar el carrito.
+            if (e.key === "Escape") {
+              e.preventDefault();
+              cancelandoRef.current = true;
               e.currentTarget.blur();
             }
           }}
@@ -376,97 +400,6 @@ const FilaCarrito = memo(function FilaCarrito({
           🗑
         </button>
       </div>
-    </div>
-  );
-});
-
-/** Cantidades de un toque para el multiplicador (las típicas de mostrador). */
-const MULTIPLICADORES = [2, 3, 6, 12] as const;
-
-/**
- * Multiplicador "N×": cantidad que se aplicará al PRÓXIMO producto —escaneado
- * o pulsado en el grid— y que vuelve sola a 1 después.
- *
- * Es el atajo que evita el martilleo: con 12 gaseosas iguales se pone "12×" y
- * se escanea UNA vez, en lugar de doce lecturas o doce toques en la tarjeta.
- */
-const ControlCantidad = memo(function ControlCantidad({
-  valor,
-  onCambiar,
-}: {
-  valor: number;
-  onCambiar: (n: number) => void;
-}) {
-  const [edicion, setEdicion] = useState<string | null>(null);
-  const activo = valor > 1;
-
-  return (
-    <div
-      className={`mt-3 rounded-lg border p-2.5 transition-colors ${
-        activo ? "border-violet-500/50 bg-violet-500/10" : "border-zinc-800 bg-zinc-950/60"
-      }`}
-    >
-      <div className="flex items-center gap-2">
-        <span className="shrink-0 text-xs font-medium text-zinc-400">Cantidad</span>
-        <button
-          type="button"
-          onClick={() => onCambiar(valor - 1)}
-          aria-label="Bajar la cantidad del próximo producto"
-          className="flex h-12 w-11 shrink-0 items-center justify-center rounded-lg border border-zinc-800 text-xl text-zinc-300 transition-colors hover:bg-zinc-800 active:scale-95"
-        >
-          −
-        </button>
-        <input
-          value={edicion ?? String(valor)}
-          inputMode="numeric"
-          aria-label="Cantidad para el próximo producto"
-          onFocus={(e) => e.currentTarget.select()}
-          onChange={(e) => setEdicion(e.target.value.replace(/\D/g, "").slice(0, 2))}
-          onBlur={() => {
-            if (edicion === null) return;
-            onCambiar(Number(edicion) || 1);
-            setEdicion(null);
-          }}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              e.preventDefault();
-              e.currentTarget.blur();
-            }
-          }}
-          className={`h-12 w-14 shrink-0 rounded-lg border bg-zinc-950 text-center text-2xl font-bold tabular-nums focus:outline-none focus:ring-1 focus:ring-violet-500 ${
-            activo ? "border-violet-500/60 text-violet-200" : "border-zinc-800 text-zinc-100"
-          }`}
-        />
-        <button
-          type="button"
-          onClick={() => onCambiar(valor + 1)}
-          aria-label="Subir la cantidad del próximo producto"
-          className="flex h-12 w-11 shrink-0 items-center justify-center rounded-lg border border-zinc-800 text-xl text-zinc-300 transition-colors hover:bg-zinc-800 active:scale-95"
-        >
-          +
-        </button>
-        <div className="ml-auto flex gap-1.5">
-          {MULTIPLICADORES.map((n) => (
-            <button
-              key={n}
-              type="button"
-              onClick={() => onCambiar(valor === n ? 1 : n)}
-              className={`h-12 w-12 rounded-lg border text-sm font-bold transition-colors active:scale-95 ${
-                valor === n
-                  ? "border-violet-500 bg-violet-500/25 text-violet-100"
-                  : "border-zinc-800 text-zinc-300 hover:bg-zinc-800"
-              }`}
-            >
-              {n}×
-            </button>
-          ))}
-        </div>
-      </div>
-      <p className="mt-1.5 text-[11px] leading-relaxed text-zinc-500">
-        {activo
-          ? `El próximo producto entrará ${valor} veces y la cantidad volverá sola a 1.`
-          : "Pon una cantidad y el siguiente escaneo (o toque) sumará esas unidades de golpe."}
-      </p>
     </div>
   );
 });
@@ -575,17 +508,6 @@ export default function PosPage() {
   const { esAdministrador } = useRolSesion();
   const [frecuentes, setFrecuentes] = useState<Producto[]>([]);
   const [carrito, setCarrito] = useState<LineaCarrito[]>([]);
-  /**
-   * Multiplicador "N×" de un solo uso: unidades que sumará el PRÓXIMO producto
-   * (escaneado o pulsado en el grid). Se consume al agregar y vuelve a 1.
-   */
-  const [multiplicador, setMultiplicador] = useState(1);
-  /**
-   * Espejo del multiplicador en un ref. `agregar` lo lee de aquí para NO
-   * depender del estado: si cambiara de identidad en cada ajuste de cantidad,
-   * se caería la memoización de las 12 tarjetas del grid en cada toque.
-   */
-  const multiplicadorRef = useRef(1);
   const [feedback, setFeedback] = useState<Feedback>(null);
   const [cobrando, setCobrando] = useState(false);
   // Modal de cobro en efectivo: abierto + monto recibido (solo dígitos).
@@ -833,62 +755,37 @@ export default function PosPage() {
 
   // ── Carrito ────────────────────────────────────────────────────────────────
 
-  /** Fija el multiplicador (acotado a 1..99) en el estado y en su ref espejo. */
-  const fijarMultiplicador = useCallback((n: number) => {
-    const v = Math.min(99, Math.max(1, Math.trunc(n) || 1));
-    multiplicadorRef.current = v;
-    setMultiplicador(v);
-  }, []);
-
   /**
-   * Agrega un producto al carrito. La cantidad sale del multiplicador "N×"
-   * (1 por defecto), así que escanear con "12×" puesto mete las doce unidades
-   * en UNA lectura en vez de obligar a repetir el gesto doce veces.
+   * Agrega UNA unidad del producto al carrito (escaneo o toque en el grid).
+   * Para cantidades grandes no se repite el gesto: se teclea el total en el
+   * input de la línea del carrito (ver `fijarQty`).
    *
-   * El multiplicador se consume SIEMPRE, incluso si el producto está agotado:
-   * es un modificador de un solo uso y dejarlo armado tras un intento fallido
-   * haría que el siguiente producto entrara multiplicado sin que nadie lo pida.
-   *
-   * UX proactiva de stock: nunca se pasa del disponible; si se pidieron más de
-   * los que quedan, agrega los que caben y lo dice en rojo.
+   * UX proactiva de stock: nunca se pasa del disponible; si ya no cabe ni una
+   * unidad más, lo dice en rojo y deja el carrito como estaba.
    */
-  const agregar = useCallback(
-    (p: Producto, cantidad?: number) => {
-      const pedidas = Math.max(1, Math.trunc(cantidad ?? multiplicadorRef.current) || 1);
-      fijarMultiplicador(1);
-
-      if (p.stock_actual <= 0) {
-        setFeedback({ tone: "error", msg: `Sin stock: "${p.nombre}" no tiene existencias.` });
-        return;
+  const agregar = useCallback((p: Producto) => {
+    if (p.stock_actual <= 0) {
+      setFeedback({ tone: "error", msg: `Sin stock: "${p.nombre}" no tiene existencias.` });
+      return;
+    }
+    // Empieza una venta nueva → el vuelto de la anterior ya se entregó.
+    setDevuelto(null);
+    setCarrito((prev) => {
+      const existente = prev.find((l) => l.id === p.id);
+      // Hueco que queda hasta el stock disponible (los artículos comunes
+      // llegan con stock Infinity, así que para ellos nunca acota).
+      if (p.stock_actual - (existente?.qty ?? 0) <= 0) {
+        setFeedback({
+          tone: "error",
+          msg: `Solo hay ${p.stock_actual} unidad(es) de "${p.nombre}".`,
+        });
+        return prev;
       }
-      // Empieza una venta nueva → el vuelto de la anterior ya se entregó.
-      setDevuelto(null);
-      setCarrito((prev) => {
-        const existente = prev.find((l) => l.id === p.id);
-        // Hueco que queda hasta el stock disponible (los artículos comunes
-        // llegan con stock Infinity, así que para ellos nunca acota).
-        const cabe = p.stock_actual - (existente?.qty ?? 0);
-        if (cabe <= 0) {
-          setFeedback({
-            tone: "error",
-            msg: `Solo hay ${p.stock_actual} unidad(es) de "${p.nombre}".`,
-          });
-          return prev;
-        }
-        const suma = Math.min(pedidas, cabe);
-        if (suma < pedidas) {
-          setFeedback({
-            tone: "error",
-            msg: `Solo quedaban ${cabe} de "${p.nombre}": se agregaron ${suma} de las ${pedidas} pedidas.`,
-          });
-        }
-        return existente
-          ? prev.map((l) => (l.id === p.id ? { ...l, qty: l.qty + suma } : l))
-          : [...prev, { ...p, qty: suma }];
-      });
-    },
-    [fijarMultiplicador],
-  );
+      return existente
+        ? prev.map((l) => (l.id === p.id ? { ...l, qty: l.qty + 1 } : l))
+        : [...prev, { ...p, qty: 1 }];
+    });
+  }, []);
 
   const cambiarQty = useCallback((id: string | number, delta: number) => {
     setCarrito((prev) =>
@@ -1382,8 +1279,6 @@ export default function PosPage() {
               : `Venta cobrada con ${metodo}: ${formatCOP(total)}.`;
 
         setCarrito([]);
-        // Venta cerrada: la siguiente empieza con el multiplicador en 1.
-        fijarMultiplicador(1);
         // Soltamos el cliente tras fiar para no cargarle sin querer la próxima venta.
         if (esFiado) setClienteSel(null);
         inputRef.current?.focus();
@@ -1444,7 +1339,6 @@ export default function PosPage() {
       refresh,
       clienteSel,
       imprimirTirilla,
-      fijarMultiplicador,
     ],
   );
 
@@ -1910,9 +1804,6 @@ export default function PosPage() {
               )}
             </div>
 
-            {/* Multiplicador de cantidad: se aplica al próximo escaneo o toque. */}
-            <ControlCantidad valor={multiplicador} onCambiar={fijarMultiplicador} />
-
             {/* Artículo común: ítem suelto sin inventario (botón grande táctil). */}
             <button
               type="button"
@@ -1976,14 +1867,7 @@ export default function PosPage() {
 
           {/* Grid táctil de productos frecuentes */}
           <div className="rounded-xl border border-violet-500/15 bg-zinc-900/50 p-4">
-            <div className="mb-3 flex items-center justify-between gap-3">
-              <h3 className="text-sm font-semibold text-zinc-100">Productos frecuentes</h3>
-              {multiplicador > 1 && (
-                <span className="rounded-full bg-violet-500/20 px-2.5 py-0.5 text-xs font-bold text-violet-200">
-                  {multiplicador}× por toque
-                </span>
-              )}
-            </div>
+            <h3 className="mb-3 text-sm font-semibold text-zinc-100">Productos frecuentes</h3>
             {frecuentes.length === 0 ? (
               <p className="py-8 text-center text-sm text-zinc-500">
                 No hay productos cargados en el inventario.
