@@ -190,26 +190,40 @@ export async function fetchProductosEmpresa(): Promise<InventoryItem[]> {
   if (!empresaId) return []; // sin empresa resuelta no se consulta (aislamiento)
 
   // 1) Intento con `fecha_vencimiento` (feature completa).
+  // `deleted_at is null` deja fuera los productos archivados: ya no están en el
+  // catálogo, así que no deben disparar alertas de stock bajo ni de vencimiento.
   const conVenc = await supabase
     .from("productos")
     .select(`${PRODUCTOS_SELECT_BASE}, fecha_vencimiento`)
     .eq("empresa_id", empresaId)
+    .is("deleted_at", null)
     .order("descripcion", { ascending: true });
 
-  // 2) Fallback: la migración de vencimiento aún no corre → reintenta sin ella.
+  // 2) Fallback: falta una de las dos columnas nuevas → reintenta sin ella. El
+  // 42703 no dice cuál es, pero el mensaje sí la nombra, así que solo soltamos la
+  // que de verdad falta (si es `deleted_at`, el reintento vuelve a incluir los
+  // archivados: peor que nada es quedarse sin alerta de stock).
   const debeReintentar = conVenc.error?.code === "42703";
+  const faltaBorrado = debeReintentar && conVenc.error!.message.includes("deleted_at");
   if (debeReintentar) {
     console.warn(
-      "[resumen] `productos.fecha_vencimiento` no existe todavía; corre " +
-        "supabase/2026-07-vencimiento-insumos.sql para activar la alerta de vencimiento.",
+      faltaBorrado
+        ? "[resumen] `productos.deleted_at` no existe todavía; corre " +
+            "supabase/2026-11-soft-delete-productos.sql para ocultar los productos archivados."
+        : "[resumen] `productos.fecha_vencimiento` no existe todavía; corre " +
+            "supabase/2026-07-vencimiento-insumos.sql para activar la alerta de vencimiento.",
     );
   }
+
+  // Construir el builder no dispara nada: la consulta sale solo si se espera.
+  let reintento = supabase
+    .from("productos")
+    .select(faltaBorrado ? `${PRODUCTOS_SELECT_BASE}, fecha_vencimiento` : PRODUCTOS_SELECT_BASE)
+    .eq("empresa_id", empresaId);
+  if (!faltaBorrado) reintento = reintento.is("deleted_at", null);
+
   const { data, error } = debeReintentar
-    ? await supabase
-        .from("productos")
-        .select(PRODUCTOS_SELECT_BASE)
-        .eq("empresa_id", empresaId)
-        .order("descripcion", { ascending: true })
+    ? await reintento.order("descripcion", { ascending: true })
     : conVenc;
 
   if (error) {
@@ -637,6 +651,7 @@ export async function fetchCatalogoProductos(): Promise<ProductoCatalogo[]> {
     .from("productos")
     .select("id, descripcion, codigo_barras, precio_costo")
     .eq("empresa_id", empresaId)
+    .is("deleted_at", null) // no se compra contra una referencia archivada
     .order("descripcion", { ascending: true });
 
   if (error) {

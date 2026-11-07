@@ -28,6 +28,21 @@ export function isOnline(): boolean {
 const SELECT_PRODUCTO =
   "id, nombre:descripcion, precio:precio_venta, codigo_barras, stock_actual, imagen_url";
 
+/**
+ * Nombre de la columna de borrado lógico de `public.productos`
+ * (`2026-11-soft-delete-productos.sql`): NULL = producto vivo.
+ *
+ * TODAS las lecturas del catálogo filtran `deleted_at is null`, que es justo el
+ * predicado del índice único PARCIAL `productos_empresa_codigo_barras_vivos_uniq`.
+ * Sin este filtro un producto archivado sigue "existiendo" para la app: el POS lo
+ * ofrecería y —el bug que esto cierra— la validación de duplicados del alta
+ * bloquearía reutilizar su código de barras, aunque el INSERT sí lo permitiría.
+ *
+ * Nota: no filtramos en el espejo de Dexie, que no guarda la columna; basta con
+ * no cachear nunca una fila archivada (ver `cacheCatalogo`/`findByBarcode`).
+ */
+const COL_BORRADO = "deleted_at";
+
 /** Normaliza una fila de PostgREST (numeric puede llegar como string). */
 function normalizar(row: Record<string, unknown>): ProductoLocal {
   return {
@@ -61,6 +76,7 @@ export async function cacheCatalogo(): Promise<number> {
     .from("productos")
     .select(SELECT_PRODUCTO)
     .eq("empresa_id", empresaId)
+    .is(COL_BORRADO, null) // solo catálogo vivo: los archivados no se espejan
     .order("descripcion", { ascending: true });
 
   if (error || !data) {
@@ -77,9 +93,12 @@ export async function cacheCatalogo(): Promise<number> {
 }
 
 /**
- * Busca un producto por código de barras EXACTO. Con red consulta Supabase (y
- * cachea el resultado); sin red o ante error de red, cae al espejo local.
+ * Busca un producto VIVO por código de barras EXACTO. Con red consulta Supabase
+ * (y cachea el resultado); sin red o ante error de red, cae al espejo local.
  * Devuelve null si no existe en ninguno.
+ *
+ * Un producto con `deleted_at` no cuenta como existente: su código vuelve a
+ * estar libre, así que esto devuelve null y el alta puede reutilizarlo.
  */
 export async function findByBarcode(codigo: string): Promise<ProductoLocal | null> {
   const valor = codigo.trim();
@@ -96,10 +115,17 @@ export async function findByBarcode(codigo: string): Promise<ProductoLocal | nul
         .select(SELECT_PRODUCTO)
         .eq("empresa_id", empresaId)
         .eq("codigo_barras", valor)
+        .is(COL_BORRADO, null) // un archivado NO ocupa el código
         .limit(1)
         .maybeSingle();
       if (!error) {
-        if (!data) return db ? (await db.productos.where("codigo_barras").equals(valor).first()) ?? null : null;
+        // El servidor manda: si no hay fila viva, el código está libre. No se
+        // consulta el espejo local, que puede traer una copia previa al archivado
+        // (sería el falso "ya existe" que bloqueaba el alta).
+        if (!data) {
+          if (db) await db.productos.where("codigo_barras").equals(valor).delete();
+          return null;
+        }
         const prod = normalizar(data as Record<string, unknown>);
         if (db) await db.productos.put(prod); // mantiene el espejo fresco
         return prod;
@@ -129,6 +155,7 @@ export async function getFrecuentes(limit = 12): Promise<ProductoLocal[]> {
         .from("productos")
         .select(SELECT_PRODUCTO)
         .eq("empresa_id", empresaId)
+        .is(COL_BORRADO, null) // el grid del POS no ofrece productos archivados
         .order("descripcion", { ascending: true })
         .limit(limit);
       if (!error && data) {

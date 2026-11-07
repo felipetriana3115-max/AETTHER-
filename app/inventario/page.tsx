@@ -69,6 +69,10 @@ export default function InventarioPage() {
       .from("productos")
       .select("*")
       .eq("empresa_id", empresaId)
+      // Solo el catálogo VIVO: las filas archivadas (`deleted_at` con valor) no
+      // se listan ni cuentan en las métricas. Mismo predicado que el índice
+      // único parcial, así que lo que se ve aquí es lo que ocupa un código.
+      .is("deleted_at", null)
       .order("descripcion", { ascending: true });
     if (error) {
       console.error("[Inventario] No se pudo cargar el catálogo:", error);
@@ -84,16 +88,49 @@ export default function InventarioPage() {
     cargar();
   }, [cargar]);
 
-  // Borra un producto (RLS lo acota a la empresa del usuario).
+  /**
+   * Saca un producto del catálogo mediante BORRADO LÓGICO (`deleted_at`), no con
+   * DELETE: la fila la siguen referenciando las ventas y compras ya registradas,
+   * así que borrarla de verdad rompería el histórico (o chocaría contra la FK).
+   *
+   * Archivarla la retira de todas las lecturas de la app y libera su
+   * (empresa_id, codigo_barras) para un alta nueva, porque la unicidad es un
+   * índice PARCIAL sobre las filas vivas (`2026-11-soft-delete-productos.sql`).
+   *
+   * RLS acota el UPDATE a la empresa del usuario; `deleted_at is null` lo hace
+   * idempotente (no re-archiva ni pisa la fecha de un archivado previo).
+   */
   const borrar = useCallback(
     async (p: ProductoRow) => {
-      if (!confirm(`¿Eliminar "${p.descripcion}" del catálogo?`)) return;
-      const { error } = await supabase.from("productos").delete().eq("id", p.id);
+      if (
+        !confirm(
+          `¿Quitar "${p.descripcion}" del catálogo?\n\n` +
+            "Se archiva: deja de aparecer en el inventario y en el POS, pero las " +
+            "ventas ya registradas conservan su historial y su código de barras " +
+            "queda libre para otro producto.",
+        )
+      )
+        return;
+
+      const { data, error } = await supabase
+        .from("productos")
+        .update({ deleted_at: new Date().toISOString() })
+        .eq("id", p.id)
+        .is("deleted_at", null)
+        .select("id")
+        .maybeSingle();
+
       if (error) {
-        console.error("[Inventario] No se pudo eliminar el producto:", error);
+        console.error("[Inventario] No se pudo archivar el producto:", error);
         setError(`No se pudo eliminar: ${error.message}`);
         return;
       }
+      // Sin error y sin fila = el UPDATE no alcanzó nada: ya estaba archivado o
+      // RLS lo dejó fuera. Recargamos para que la tabla refleje la realidad.
+      if (!data) {
+        console.warn("[Inventario] El producto ya estaba archivado o no es de esta empresa:", p.id);
+      }
+      setError(null);
       cargar();
     },
     [cargar],
