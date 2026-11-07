@@ -45,9 +45,16 @@ const CameraScanner = dynamic(() => import("./CameraScanner"), { ssr: false });
 
 export type TipoProducto = "unidad" | "granel" | "kit";
 
-/** Fila de `public.productos` tal como la consumimos aquí (id = bigint → number). */
+/**
+ * Fila de `public.productos` tal como la consumimos aquí.
+ *
+ * `id` es `string | number` —no `number`— porque la PK de `productos` es un UUID
+ * en las instancias actuales y un bigint en las antiguas. Tipearlo como `number`
+ * hacía que `Number(id)` diera NaN y que comparaciones como "¿es este mismo
+ * producto?" fueran siempre falsas. Mismo criterio que el POS y `offline/catalog`.
+ */
 export type Producto = {
-  id: number;
+  id: string | number;
   codigo_barras: string | null;
   descripcion: string;
   tipo: TipoProducto;
@@ -136,44 +143,89 @@ function toFormState(p?: Producto): FormState {
   };
 }
 
+/** Producto de la empresa que ya ocupa un código de barras. */
+type Ocupante = { id: string | number; descripcion: string; archivado: boolean };
+
 /**
- * id del producto ARCHIVADO (`deleted_at` con valor) que ocupa ese código en la
- * empresa, o `null` si no hay ninguno.
+ * ¿Qué producto de la empresa ocupa ese código de barras, y está vivo o
+ * archivado? `null` si el código está libre.
  *
  * Al eliminar no se borra la fila —las ventas y compras la referencian—, solo se
  * marca `deleted_at`. Esa fila sigue llevando su (empresa_id, codigo_barras), así
- * que si la instancia todavía tiene la unicidad TOTAL (le falta
- * `2026-11-soft-delete-productos.sql`, o quedó una constraint hecha a mano), el
- * INSERT revienta con 23505 — "Ya existe un producto con ese código" — aunque la
- * app ya no muestre el producto por ningún lado. Reactivar esa fila en vez de
- * insertar otra evita el choque, conserva el id y el historial, y se comporta
- * igual cuando el índice parcial SÍ está aplicado.
+ * que si la instancia conserva una unicidad TOTAL (le falta
+ * `2026-11-fix-unicidad-total-codigo-barras.sql`, o quedó un índice único hecho a
+ * mano) el INSERT revienta con 23505 aunque la app ya no muestre el producto.
+ * Saber QUIÉN ocupa el código sirve para dos cosas: reactivar el archivado en vez
+ * de insertar otro, y —si no hay ocupante visible— diagnosticar que lo que
+ * bloquea es una unicidad global entre empresas, no un duplicado real.
  *
  * No toca RLS ni el aislamiento: es un SELECT normal, acotado además por
  * `empresa_id` como el resto de lecturas del formulario.
  */
-async function buscarArchivadoPorCodigo(
+async function buscarOcupanteCodigo(
   empresaId: string,
   codigo: string | null,
-): Promise<number | null> {
+  excluirId?: string | number | null,
+): Promise<Ocupante | null> {
   if (!codigo) return null;
-  const { data, error } = await supabase
+
+  let q = supabase
     .from("productos")
-    .select("id")
+    .select("id, descripcion, deleted_at")
     .eq("empresa_id", empresaId)
     .eq("codigo_barras", codigo)
-    .not("deleted_at", "is", null)
-    .order("deleted_at", { ascending: false }) // si hay varios, gana el último
-    .limit(1)
-    .maybeSingle();
+    // Los vivos (`deleted_at` nulo) primero: si hay uno, es el que manda.
+    .order("deleted_at", { ascending: true, nullsFirst: true })
+    .limit(1);
+  // En edición, encontrarse a sí mismo no es un conflicto.
+  if (excluirId != null) q = q.neq("id", excluirId);
+
+  const { data, error } = await q.maybeSingle();
 
   if (error) {
     // 42703 = la columna `deleted_at` no existe todavía (falta la migración):
     // entonces no hay soft delete que reactivar y el INSERT normal es correcto.
-    console.warn("[ProductForm] No se pudo buscar un archivado con ese código:", error.message);
+    console.warn("[ProductForm] No se pudo consultar quién ocupa el código:", error.message);
     return null;
   }
-  return (data?.id as number | undefined) ?? null;
+  if (!data) return null;
+
+  const fila = data as {
+    id: string | number;
+    descripcion: string | null;
+    deleted_at: string | null;
+  };
+  return { id: fila.id, descripcion: fila.descripcion ?? "", archivado: fila.deleted_at != null };
+}
+
+/**
+ * Suelta el código que retienen las filas ARCHIVADAS de la empresa (les deja el
+ * `codigo_barras` en NULL) para que otro producto pueda usarlo.
+ *
+ * Es el camino de la EDICIÓN: ahí no se puede "reactivar" la fila archivada —el
+ * usuario está guardando otra—, así que lo correcto es liberar el código sin
+ * borrar la fila ni su historial de ventas. Con el índice parcial aplicado esto
+ * no hace falta; con una unicidad total residual, es lo que evita el 23505.
+ */
+async function liberarCodigoDeArchivados(
+  empresaId: string,
+  codigo: string | null,
+  excluirId?: string | number | null,
+): Promise<void> {
+  if (!codigo) return;
+
+  let q = supabase
+    .from("productos")
+    .update({ codigo_barras: null })
+    .eq("empresa_id", empresaId)
+    .eq("codigo_barras", codigo)
+    .not("deleted_at", "is", null);
+  if (excluirId != null) q = q.neq("id", excluirId);
+
+  const { error } = await q;
+  if (error) {
+    console.warn("[ProductForm] No se pudo liberar el código del archivado:", error.message);
+  }
 }
 
 /** Número o `null` si el campo viene vacío (para columnas opcionales). */
@@ -335,8 +387,10 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
         try {
           const existente = await findByBarcode(codigo, { permitirEspejo: false });
           if (token !== chequeoRef.current) return; // llegó otro código después
-          // En edición, encontrarse a sí mismo no es un duplicado.
-          if (!existente || (editando && Number(existente.id) === producto!.id)) {
+          // En edición, encontrarse a sí mismo no es un duplicado. La comparación
+          // va por `String`: el id es un UUID, así que `Number(id)` daba NaN y el
+          // producto siempre se denunciaba como duplicado de sí mismo.
+          if (!existente || (editando && String(existente.id) === String(producto!.id))) {
             setAvisoCodigo(null);
             return;
           }
@@ -485,58 +539,151 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
         }
         const conImagen = { ...base, imagen_url: urlImagen };
 
-        let query;
-        if (editando) {
-          // Edición: RLS acota por `id` a la empresa del usuario; no reescribimos
-          // `empresa_id` (no debe cambiar de dueño).
-          query = supabase.from("productos").update(conImagen).eq("id", producto!.id);
-        } else {
-          // Alta: adjuntamos `empresa_id` EXPLÍCITO en vez de confiar en el DEFAULT
-          // del servidor. Si no hay empresa resoluble, no tiene sentido intentar el
-          // INSERT: el `with check` lo rechazaría con un RLS opaco.
-          const empresaId = await getEmpresaIdActiva();
-          const payload = { ...conImagen, empresa_id: empresaId };
+        // `empresa_id` resuelto SIEMPRE: en el alta viaja EXPLÍCITO en el payload
+        // (en vez de confiar en el DEFAULT del servidor) y en los dos modos acota
+        // las consultas de diagnóstico del código de barras.
+        const empresaId = await getEmpresaIdActiva();
 
+        if (!editando) {
           // Diagnóstico: así se ve exactamente qué viaja al servidor. Si
           // `empresa_id` sale `null`, el problema es el dato del usuario
           // (usuarios.empresa_id nulo), NO la política ni el formulario.
-          console.log("[ProductForm] Payload INSERT productos →", payload);
+          console.log("[ProductForm] Payload INSERT productos →", {
+            ...conImagen,
+            empresa_id: empresaId,
+          });
 
+          // Sin empresa resoluble no tiene sentido intentar el INSERT: el
+          // `with check` lo rechazaría con un RLS opaco.
           if (!empresaId) {
             setError(
               "Tu usuario no tiene una empresa asignada, así que no se puede crear " +
                 "el producto. Cierra sesión y vuelve a entrar; si persiste, hay que " +
                 "reparar tu cuenta (usuarios.empresa_id está vacío).",
             );
-            setGuardando(false);
             return;
           }
-
-          // Si el código lo ocupa una fila ARCHIVADA (el producto que el usuario
-          // "eliminó"), la REACTIVAMOS en vez de insertar otra: conserva id e
-          // historial y, sobre todo, no choca contra el único aunque esta
-          // instancia aún tenga la unicidad total. Ver `buscarArchivadoPorCodigo`.
-          const archivadoId = await buscarArchivadoPorCodigo(empresaId, base.codigo_barras);
-          query =
-            archivadoId != null
-              ? supabase
-                  .from("productos")
-                  .update({ ...conImagen, deleted_at: null })
-                  .eq("id", archivadoId)
-              : supabase.from("productos").insert(payload);
         }
 
-        const { data, error } = await query.select().single();
+        /** Lo que nos interesa de la respuesta de PostgREST (el cliente no va tipado). */
+        type Resultado = {
+          data: unknown;
+          // `message` trae el nombre de la restricción violada y `details` la
+          // clave concreta ("Key (empresa_id, codigo_barras)=(…) already exists"):
+          // son los dos datos que dicen QUÉ unicidad falló, no solo que falló una.
+          error: { code?: string; message: string; details?: string | null } | null;
+        };
+
+        /**
+         * Único punto que escribe en `productos`. `reactivarId` convierte el alta
+         * en la REACTIVACIÓN de la fila archivada que ya tenía ese código: conserva
+         * el id y el historial, y no choca contra el único ni en una instancia a la
+         * que todavía le falte el índice parcial.
+         */
+        const ejecutar = async (reactivarId: string | number | null): Promise<Resultado> => {
+          if (editando) {
+            // Edición: RLS acota por `id` a la empresa del usuario; no reescribimos
+            // `empresa_id` (no debe cambiar de dueño).
+            return supabase
+              .from("productos")
+              .update(conImagen)
+              .eq("id", producto!.id)
+              .select()
+              .single();
+          }
+          if (reactivarId != null) {
+            return supabase
+              .from("productos")
+              .update({ ...conImagen, deleted_at: null })
+              .eq("id", reactivarId)
+              .select()
+              .single();
+          }
+          return supabase
+            .from("productos")
+            .insert({ ...conImagen, empresa_id: empresaId })
+            .select()
+            .single();
+        };
+
+        /**
+         * Deja el código libre antes de guardar: en el alta devolvemos el id del
+         * archivado para reactivarlo; en la edición le quitamos el código.
+         */
+        const desbloquearCodigo = async (): Promise<string | number | null> => {
+          if (!empresaId || !base.codigo_barras) return null;
+          const ocupante = await buscarOcupanteCodigo(
+            empresaId,
+            base.codigo_barras,
+            editando ? producto!.id : null,
+          );
+          if (!ocupante?.archivado) return null;
+          if (!editando) return ocupante.id;
+          await liberarCodigoDeArchivados(empresaId, base.codigo_barras, producto!.id);
+          return null;
+        };
+
+        // Solo miramos el ocupante si el código es nuevo para esta fila: en una
+        // edición que no lo toca no hay conflicto posible consigo misma.
+        const codigoNuevo = !editando || base.codigo_barras !== (producto!.codigo_barras ?? null);
+        let { data, error } = await ejecutar(codigoNuevo ? await desbloquearCodigo() : null);
+
+        // 23505 = unicidad violada. Con el índice PARCIAL aplicado solo puede venir
+        // de un producto VIVO; si el ocupante resulta estar archivado —o no existe
+        // en esta empresa—, lo que falla es la BASE DE DATOS, no el dato tecleado.
+        if (error?.code === "23505" && empresaId) {
+          // Nombre de la restricción que se ha violado. Sin esto dábamos por hecho
+          // que el choque era del código de barras, cuando puede venir de otra
+          // unicidad (descripción, sku…) y el mensaje despistaba.
+          const restriccion = /unique constraint "([^"]+)"/.exec(error.message)?.[1] ?? "desconocida";
+          const esDelCodigo = /codigo_barras|barras/i.test(restriccion + " " + (error.details ?? ""));
+          console.error("[ProductForm] 23505 →", {
+            restriccion,
+            detalle: error.details,
+            codigo: base.codigo_barras,
+          });
+
+          const ocupante = esDelCodigo
+            ? await buscarOcupanteCodigo(
+                empresaId,
+                base.codigo_barras,
+                editando ? producto!.id : null,
+              )
+            : null;
+
+          if (ocupante?.archivado) {
+            // Una única segunda pasada, ya con el código desbloqueado.
+            ({ data, error } = await ejecutar(await desbloquearCodigo()));
+          } else if (ocupante) {
+            setError(
+              `El código "${base.codigo_barras}" ya lo usa el producto ACTIVO ` +
+                `"${ocupante.descripcion}". Edita ese producto o usa otro código.`,
+            );
+            return;
+          } else if (esDelCodigo) {
+            setError(
+              "Ningún producto de TU empresa usa ese código, pero la base de datos " +
+                `lo rechaza por la restricción "${restriccion}": sigue siendo una ` +
+                "unicidad TOTAL (o global entre empresas) en vez de un índice parcial " +
+                "sobre las filas vivas. Aplica en el SQL Editor de Supabase: " +
+                "supabase/2026-11-fix-unicidad-total-codigo-barras.sql",
+            );
+            return;
+          } else {
+            setError(
+              `La base de datos rechazó el producto por la restricción única ` +
+                `"${restriccion}" (no es el código de barras). Detalle: ${error.details ?? error.message}`,
+            );
+            return;
+          }
+        }
 
         if (error) {
           console.error("[ProductForm] No se pudo guardar el producto:", error);
-          // 23505 = violación de índice único (codigo_barras repetido en la empresa).
           setError(
             error.code === "23505"
-              ? "Ya existe un producto ACTIVO con ese código de barras en tu empresa. " +
-                  "Si el producto que lo usaba fue eliminado, falta aplicar " +
-                  "supabase/2026-11-soft-delete-productos.sql (la unicidad debe ser " +
-                  "parcial, solo sobre los productos vivos)."
+              ? "Ese código de barras sigue ocupado por otro producto de tu empresa. " +
+                  "Usa otro código o edita el producto que ya lo tiene."
               : `No se pudo guardar: ${error.message}`,
           );
           return;
