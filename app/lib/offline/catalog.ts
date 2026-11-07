@@ -100,7 +100,17 @@ export async function cacheCatalogo(): Promise<number> {
  * Un producto con `deleted_at` no cuenta como existente: su código vuelve a
  * estar libre, así que esto devuelve null y el alta puede reutilizarlo.
  */
-export async function findByBarcode(codigo: string): Promise<ProductoLocal | null> {
+export async function findByBarcode(
+  codigo: string,
+  /**
+   * `permitirEspejo: false` desactiva el fallback a Dexie: si el servidor no
+   * puede responder, se devuelve `null` en vez de una copia local que puede ser
+   * ANTERIOR al archivado. Lo usa el alta de productos, donde un falso "ya
+   * existe" bloquea reutilizar un código que en realidad está libre; un falso
+   * "libre" es inofensivo porque el índice único sigue siendo el juez.
+   */
+  { permitirEspejo = true }: { permitirEspejo?: boolean } = {},
+): Promise<ProductoLocal | null> {
   const valor = codigo.trim();
   if (!valor) return null;
   const db = getDB();
@@ -136,8 +146,43 @@ export async function findByBarcode(codigo: string): Promise<ProductoLocal | nul
     }
   }
 
-  if (!db) return null;
+  if (!db || !permitirEspejo) return null;
   return (await db.productos.where("codigo_barras").equals(valor).first()) ?? null;
+}
+
+/**
+ * Saca del espejo local toda copia de un producto, por id y/o por código. Se
+ * llama al ARCHIVAR: Dexie no guarda `deleted_at`, así que la única manera de
+ * que un archivado deje de "existir" localmente es borrarlo de la tabla.
+ *
+ * Sin esto, el espejo conserva la fila y cualquier lectura que caiga al
+ * fallback local (sin red o ante error de consulta) sigue viendo el producto
+ * eliminado y da el falso "ya existe ese código de barras".
+ */
+export async function olvidarProductoLocal(ref: {
+  id?: string | number;
+  codigo?: string | null;
+}): Promise<void> {
+  const db = getDB();
+  if (!db) return;
+  if (ref.id != null) await db.productos.delete(ref.id);
+  const codigo = ref.codigo?.trim();
+  if (codigo) await db.productos.where("codigo_barras").equals(codigo).delete();
+}
+
+/**
+ * Re-sincroniza el espejo local contra el catálogo VIVO del servidor y, de paso,
+ * purga los archivados: `cacheCatalogo()` hace `clear()` + `bulkPut()` con las
+ * filas `deleted_at is null`, así que lo que ya no está vivo desaparece de
+ * IndexedDB.
+ *
+ * Pensado para llamarse al ABRIR el alta de productos, antes de que el usuario
+ * teclee un código. Sin red no hay nada que purgar con criterio (no sabemos qué
+ * se archivó mientras tanto), así que no se toca el espejo.
+ */
+export async function purgarArchivadosLocal(): Promise<void> {
+  if (!isOnline()) return;
+  await cacheCatalogo();
 }
 
 /**

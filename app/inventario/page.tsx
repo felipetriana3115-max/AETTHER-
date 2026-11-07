@@ -6,6 +6,7 @@ import PageShell from "../components/PageShell";
 import ProductForm, { type Producto } from "../components/ProductForm";
 import { supabase, getEmpresaIdActiva } from "../lib/auth";
 import { soportaCamara } from "../lib/barcode-camera";
+import { olvidarProductoLocal } from "../lib/offline/catalog";
 import { formatCOP } from "../lib/data-model";
 
 /**
@@ -130,6 +131,10 @@ export default function InventarioPage() {
       if (!data) {
         console.warn("[Inventario] El producto ya estaba archivado o no es de esta empresa:", p.id);
       }
+      // El espejo de Dexie no guarda `deleted_at`: si no lo borramos aquí, la
+      // copia local sobrevive al archivado y el POS —o la validación del alta
+      // cuando cae al fallback— lo sigue dando por existente.
+      void olvidarProductoLocal({ id: p.id, codigo: p.codigo_barras }).catch(() => {});
       setError(null);
       cargar();
     },

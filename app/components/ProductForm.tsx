@@ -5,7 +5,7 @@ import dynamic from "next/dynamic";
 import { supabase, getEmpresaIdActiva } from "../lib/auth";
 import { ACCEPT_IMAGEN, subirImagenProducto, validarImagen } from "../lib/productos";
 import { soportaCamara } from "../lib/barcode-camera";
-import { findByBarcode } from "../lib/offline/catalog";
+import { findByBarcode, purgarArchivadosLocal } from "../lib/offline/catalog";
 
 /**
  * El lector por cámara arrastra el decodificador ZXing (~300 KB), así que se
@@ -136,6 +136,46 @@ function toFormState(p?: Producto): FormState {
   };
 }
 
+/**
+ * id del producto ARCHIVADO (`deleted_at` con valor) que ocupa ese código en la
+ * empresa, o `null` si no hay ninguno.
+ *
+ * Al eliminar no se borra la fila —las ventas y compras la referencian—, solo se
+ * marca `deleted_at`. Esa fila sigue llevando su (empresa_id, codigo_barras), así
+ * que si la instancia todavía tiene la unicidad TOTAL (le falta
+ * `2026-11-soft-delete-productos.sql`, o quedó una constraint hecha a mano), el
+ * INSERT revienta con 23505 — "Ya existe un producto con ese código" — aunque la
+ * app ya no muestre el producto por ningún lado. Reactivar esa fila en vez de
+ * insertar otra evita el choque, conserva el id y el historial, y se comporta
+ * igual cuando el índice parcial SÍ está aplicado.
+ *
+ * No toca RLS ni el aislamiento: es un SELECT normal, acotado además por
+ * `empresa_id` como el resto de lecturas del formulario.
+ */
+async function buscarArchivadoPorCodigo(
+  empresaId: string,
+  codigo: string | null,
+): Promise<number | null> {
+  if (!codigo) return null;
+  const { data, error } = await supabase
+    .from("productos")
+    .select("id")
+    .eq("empresa_id", empresaId)
+    .eq("codigo_barras", codigo)
+    .not("deleted_at", "is", null)
+    .order("deleted_at", { ascending: false }) // si hay varios, gana el último
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    // 42703 = la columna `deleted_at` no existe todavía (falta la migración):
+    // entonces no hay soft delete que reactivar y el INSERT normal es correcto.
+    console.warn("[ProductForm] No se pudo buscar un archivado con ese código:", error.message);
+    return null;
+  }
+  return (data?.id as number | undefined) ?? null;
+}
+
 /** Número o `null` si el campo viene vacío (para columnas opcionales). */
 function toNumberOrNull(v: string): number | null {
   const s = v.trim();
@@ -195,6 +235,22 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
     chequeoRef.current++; // invalida una comprobación de duplicado en vuelo
     if (fileRef.current) fileRef.current.value = "";
   }, [producto]);
+
+  /**
+   * Al ABRIR el formulario re-sincronizamos el espejo local de Dexie con el
+   * catálogo vivo: así los productos archivados desaparecen de IndexedDB antes
+   * de que el usuario teclee o escanee un código. Sin esto, una copia local
+   * previa al archivado sobrevive indefinidamente y cualquier lectura que caiga
+   * al fallback sin red devuelve el fantasma ("Sopera" ya eliminada).
+   *
+   * Es best-effort y no bloquea el alta: si falla, el servidor sigue siendo el
+   * que decide si el código está ocupado.
+   */
+  useEffect(() => {
+    void purgarArchivadosLocal().catch((e) => {
+      console.warn("[ProductForm] No se pudo purgar el espejo local:", e);
+    });
+  }, []);
 
   // Previsualización del archivo recién elegido (sin subirlo). El object URL se
   // libera al cambiar de archivo o al desmontar para no filtrar memoria.
@@ -256,14 +312,53 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
   );
 
   /**
-   * Punto único por el que entra un código de barras capturado, venga del lector
-   * USB (Enter) o de la cámara. Rellena el campo, avisa si ese código ya existe
-   * en la empresa y manda el foco al siguiente dato que falta, para que el alta
-   * continúe sin tocar el ratón.
+   * ¿Ese código ya lo ocupa OTRO producto VIVO de la empresa? Solo entonces
+   * avisamos.
    *
-   * La comprobación de duplicado usa `findByBarcode`, el mismo helper del POS:
-   * filtra por la empresa de la sesión y cae al espejo local sin red, así que no
-   * duplicamos consulta ni nos saltamos el aislamiento por tenant.
+   * Usa `findByBarcode`, el mismo helper del POS (filtra por la empresa de la
+   * sesión y por `deleted_at is null`), pero con `permitirEspejo: false`: aquí
+   * NO queremos el fallback a Dexie. Un espejo anterior al archivado devolvería
+   * el producto eliminado y pintaría el aviso de duplicado sobre un código que
+   * en realidad está libre — el bloqueo que reporta el usuario con "Sopera".
+   * Si el servidor no puede responder, no avisamos: el índice único sigue
+   * siendo el juez final.
+   */
+  const verificarCodigo = useCallback(
+    (codigoCrudo: string) => {
+      const codigo = codigoCrudo.trim();
+      const token = ++chequeoRef.current; // invalida cualquier chequeo en vuelo
+      if (!codigo) {
+        setAvisoCodigo(null);
+        return;
+      }
+      void (async () => {
+        try {
+          const existente = await findByBarcode(codigo, { permitirEspejo: false });
+          if (token !== chequeoRef.current) return; // llegó otro código después
+          // En edición, encontrarse a sí mismo no es un duplicado.
+          if (!existente || (editando && Number(existente.id) === producto!.id)) {
+            setAvisoCodigo(null);
+            return;
+          }
+          setAvisoCodigo(
+            `Ya existe "${existente.nombre}" con este código. Si lo guardas así, ` +
+              "el sistema lo rechazará: edita ese producto o usa otro código.",
+          );
+        } catch (e) {
+          // El aviso es una cortesía; si la consulta falla seguimos y será el
+          // INSERT quien reporte el duplicado (23505).
+          console.warn("[ProductForm] No se pudo verificar el código:", e);
+        }
+      })();
+    },
+    [editando, producto],
+  );
+
+  /**
+   * Punto único por el que entra un código de barras capturado, venga del lector
+   * USB (Enter) o de la cámara. Rellena el campo, lanza la verificación y manda
+   * el foco al siguiente dato que falta, para que el alta continúe sin tocar el
+   * ratón.
    */
   const aplicarCodigo = useCallback(
     (codigoCrudo: string) => {
@@ -280,25 +375,15 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
       siguiente?.focus();
       siguiente?.select();
 
-      const token = ++chequeoRef.current;
-      void (async () => {
-        try {
-          const existente = await findByBarcode(codigo);
-          if (token !== chequeoRef.current) return; // llegó otro escaneo después
-          // En edición, encontrarse a sí mismo no es un duplicado.
-          if (!existente || (editando && Number(existente.id) === producto!.id)) return;
-          setAvisoCodigo(
-            `Ya existe "${existente.nombre}" con este código. Si lo guardas así, ` +
-              "el sistema lo rechazará: edita ese producto o usa otro código.",
-          );
-        } catch (e) {
-          // El aviso es una cortesía; si la consulta falla seguimos y será el
-          // INSERT quien reporte el duplicado (23505).
-          console.warn("[ProductForm] No se pudo verificar el código escaneado:", e);
-        }
-      })();
+      verificarCodigo(codigo);
     },
-    [form.descripcion, editando, producto],
+    [form.descripcion, verificarCodigo],
+  );
+
+  /** Código TECLEADO a mano: se verifica al salir del campo. */
+  const onCodigoBlur = useCallback(
+    (e: React.FocusEvent<HTMLInputElement>) => verificarCodigo(e.currentTarget.value),
+    [verificarCodigo],
   );
 
   /**
@@ -427,7 +512,18 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
             return;
           }
 
-          query = supabase.from("productos").insert(payload);
+          // Si el código lo ocupa una fila ARCHIVADA (el producto que el usuario
+          // "eliminó"), la REACTIVAMOS en vez de insertar otra: conserva id e
+          // historial y, sobre todo, no choca contra el único aunque esta
+          // instancia aún tenga la unicidad total. Ver `buscarArchivadoPorCodigo`.
+          const archivadoId = await buscarArchivadoPorCodigo(empresaId, base.codigo_barras);
+          query =
+            archivadoId != null
+              ? supabase
+                  .from("productos")
+                  .update({ ...conImagen, deleted_at: null })
+                  .eq("id", archivadoId)
+              : supabase.from("productos").insert(payload);
         }
 
         const { data, error } = await query.select().single();
@@ -437,11 +533,18 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
           // 23505 = violación de índice único (codigo_barras repetido en la empresa).
           setError(
             error.code === "23505"
-              ? "Ya existe un producto con ese código de barras en tu empresa."
+              ? "Ya existe un producto ACTIVO con ese código de barras en tu empresa. " +
+                  "Si el producto que lo usaba fue eliminado, falta aplicar " +
+                  "supabase/2026-11-soft-delete-productos.sql (la unicidad debe ser " +
+                  "parcial, solo sobre los productos vivos)."
               : `No se pudo guardar: ${error.message}`,
           );
           return;
         }
+
+        // El catálogo cambió: refrescamos el espejo local para que el POS vea el
+        // alta (o la reactivación) y no quede ninguna fila archivada en Dexie.
+        void purgarArchivadosLocal().catch(() => {});
 
         onSaved?.(data as Producto);
         setAvisoCodigo(null);
@@ -510,6 +613,7 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
                 value={form.codigo_barras}
                 onChange={set("codigo_barras")}
                 onKeyDown={onCodigoKeyDown}
+                onBlur={onCodigoBlur}
                 placeholder="Escanea o escribe…"
                 className={`${INPUT} min-w-0 flex-1`}
               />
