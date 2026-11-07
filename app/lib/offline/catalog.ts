@@ -11,6 +11,7 @@
  */
 
 import { supabase, getEmpresaIdActiva } from "../auth";
+import { normalizarCodigoBarras } from "../productos";
 import { getDB, type ProductoLocal } from "./db";
 
 /** ¿Hay conexión de red? En SSR asumimos que sí (no hay `navigator`). */
@@ -49,7 +50,9 @@ function normalizar(row: Record<string, unknown>): ProductoLocal {
     id: row.id as string | number,
     nombre: String(row.nombre ?? ""),
     precio: Number(row.precio ?? 0),
-    codigo_barras: (row.codigo_barras as string | null) ?? null,
+    // Normalizado al leer: el espejo de Dexie se indexa por este valor, así que
+    // guardarlo con espacios haría que el escaneo del POS no lo encontrase.
+    codigo_barras: normalizarCodigoBarras(row.codigo_barras as string | null),
     stock_actual: Number(row.stock_actual ?? 0),
     // Cadena vacía → null: para la UI "sin imagen" es un solo caso.
     imagen_url: (row.imagen_url as string | null) || null,
@@ -111,7 +114,7 @@ export async function findByBarcode(
    */
   { permitirEspejo = true }: { permitirEspejo?: boolean } = {},
 ): Promise<ProductoLocal | null> {
-  const valor = codigo.trim();
+  const valor = normalizarCodigoBarras(codigo);
   if (!valor) return null;
   const db = getDB();
 
@@ -166,7 +169,7 @@ export async function olvidarProductoLocal(ref: {
   const db = getDB();
   if (!db) return;
   if (ref.id != null) await db.productos.delete(ref.id);
-  const codigo = ref.codigo?.trim();
+  const codigo = normalizarCodigoBarras(ref.codigo);
   if (codigo) await db.productos.where("codigo_barras").equals(codigo).delete();
 }
 

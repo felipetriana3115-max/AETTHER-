@@ -7,6 +7,7 @@ import ProductForm, { type Producto } from "../components/ProductForm";
 import { supabase, getEmpresaIdActiva } from "../lib/auth";
 import { soportaCamara } from "../lib/barcode-camera";
 import { olvidarProductoLocal } from "../lib/offline/catalog";
+import { normalizarCodigoBarras } from "../lib/productos";
 import { formatCOP } from "../lib/data-model";
 
 /**
@@ -34,6 +35,18 @@ type ProductoRow = Producto & { departamentos: { nombre: string } | null };
 
 const SELECT =
   "id, codigo_barras, descripcion, tipo, precio_costo, margen_ganancia, precio_venta, precio_mayoreo, departamento_id, stock_actual, stock_minimo, stock_maximo, departamentos(nombre)";
+
+/**
+ * Filas por petición al traer el catálogo.
+ *
+ * La búsqueda de esta vista filtra en MEMORIA, así que solo encuentra lo que se
+ * haya descargado: si la consulta se queda en la primera página, un producto
+ * ACTIVO que esté más allá "no existe" para el buscador aunque la validación del
+ * alta —que pregunta al servidor— sí lo vea. Esa era la discrepancia. PostgREST
+ * limita cada respuesta (1000 filas por defecto), de modo que el catálogo se pide
+ * por páginas hasta agotarlo.
+ */
+const PAGINA = 1000;
 
 export default function InventarioPage() {
   const [productos, setProductos] = useState<ProductoRow[]>([]);
@@ -66,22 +79,38 @@ export default function InventarioPage() {
       setCargando(false);
       return;
     }
-    const { data, error } = await supabase
-      .from("productos")
-      .select("*")
-      .eq("empresa_id", empresaId)
-      // Solo el catálogo VIVO: las filas archivadas (`deleted_at` con valor) no
-      // se listan ni cuentan en las métricas. Mismo predicado que el índice
-      // único parcial, así que lo que se ve aquí es lo que ocupa un código.
-      .is("deleted_at", null)
-      .order("descripcion", { ascending: true });
-    if (error) {
-      console.error("[Inventario] No se pudo cargar el catálogo:", error);
-      setError("No se pudieron cargar los productos.");
-    } else {
-      setError(null);
-      setProductos((data ?? []) as unknown as ProductoRow[]);
+    // Catálogo COMPLETO, por páginas: el buscador filtra en memoria, así que
+    // cualquier fila que no se descargue aquí es invisible para él.
+    const filas: ProductoRow[] = [];
+    for (let desde = 0; ; desde += PAGINA) {
+      const { data, error } = await supabase
+        .from("productos")
+        .select("*")
+        .eq("empresa_id", empresaId)
+        // Solo el catálogo VIVO: las filas archivadas (`deleted_at` con valor) no
+        // se listan ni cuentan en las métricas. Mismo predicado que el índice
+        // único parcial, así que lo que se ve aquí es lo que ocupa un código.
+        .is("deleted_at", null)
+        // `id` como desempate: sin él, dos productos con la misma descripción
+        // pueden colarse o repetirse en el corte entre páginas.
+        .order("descripcion", { ascending: true })
+        .order("id", { ascending: true })
+        .range(desde, desde + PAGINA - 1);
+
+      if (error) {
+        console.error("[Inventario] No se pudo cargar el catálogo:", error);
+        setError("No se pudieron cargar los productos.");
+        setCargando(false);
+        return;
+      }
+
+      const lote = (data ?? []) as unknown as ProductoRow[];
+      filas.push(...lote);
+      if (lote.length < PAGINA) break; // última página
     }
+
+    setError(null);
+    setProductos(filas);
     setCargando(false);
   }, []);
 
@@ -141,14 +170,22 @@ export default function InventarioPage() {
     [cargar],
   );
 
-  // Búsqueda en tiempo real: filtra por código de barras o descripción.
+  /**
+   * Búsqueda en tiempo real por código de barras o descripción.
+   *
+   * Los DOS lados van normalizados: el término tecleado y el código guardado. Un
+   * producto cuya fila tenga " 7702412100110" (pegado desde Excel, lector mal
+   * configurado) se encuentra igual tecleando "7702412100110", que es lo que
+   * manda el lector. Mientras esté ACTIVO —y todas las páginas del catálogo vivo
+   * están cargadas— aparece sin excepción.
+   */
   const filtrados = useMemo(() => {
-    const q = busqueda.trim().toLowerCase();
+    const q = (normalizarCodigoBarras(busqueda) ?? "").toLowerCase();
     if (!q) return productos;
     return productos.filter(
       (p) =>
         p.descripcion.toLowerCase().includes(q) ||
-        (p.codigo_barras ?? "").toLowerCase().includes(q),
+        (normalizarCodigoBarras(p.codigo_barras) ?? "").toLowerCase().includes(q),
     );
   }, [productos, busqueda]);
 
@@ -170,8 +207,41 @@ export default function InventarioPage() {
    */
   const onCodigoCamara = useCallback((codigo: string) => {
     setCamaraAbierta(false);
-    setBusqueda(codigo.trim());
+    setBusqueda(normalizarCodigoBarras(codigo) ?? "");
   }, []);
+
+  /**
+   * Abre un producto CONCRETO en el modal de edición. Lo dispara el aviso de
+   * código duplicado del formulario ("Ver/Editar …") para ir directo al producto
+   * que ocupa el código y poder cambiárselo o archivarlo.
+   *
+   * Si la fila no está en memoria (el aviso lo resolvió el servidor), se pide por
+   * id acotando por empresa, igual que el resto de lecturas de la vista.
+   */
+  const abrirProducto = useCallback(
+    async (id: string | number) => {
+      const enMemoria = productos.find((p) => String(p.id) === String(id));
+      if (enMemoria) {
+        setModal(enMemoria);
+        return;
+      }
+      const empresaId = await getEmpresaIdActiva();
+      if (!empresaId) return;
+      const { data, error } = await supabase
+        .from("productos")
+        .select("*")
+        .eq("id", id)
+        .eq("empresa_id", empresaId)
+        .maybeSingle();
+      if (error || !data) {
+        console.warn("[Inventario] No se pudo abrir el producto en conflicto:", error?.message);
+        setError("No se pudo abrir ese producto. Búscalo en la lista para editarlo.");
+        return;
+      }
+      setModal(data as unknown as ProductoRow);
+    },
+    [productos],
+  );
 
   return (
     <PageShell
@@ -359,6 +429,7 @@ export default function InventarioPage() {
               producto={modal === "nuevo" ? undefined : modal}
               onSaved={onSaved}
               onCancel={() => setModal(null)}
+              onEditarProducto={abrirProducto}
             />
           </div>
         </div>

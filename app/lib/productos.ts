@@ -1,5 +1,6 @@
 /**
- * Productos — imagen opcional en Supabase Storage.
+ * Productos — helpers del dominio: código de barras canónico e imagen opcional
+ * en Supabase Storage.
  *
  * La foto de un producto vive en el bucket público `productos` bajo la ruta
  * `${empresa_id}/${archivo}`. Ese primer segmento NO es decorativo: las políticas
@@ -14,6 +15,35 @@
  */
 
 import { supabase, getEmpresaIdActiva } from "./auth";
+
+/**
+ * Caracteres invisibles al principio/final de un código de barras.
+ *
+ * Además del espacio normal cubre los de ancho cero (U+200B..U+200D) y el BOM
+ * (U+FEFF), que `trim()` NO elimina y que hacen que " 7702412100110" y
+ * "7702412100110" sean dos códigos DISTINTOS para la base de datos: el índice
+ * único no los ve como duplicados y una búsqueda exacta por el código tecleado
+ * no encuentra la fila. (El espacio no-separable que deja un pegado desde Excel
+ * sí cuenta como `\s`, así que entra por ahí.)
+ */
+const BORDES_INVISIBLES = /^[\s\u200b-\u200d\ufeff]+|[\s\u200b-\u200d\ufeff]+$/g;
+
+/**
+ * Forma canónica de un código de barras: sin espacios (ni invisibles) a los
+ * lados, y `null` cuando no queda nada.
+ *
+ * ÚNICA definición de "qué código es este" en toda la app. Se aplica en los tres
+ * momentos —al LEER una fila, al BUSCAR/VALIDAR y al GUARDAR— para que la
+ * validación de duplicados del alta y la búsqueda del inventario no puedan
+ * discrepar: ambas comparan el mismo valor normalizado.
+ *
+ * `null` (no cadena vacía) porque la columna es nullable y la unicidad de
+ * Postgres ignora los NULL: un producto sin código no bloquea a los demás.
+ */
+export function normalizarCodigoBarras(valor: string | null | undefined): string | null {
+  const limpio = (valor ?? "").replace(BORDES_INVISIBLES, "");
+  return limpio || null;
+}
 
 /** Bucket de Storage donde viven las fotos de producto. */
 export const BUCKET_IMAGENES = "productos";

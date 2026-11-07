@@ -3,7 +3,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import dynamic from "next/dynamic";
 import { supabase, getEmpresaIdActiva } from "../lib/auth";
-import { ACCEPT_IMAGEN, subirImagenProducto, validarImagen } from "../lib/productos";
+import {
+  ACCEPT_IMAGEN,
+  normalizarCodigoBarras,
+  subirImagenProducto,
+  validarImagen,
+} from "../lib/productos";
 import { soportaCamara } from "../lib/barcode-camera";
 import { findByBarcode, purgarArchivadosLocal } from "../lib/offline/catalog";
 
@@ -86,6 +91,13 @@ type Props = {
   onSaved?: (p: Producto) => void;
   /** Se invoca al cancelar (cerrar el modal/panel del padre). */
   onCancel?: () => void;
+  /**
+   * Abre OTRO producto del catálogo para editarlo. Lo provee el padre, que es
+   * quien controla el modal; aquí alimenta el botón "Ver/Editar …" del aviso de
+   * código duplicado, para saltar directo al producto que ya ocupa el código y
+   * cambiárselo o archivarlo sin tener que buscarlo a mano.
+   */
+  onEditarProducto?: (id: string | number) => void;
 };
 
 // ── Estado del formulario ────────────────────────────────────────────────────
@@ -128,7 +140,9 @@ const SIN_SUSCRIPCION = () => () => {};
 /** Convierte una fila de la BD al estado del formulario (números → string). */
 function toFormState(p?: Producto): FormState {
   return {
-    codigo_barras: p?.codigo_barras ?? "",
+    // Normalizado AL LEER: si la fila guarda " 7702…" (pegado desde Excel, lector
+    // mal configurado), el formulario muestra y reenvía el código ya limpio.
+    codigo_barras: normalizarCodigoBarras(p?.codigo_barras) ?? "",
     descripcion: p?.descripcion ?? "",
     tipo: p?.tipo ?? "unidad",
     precio_costo: p ? String(p.precio_costo) : "",
@@ -145,6 +159,12 @@ function toFormState(p?: Producto): FormState {
 
 /** Producto de la empresa que ya ocupa un código de barras. */
 type Ocupante = { id: string | number; descripcion: string; archivado: boolean };
+
+/**
+ * Producto ACTIVO que ya ocupa el código tecleado. Se guarda con id —no solo con
+ * el nombre— para poder ofrecer el salto directo a su edición.
+ */
+type Conflicto = { id: string | number; nombre: string };
 
 /**
  * ¿Qué producto de la empresa ocupa ese código de barras, y está vivo o
@@ -236,7 +256,12 @@ function toNumberOrNull(v: string): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
-export default function ProductForm({ producto, onSaved, onCancel }: Props) {
+export default function ProductForm({
+  producto,
+  onSaved,
+  onCancel,
+  onEditarProducto,
+}: Props) {
   const editando = producto != null;
   const [form, setForm] = useState<FormState>(() => toFormState(producto));
   const [departamentos, setDepartamentos] = useState<Departamento[]>([]);
@@ -253,9 +278,9 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
 
   // ── Alta rápida por código de barras ──────────────────────────────────────
   const [escanerAbierto, setEscanerAbierto] = useState(false);
-  // Aviso (no bloqueante) de que ese código ya está en el catálogo de la
-  // empresa. Evita llegar al INSERT y chocar contra el único (error 23505).
-  const [avisoCodigo, setAvisoCodigo] = useState<string | null>(null);
+  // Producto ACTIVO que ya ocupa el código tecleado. Evita llegar al INSERT y
+  // chocar contra el único (error 23505), y da el atajo para ir a editarlo.
+  const [conflicto, setConflicto] = useState<Conflicto | null>(null);
   const descripcionRef = useRef<HTMLInputElement>(null);
   const codigoRef = useRef<HTMLInputElement>(null);
   const precioVentaRef = useRef<HTMLInputElement>(null);
@@ -283,7 +308,8 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
     setVentaManual(producto != null);
     setImagenFile(null);
     setImagenUrl(producto?.imagen_url ?? null);
-    setAvisoCodigo(null);
+    setConflicto(null);
+    setError(null);
     chequeoRef.current++; // invalida una comprobación de duplicado en vuelo
     if (fileRef.current) fileRef.current.value = "";
   }, [producto]);
@@ -357,7 +383,7 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
       if (campo === "precio_venta") setVentaManual(true);
       // El aviso de "código ya usado" se refiere al valor anterior: al teclear
       // otro deja de aplicar y lo retiramos en vez de dejarlo mintiendo.
-      if (campo === "codigo_barras") setAvisoCodigo(null);
+      if (campo === "codigo_barras") setConflicto(null);
       setForm((f) => ({ ...f, [campo]: value }));
     },
     [],
@@ -377,10 +403,10 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
    */
   const verificarCodigo = useCallback(
     (codigoCrudo: string) => {
-      const codigo = codigoCrudo.trim();
+      const codigo = normalizarCodigoBarras(codigoCrudo);
       const token = ++chequeoRef.current; // invalida cualquier chequeo en vuelo
       if (!codigo) {
-        setAvisoCodigo(null);
+        setConflicto(null);
         return;
       }
       void (async () => {
@@ -391,13 +417,10 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
           // va por `String`: el id es un UUID, así que `Number(id)` daba NaN y el
           // producto siempre se denunciaba como duplicado de sí mismo.
           if (!existente || (editando && String(existente.id) === String(producto!.id))) {
-            setAvisoCodigo(null);
+            setConflicto(null);
             return;
           }
-          setAvisoCodigo(
-            `Ya existe "${existente.nombre}" con este código. Si lo guardas así, ` +
-              "el sistema lo rechazará: edita ese producto o usa otro código.",
-          );
+          setConflicto({ id: existente.id, nombre: existente.nombre });
         } catch (e) {
           // El aviso es una cortesía; si la consulta falla seguimos y será el
           // INSERT quien reporte el duplicado (23505).
@@ -416,11 +439,11 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
    */
   const aplicarCodigo = useCallback(
     (codigoCrudo: string) => {
-      const codigo = codigoCrudo.trim();
+      const codigo = normalizarCodigoBarras(codigoCrudo);
       if (!codigo) return;
 
       setForm((f) => ({ ...f, codigo_barras: codigo }));
-      setAvisoCodigo(null);
+      setConflicto(null);
 
       // Enfocamos lo que de verdad falta: en un alta recién escaneada eso es la
       // descripción; si ya está escrita (p. ej. se re-escanea para corregir el
@@ -508,7 +531,9 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
       // Campos comunes a alta y edición. Los precios/stocks vacíos van como 0 o
       // null según la columna sea NOT NULL.
       const base = {
-        codigo_barras: form.codigo_barras.trim() || null,
+        // Se escribe SIEMPRE normalizado: es lo único que garantiza que el valor
+        // guardado sea idéntico al que buscan el inventario, el POS y el único.
+        codigo_barras: normalizarCodigoBarras(form.codigo_barras),
         descripcion,
         tipo: form.tipo,
         precio_costo: Number(form.precio_costo) || 0,
@@ -625,7 +650,10 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
 
         // Solo miramos el ocupante si el código es nuevo para esta fila: en una
         // edición que no lo toca no hay conflicto posible consigo misma.
-        const codigoNuevo = !editando || base.codigo_barras !== (producto!.codigo_barras ?? null);
+        // Los dos lados normalizados: si la fila guardaba " 7702…" y ahora se
+        // graba "7702…", el código SÍ cambia y hay que revisar el ocupante.
+        const codigoNuevo =
+          !editando || base.codigo_barras !== normalizarCodigoBarras(producto!.codigo_barras);
         let { data, error } = await ejecutar(codigoNuevo ? await desbloquearCodigo() : null);
 
         // 23505 = unicidad violada. Con el índice PARCIAL aplicado solo puede venir
@@ -655,10 +683,9 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
             // Una única segunda pasada, ya con el código desbloqueado.
             ({ data, error } = await ejecutar(await desbloquearCodigo()));
           } else if (ocupante) {
-            setError(
-              `El código "${base.codigo_barras}" ya lo usa el producto ACTIVO ` +
-                `"${ocupante.descripcion}". Edita ese producto o usa otro código.`,
-            );
+            // Mismo caso que el aviso previo al guardado, así que se cuenta igual
+            // (con el atajo a ese producto) en vez de con un error suelto.
+            setConflicto({ id: ocupante.id, nombre: ocupante.descripcion });
             return;
           } else if (esDelCodigo) {
             setError(
@@ -694,7 +721,7 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
         void purgarArchivadosLocal().catch(() => {});
 
         onSaved?.(data as Producto);
-        setAvisoCodigo(null);
+        setConflicto(null);
         if (!editando) {
           setForm(toFormState()); // limpia para cargar el siguiente
           setImagenFile(null);
@@ -791,13 +818,31 @@ export default function ProductForm({ producto, onSaved, onCancel }: Props) {
           </div>
         </div>
 
-        {/* Aviso NO bloqueante: el código ya pertenece a otro producto de la
-            empresa. Se avisa aquí porque el INSERT lo rechazaría (23505) y a esas
-            alturas ya se habría rellenado todo el formulario. */}
-        {avisoCodigo && (
-          <p className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
-            {avisoCodigo}
-          </p>
+        {/* Aviso NO bloqueante: el código ya pertenece a otro producto ACTIVO de
+            la empresa. Se avisa aquí porque el INSERT lo rechazaría (23505) y a
+            esas alturas ya se habría rellenado todo el formulario.
+
+            El botón resuelve el conflicto en vez de solo denunciarlo: abre el
+            producto que ocupa el código para cambiárselo o archivarlo. */}
+        {conflicto && (
+          <div
+            role="status"
+            className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2.5 text-xs text-amber-200"
+          >
+            <p>
+              Ya existe el producto activo <strong>“{conflicto.nombre}”</strong> con este código.
+              Usa otro código, o abre ese producto para cambiarle el suyo o archivarlo.
+            </p>
+            {onEditarProducto && (
+              <button
+                type="button"
+                onClick={() => onEditarProducto(conflicto.id)}
+                className="mt-2 rounded-md border border-amber-400/50 px-2.5 py-1 font-medium text-amber-100 transition-colors hover:bg-amber-500/20"
+              >
+                Ver/Editar “{conflicto.nombre}”
+              </button>
+            )}
+          </div>
         )}
 
         {/* Departamento */}
